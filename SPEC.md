@@ -39,6 +39,8 @@
 - `ChatGPT Web -> new Local Agent Bridge identity/attestation -> Adaptive Agent Runtime -> verified unique logical Controller`。
 - 能够退役 `manual_user_authorized` Web Controller binding，不再要求用户用提示词提供 conversation ID 证明 Controller 身份。
 - Files workspace 边界覆盖 traversal、symlink、hardlink、nonexistent-target 与 TOCTOU 风险。
+- Capability/Authorization 必须绑定 authenticated principal、Bridge execution session、capability grant 与 workspace；任一不匹配时高副作用能力 fail closed。
+- Bridge ingress 的授权证明必须是本地签名/等价机器证明并绑定具体请求内容、method/tool、nonce 与 session generation；OpenAI tunnel correlation headers 本身不是授权凭据。
 - Shell/Process 有真实、可解释的 filesystem / network / environment / credential 权限边界，而非仅依赖 cwd。
 - Browser 与独立 Computer Runtime 的授权、session ownership、目标隔离和 E2E 均有真实证据。
 - 在 Adaptive Agent Runtime 完全未运行时，Bridge / Computer Runtime 核心产品链仍可独立工作。

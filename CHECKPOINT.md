@@ -146,3 +146,17 @@ Runtime collaborative 初始化器已建立并复用：
 - 目前没有观察到可直接等同于 ChatGPT conversation ID 的机器字段；这些 header 只能先作为 transport/session/principal correlation facts，不能直接升级为 Adaptive Agent Runtime Controller host attestation。
 
 因此下一条真实关键路径切换为 `LAB-SAFE-01`：Auth -> Execution Session -> Capability -> Authorization -> Workspace/Shell isolation。Local Tool Bridge / Computer Runtime 继续保持 model-agnostic；Web ChatGPT Executor 仍属于未来独立 executor plane。
+
+
+## LAB-SAFE-01 security boundary progress
+
+- `experiments/security-boundary` Rust Harness 已扩到 16/16 PASS。
+- Authorization prototype 明确绑定 `principal_id / execution_session_id / capability_id / workspace_id`；不引用 ChatGPT model、Web conversation lifecycle、Runtime Controller/Goal/DAG。
+- Capability authority 新增 TTL、revocation、session-generation fencing、request nonce replay protection；authority key/state 0600 原子持久化，重启后 replay/revocation 仍保持。
+- Local ingress proof 使用 per-capability HMAC 逐请求绑定 principal/session/workspace、request ID/nonce、MCP method/tool 与 body hash；proof 可映射到 `x-lab-*` ingress headers，但 signing secret 不出本机 signer。
+- `x-openai-session` / `x-openai-subject` 明确留在 correlation-only 层：Harness 已验证它们不能单独作为 authorization source。
+- Unix Files prototype 使用 directory FD + `openat/O_NOFOLLOW/fstat/fstatat/renameat`，已闭合 hardlink read/write、symlink existing write、nonexistent target under symlink parent、traversal 与 secure move 的当前测试门。
+- macOS Shell prototype 使用 replaceable `sandbox-exec` backend：workspace I/O PASS；敏感路径外读、workspace 外写、outbound network 均阻断；继承环境清空。`sandbox-exec` 不冻结为最终产品依赖。
+- CatDesk 独立 worktree `/Users/echoman/CatDesk-PoC-20260907/worktrees/lab-safe-01` 先以真实 upstream 行为得到 RED：hardlink read、nonexistent write/move symlink-parent、macOS shell outside-workspace 全部失败安全门；candidate patch 后 8 个新增 security tests 全部 PASS；`cargo test security_` 为 9/9（含一个既有 connector security-name test）。
+- CatDesk candidate full suite 为 216 PASS / 6 FAIL；六个 FAIL 都属于 `change_tracking`，在未修改 upstream `bfac47b` 上已复现，因此不是本 security candidate 引入。
+- 下一步仍是 `LAB-SAFE-01`：把当前本机 contract 接入正式 Bridge ingress，补 capability issuance / expiry / revocation / replay protection，并在扩大通用 Files/Shell 前继续 fail closed。

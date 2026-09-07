@@ -36,6 +36,26 @@ Web Executor machine state 只保存 execution correlation，不成为第二份 
 - Browser DevTools bridge 与通用 Computer Runtime 是不同 capability，分别授权、审计和隔离。
 - 日志不得持久化 bearer token、cookie、API key 或可直接复用的敏感凭据；身份探针只保留脱敏指纹/相关性事实。
 
+## LAB-SAFE-01 security contract
+
+Bridge authorization is explicitly layered as `Transport/Auth -> Execution Session -> Capability Grant -> Authorization -> Workspace/Shell enforcement`. The Bridge may report provider/tunnel correlation facts, but Web conversation identity, Runtime Controller identity and model routing remain outside this security core.
+
+The first concrete contract is:
+
+- `principal_id` identifies the authenticated/local transport principal used by Bridge authorization;
+- `execution_session_id` identifies one Bridge execution session and is independently revocable;
+- `capability_id` selects one issued capability grant;
+- `workspace_id` selects the authorized filesystem/shell boundary;
+- authorization succeeds only when all four values match and the requested operation is present in the grant.
+
+Unix Files enforcement must resolve from an already-open workspace directory descriptor instead of relying only on `canonicalize()+starts_with()`: parent components use `openat` with `O_DIRECTORY|O_NOFOLLOW`; read/write targets use `O_NOFOLLOW` plus inode/link-count checks; create uses `O_CREAT|O_EXCL`; move uses `fstatat(..., AT_SYMLINK_NOFOLLOW)` and `renameat`; unsafe cross-device fallback fails closed. This closes the already-reproduced hardlink and nonexistent-target-through-symlink-parent classes in the current candidate.
+
+macOS Shell enforcement currently uses a replaceable Seatbelt/sandbox-exec PoC backend. It clears inherited environment variables, moves runtime HOME/TMP into the workspace, blocks user-data roots outside the workspace, blocks outbound network access and permits workspace I/O. This is evidence that `cwd` can be replaced with a real OS-enforced boundary; `sandbox-exec` itself is not frozen as the final backend. Linux Landlock remains a separate backend; Windows requires an equivalent product decision.
+
+Bridge ingress 的下一层已验证为 **local-ingress signed request proof**：本地 ingress adapter 持有 per-capability signing secret，逐请求签名 `capability_id + principal_id + execution_session_id + workspace_id + request_id + nonce + MCP method + tool name + body sha256 + provenance`。Bridge core 只接受 HMAC 校验成功且未过期/未撤销/未 replay、session generation 当前、capability scope 匹配的请求。签名 secret 不进入 ChatGPT prompt、MCP tool arguments、OpenAI tunnel headers 或普通日志。
+
+`x-openai-session` / `x-openai-subject` 继续只记为 correlation observations；即使字段稳定，也不能单独生成上述 proof，因此不会被提升为 authorization source。Capability authority 的 PoC 状态使用 0600 key/state 文件原子持久化，replay nonce 与 revocation 在进程重启后继续生效。正式产品仍需把 signer/verifier 接入真实 loopback/Unix-socket ingress，并定义 key rotation、crash recovery 与同 UID hostile-process 边界。
+
 ## Harness
 
 当前最小 Harness：
