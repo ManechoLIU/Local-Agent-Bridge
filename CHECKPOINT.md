@@ -169,3 +169,12 @@ Runtime collaborative 初始化器已建立并复用：
 - `x-openai-subject` 等 correlation headers 不作为本地授权，也不被 ingress 转发成 trusted proof。
 - ingress tests 4/4 PASS：认证+signed proof、correlation-only 不可替代 local key、缺 capability 在 backend 前 fail closed、backend 必须 loopback。
 - 下一步：真实连接 `tunnel-client -> local-tool-bridge ingress -> CatDesk security candidate`，再验证 read/write/edit/shell/job 的 scoped capability E2E 与 revoke/replay 行为。
+
+## Signed Local Tool Bridge ingress E2E
+
+- `crates/local-tool-bridge` 已新增独立 0600 Unix-domain socket runtime，UDS 文件权限作为本机 transport boundary；backend 仍强制 loopback-only。
+- UDS ingress 在转发前按 method/tool capability map 授权，并注入逐请求 signed `x-lab-*` proof；本地 ingress secret 不向 backend/OpenAI correlation headers 泄露。
+- 真实链路已跑通：`curl over UDS -> local-tool-bridge -> signed proof -> CatDesk lab/security-boundary candidate -> workspace/macOS sandbox`。
+- 实测完成 `server/discover`、`tools/list`、`catdesk_instruction`、read、write、edit、`/bin/pwd`、background `start_command -> poll_command`。write/edit 最终内容为 `edited-through-signed-ingress`，job 输出 `job-secure-done`。
+- 首次 shell E2E 暴露 `.catdesk-sandbox` scratch 会污染 workspace/change tracking；CatDesk candidate 已新增 commit `707b95e`，把 sandbox HOME/TMP scratch 移到 `~/.catdesk/sandbox` 并显式授权该 scratch，复跑后 workspace 只剩业务文件。
+- 下一步是把 OpenAI Secure MCP `tunnel-client` 的 local target 从 TCP/旧 probe 切到该 UDS ingress，证明 `Personal ChatGPT Web -> Secure MCP Tunnel -> UDS Local Tool Bridge -> hardened CatDesk -> Mac` 全链。

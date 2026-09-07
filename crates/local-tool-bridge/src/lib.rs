@@ -78,6 +78,12 @@ impl ToolPolicy {
     }
 }
 
+#[derive(Clone, Debug)]
+enum LocalIngressAuth {
+    SharedKey([u8; 32]),
+    TrustedUnixSocket,
+}
+
 #[derive(Clone)]
 pub struct BridgeIngress {
     inner: Arc<BridgeIngressInner>,
@@ -87,7 +93,7 @@ struct BridgeIngressInner {
     authority: Mutex<CapabilityAuthority>,
     issued: IssuedCapability,
     context: ExecutionContext,
-    ingress_key_sha256: [u8; 32],
+    local_auth: LocalIngressAuth,
     backend_url: Url,
     client: reqwest::Client,
     policy: ToolPolicy,
@@ -141,7 +147,39 @@ impl BridgeIngress {
                 authority: Mutex::new(authority),
                 issued,
                 context,
-                ingress_key_sha256,
+                local_auth: LocalIngressAuth::SharedKey(ingress_key_sha256),
+                backend_url,
+                client: reqwest::Client::new(),
+                policy,
+            }),
+        })
+    }
+
+    pub fn new_trusted_unix_socket(
+        authority: CapabilityAuthority,
+        issued: IssuedCapability,
+        context: ExecutionContext,
+        backend_url: &str,
+        policy: ToolPolicy,
+    ) -> Result<Self, String> {
+        if issued.capability_id != context.capability_id {
+            return Err("issued capability does not match ingress execution context".into());
+        }
+        let backend_url =
+            Url::parse(backend_url).map_err(|error| format!("invalid backend URL: {error}"))?;
+        if backend_url.scheme() != "http" {
+            return Err("backend URL must use loopback http".into());
+        }
+        let host = backend_url.host_str().unwrap_or_default();
+        if !matches!(host, "127.0.0.1" | "localhost" | "::1") {
+            return Err("backend URL must be loopback-only".into());
+        }
+        Ok(Self {
+            inner: Arc::new(BridgeIngressInner {
+                authority: Mutex::new(authority),
+                issued,
+                context,
+                local_auth: LocalIngressAuth::TrustedUnixSocket,
                 backend_url,
                 client: reqwest::Client::new(),
                 policy,
@@ -161,11 +199,14 @@ async fn handle_mcp(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
-    if !valid_ingress_key(&headers, &state.inner.ingress_key_sha256) {
-        return text_response(
-            StatusCode::UNAUTHORIZED,
-            "local ingress authentication failed",
-        );
+    match &state.inner.local_auth {
+        LocalIngressAuth::SharedKey(expected) if !valid_ingress_key(&headers, expected) => {
+            return text_response(
+                StatusCode::UNAUTHORIZED,
+                "local ingress authentication failed",
+            );
+        }
+        LocalIngressAuth::SharedKey(_) | LocalIngressAuth::TrustedUnixSocket => {}
     }
 
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
