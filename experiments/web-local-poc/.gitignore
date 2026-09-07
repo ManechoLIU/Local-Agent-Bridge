@@ -1,0 +1,6 @@
+home/
+logs/
+workspace/*
+!workspace/read-test.txt
+
+__pycache__/
