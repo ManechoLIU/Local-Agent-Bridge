@@ -8,7 +8,7 @@ const moduleUrl = new URL('./server.mjs', import.meta.url);
 
 async function loadServer() {
   try {
-    return await import(moduleUrl);
+    return await import(moduleUrl.href + `?v=${Date.now()}-${Math.random()}`);
   } catch (error) {
     assert.fail(`identity probe server must load: ${error.message}`);
   }
@@ -34,47 +34,38 @@ async function startProbe(options = {}) {
   };
 }
 
-function modernRequest(method, params = {}, headers = {}) {
-  return {
+async function rpc(url, method, params = {}, headers = {}, id = 1) {
+  const response = await fetch(url, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'mcp-protocol-version': '2026-07-28',
-      'mcp-method': method,
-      ...headers,
-    },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-  };
-}
-
-async function rpc(url, method, params = {}, headers = {}) {
-  const response = await fetch(url, modernRequest(method, params, headers));
+    headers: { 'content-type': 'application/json', ...headers },
+    body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
+  });
   return { response, body: await response.json() };
 }
 
-test('server/discover and tools/list expose the phase-1 noauth contract', async (t) => {
+test('standard MCP initialize and tools/list expose a noauth identity tool', async (t) => {
   const probe = await startProbe();
   t.after(probe.close);
 
-  const discover = await rpc(probe.url, 'server/discover', { _meta: {} });
-  assert.equal(discover.response.status, 200);
-  assert.equal(discover.body.result.protocolVersion, '2026-07-28');
-  assert.equal(discover.body.result.serverInfo.name, 'identity-probe');
-  assert.deepEqual(discover.body.result.securitySchemes, [{ type: 'noauth' }]);
+  const initialized = await rpc(probe.url, 'initialize', {
+    protocolVersion: '2025-03-26',
+    capabilities: {},
+    clientInfo: { name: 'test-client', version: '1' },
+  });
+  assert.equal(initialized.response.status, 200);
+  assert.equal(initialized.body.result.protocolVersion, '2025-03-26');
+  assert.equal(initialized.body.result.serverInfo.name, 'identity-probe');
+  assert.deepEqual(initialized.body.result.capabilities, { tools: { listChanged: false } });
 
-  const listed = await rpc(probe.url, 'tools/list', { _meta: {} });
+  const listed = await rpc(probe.url, 'tools/list', {});
   assert.equal(listed.response.status, 200);
-  assert.deepEqual(listed.body.result.tools, [{
-    name: 'identity_probe',
-    description: 'Return a sanitized observation of request identity signals. This does not authenticate a ChatGPT user or conversation.',
-    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-    annotations: {
-      readOnlyHint: true,
-      openWorldHint: false,
-      destructiveHint: false,
-    },
-    securitySchemes: [{ type: 'noauth' }],
-  }]);
+  assert.equal(listed.body.result.resultType, 'complete');
+  assert.equal(listed.body.result.ttlMs, 0);
+  assert.equal(listed.body.result.cacheScope, 'public');
+  assert.equal(listed.body.result.tools[0].name, 'identity_probe');
+  assert.deepEqual(listed.body.result.tools.map((entry) => entry.name), [
+    'identity_probe', 'poc_read', 'poc_write', 'poc_edit', 'poc_command', 'poc_start_job', 'poc_poll_job',
+  ]);
 });
 
 test('identity_probe sanitizes secrets and reports expected conversation matches', async (t) => {
@@ -96,7 +87,6 @@ test('identity_probe sanitizes secrets and reports expected conversation matches
     cookie: 'session=raw-cookie-secret',
     'x-api-key': 'raw-api-key-secret',
     'x-openai-request-id': 'request-secret-789',
-    'mcp-name': 'identity_probe',
     'user-agent': 'identity-probe-test',
   });
 
@@ -111,7 +101,7 @@ test('identity_probe sanitizes secrets and reports expected conversation matches
   ]);
   assert.equal(observation.headers.authorization.scheme, 'Bearer');
   assert.equal(observation.headers.authorization.credentialLength, bearer.length);
-  assert.equal(observation.meta['conversationId'].matchesExpectedConversationId, true);
+  assert.equal(observation.meta.conversationId.matchesExpectedConversationId, true);
   assert.equal(observation.headers.identity['x-openai-request-id'].matchesExpectedConversationId, false);
   assert.equal('harmless' in observation.meta, false);
 
@@ -125,17 +115,40 @@ test('identity_probe sanitizes secrets and reports expected conversation matches
   assert.equal(entries.at(-1).meta.conversationId.matchesExpectedConversationId, true);
 });
 
-test('modern requests fail closed without params._meta', async (t) => {
+test('standard MCP requests do not require custom correlation headers or _meta', async (t) => {
   const probe = await startProbe();
   t.after(probe.close);
 
-  const missingMeta = await rpc(probe.url, 'ping', {});
-  assert.equal(missingMeta.response.status, 200);
-  assert.equal(missingMeta.body.error.code, -32602);
-  assert.match(missingMeta.body.error.message, /params\._meta/);
+  const listed = await rpc(probe.url, 'tools/list', {});
+  assert.equal(listed.response.status, 200);
+  assert.equal(listed.body.result.tools[0].name, 'identity_probe');
+
+  const called = await rpc(probe.url, 'tools/call', { name: 'identity_probe', arguments: {} });
+  assert.equal(called.response.status, 200);
+  assert.deepEqual(called.body.result.structuredContent.meta, {});
 });
 
-test('HTTP method handling and MCP correlation headers are enforced', async (t) => {
+test('notifications/initialized and optional legacy correlation checks behave safely', async (t) => {
+  const probe = await startProbe();
+  t.after(probe.close);
+
+  const notification = await fetch(probe.url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }),
+  });
+  assert.equal(notification.status, 202);
+
+  const mismatchedMethod = await rpc(probe.url, 'ping', {}, { 'mcp-method': 'tools/list' });
+  assert.equal(mismatchedMethod.body.error.code, -32602);
+
+  const mismatchedName = await rpc(probe.url, 'tools/call', {
+    name: 'identity_probe', arguments: {},
+  }, { 'mcp-name': 'wrong-name' });
+  assert.equal(mismatchedName.body.error.code, -32602);
+});
+
+test('HTTP method handling and legacy server/discover remain available for local harnesses', async (t) => {
   const probe = await startProbe();
   t.after(probe.close);
 
@@ -145,15 +158,15 @@ test('HTTP method handling and MCP correlation headers are enforced', async (t) 
   const deleteResponse = await fetch(probe.url, { method: 'DELETE' });
   assert.equal(deleteResponse.status, 204);
 
-  const mismatchedMethod = await fetch(probe.url, modernRequest('ping', { _meta: {} }, {
-    'mcp-method': 'tools/list',
-  }));
-  assert.equal((await mismatchedMethod.json()).error.code, -32602);
-
-  const missingName = await rpc(probe.url, 'tools/call', {
-    _meta: {},
-    name: 'identity_probe',
-    arguments: {},
+  const discover = await rpc(probe.url, 'server/discover', { _meta: {} }, {
+    'mcp-protocol-version': '2026-07-28',
+    'mcp-method': 'server/discover',
   });
-  assert.equal(missingName.body.error.code, -32602);
+  assert.equal(discover.response.status, 200);
+  assert.equal(discover.body.result.resultType, 'complete');
+  assert.equal(discover.body.result.supportedVersions.includes('2026-07-28'), true);
+  assert.deepEqual(discover.body.result.capabilities, { tools: {} });
+  assert.equal(discover.body.result.ttlMs, 0);
+  assert.equal(discover.body.result.cacheScope, 'private');
+  assert.equal(discover.body.result._meta['io.modelcontextprotocol/serverInfo'].name, 'identity-probe');
 });

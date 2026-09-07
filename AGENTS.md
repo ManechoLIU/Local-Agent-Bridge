@@ -55,6 +55,23 @@ The supported product architecture must include an independent mode such as:
 
 Adaptive Agent Runtime is allowed to call the Bridge and the Bridge may expose adapters useful to Runtime, but unnecessary hard dependencies are forbidden.
 
+
+### 1.4.1 Web ChatGPT Executor is an external executor plane
+
+ChatGPT Web model invocation, model routing, and Agent lifecycle must **not** be hard-coded into Local Tool Bridge / Local Agent Bridge or Computer Runtime.
+
+A future **Web ChatGPT Executor** is a separate adapter / executor-plane component. Adaptive Agent Runtime may route work to that executor, and the executor may call Local Tool Bridge to obtain local machine capabilities. The Bridge and Computer Runtime remain model-agnostic capability providers and must not own model selection, prompt lifecycle, Controller state, Goal/TASK_LEDGER state, DAG/READY/WIP, retry policy, or Agent lifecycle.
+
+The intended boundary is:
+
+`Adaptive Agent Runtime -> Web ChatGPT Executor -> Personal ChatGPT Web`
+
+and, when local capabilities are needed:
+
+`Web ChatGPT Executor -> Local Tool Bridge -> Files / Shell / Process / Browser / Computer Runtime -> local machine`
+
+Current interfaces must preserve this separation even during PoC shortcuts. Correlation between Web conversation/execution identity and Bridge execution sessions belongs in the external adapter/orchestration layer unless the Bridge is merely reporting machine-verifiable transport/session facts.
+
 SelfAlone is a separate project. It may be used only as an external E2E target / fixture when that is useful for validating the Bridge or Computer Runtime. This project must not modify SelfAlone main, reuse its task ledger or Controller identity, or take over its Controller lifecycle as part of normal development.
 
 ### 1.5 Controller-gated actions must follow machine facts when available
@@ -94,7 +111,7 @@ Agents must not infer that `smaller command = allowed` or `larger command = bloc
 
 The user has explicitly authorized the following current Web execution target to act as the **only project-level Controller execution entry during bootstrap development**:
 
-- `web_execution_target_id = 6a9e4037-0a00-83ea-bb8e-1301c5f6b979`
+- `web_execution_target_id = 6a9e4158-cc8c-83ea-9763-05a7fd51f597`
 - `provenance = manual_user_authorized`
 - `binding = temporary`
 - `host_attested = false`
@@ -109,7 +126,7 @@ The canonical Adaptive Agent Runtime registry now contains one project-specific 
 
 - `project_identity = /Users/echoman/Documents/ChatGPT/Local-Agent-Bridge/.git` (Git common-dir; this is the Runtime project identity boundary)
 - `logical_controller_id = a697051d-402b-4062-a883-a29ba8b395e9`
-- `web_execution_target_id = 6a9e4037-0a00-83ea-bb8e-1301c5f6b979`
+- `web_execution_target_id = 6a9e4158-cc8c-83ea-9763-05a7fd51f597`
 - `provenance = manual_user_authorized`
 - `binding = temporary`
 - `host_attested = false`
@@ -135,6 +152,9 @@ During this temporary phase:
 - development may use Adaptive Agent Runtime as orchestration infrastructure, while the Bridge/Computer Runtime product remains independently runnable.
 
 If the active Web conversation changes before strong binding exists, the new execution target must receive fresh explicit user authorization; agents must not silently inherit this Web ID as current ownership.
+
+
+Bootstrap machine-binding note (2026-09-07): the user-authorized current Web execution entry is `6a9e4158-cc8c-83ea-9763-05a7fd51f597`. Adaptive Agent Runtime has recorded it in this Controller's Web lineage, but currently projects it as `historical_alias / STALE / EXPLICIT_CURRENT_TARGET_REQUIRED`; `host_attested=false` and Controller actions are not machine-authorized by this alias alone. The prior alias `6a9e4037-0a00-83ea-bb8e-1301c5f6b979` is historical only and must not be treated as the current project Controller execution entry.
 
 ## 3. Automatic retirement conditions for bootstrap binding
 

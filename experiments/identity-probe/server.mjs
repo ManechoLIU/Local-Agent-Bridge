@@ -3,14 +3,58 @@ import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { createServer } from 'node:http';
 
-const protocolVersion = '2026-07-28';
+const legacyProtocolVersion = '2026-07-28';
+const supportedMcpProtocolVersions = new Set(['2025-11-25', '2025-03-26']);
+const defaultMcpProtocolVersion = '2025-11-25';
+
 const tool = {
   name: 'identity_probe',
   description: 'Return a sanitized observation of request identity signals. This does not authenticate a ChatGPT user or conversation.',
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-  annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false },
-  securitySchemes: [{ type: 'noauth' }],
+  annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false, idempotentHint: true },
 };
+
+const safePocTools = [
+  { name: 'poc_read', description: 'Read the fixed PoC source file inside the isolated workspace.', inputSchema: { type: 'object', properties: {}, additionalProperties: false }, annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false, idempotentHint: true } },
+  { name: 'poc_write', description: 'Write a fixed marker to the fixed PoC target file inside the isolated workspace.', inputSchema: { type: 'object', properties: {}, additionalProperties: false }, annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: true } },
+  { name: 'poc_edit', description: 'Edit the fixed PoC target file by replacing the fixed write marker with the fixed edited marker.', inputSchema: { type: 'object', properties: {}, additionalProperties: false }, annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: true } },
+  { name: 'poc_command', description: 'Run the fixed harmless /bin/pwd command in the isolated PoC workspace.', inputSchema: { type: 'object', properties: {}, additionalProperties: false }, annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false, idempotentHint: true } },
+  { name: 'poc_start_job', description: 'Start the fixed short background PoC job and return its job id.', inputSchema: { type: 'object', properties: {}, additionalProperties: false }, annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: false } },
+  { name: 'poc_poll_job', description: 'Poll a PoC job previously started by poc_start_job.', inputSchema: { type: 'object', properties: { jobId: { type: 'string' } }, required: ['jobId'], additionalProperties: false }, annotations: { readOnlyHint: true, openWorldHint: false, destructiveHint: false, idempotentHint: true } },
+];
+
+const allTools = [tool, ...safePocTools];
+const safePocToolNames = new Set(safePocTools.map((entry) => entry.name));
+const safePocServerUrl = 'http://127.0.0.1:33303/mcp';
+
+async function callSafePocTool(name, args = {}) {
+  const response = await fetch(safePocServerUrl, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'mcp-protocol-version': legacyProtocolVersion,
+      'mcp-method': 'tools/call',
+      'mcp-name': name,
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: `safe-${randomUUID()}`,
+      method: 'tools/call',
+      params: {
+        _meta: {
+          'io.modelcontextprotocol/protocolVersion': legacyProtocolVersion,
+          'io.modelcontextprotocol/clientCapabilities': {},
+          'io.modelcontextprotocol/clientInfo': { name: 'identity-probe-safe-poc-adapter', version: '1' },
+        },
+        name,
+        arguments: args,
+      },
+    }),
+  });
+  const payload = await response.json();
+  if (!response.ok || payload?.error) throw new Error(payload?.error?.message || `safe PoC backend HTTP ${response.status}`);
+  return payload.result;
+}
 
 function hashPrefix(value) {
   return createHash('sha256').update(String(value)).digest('hex').slice(0, 16);
@@ -53,11 +97,13 @@ function sanitizeHeaders(headers, expectedConversationId) {
     }
     if (
       lower.startsWith('x-openai-') ||
+      lower.startsWith('openai-') ||
       lower.includes('conversation') ||
       lower.includes('session') ||
       lower.includes('thread') ||
       lower.includes('request-id') ||
-      lower.includes('trace')
+      lower.includes('trace') ||
+      lower.includes('client')
     ) {
       identity[lower] = fingerprint(value, expectedConversationId);
     }
@@ -111,6 +157,10 @@ async function readBody(req) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
+function negotiatedProtocolVersion(requested) {
+  return supportedMcpProtocolVersions.has(requested) ? requested : defaultMcpProtocolVersion;
+}
+
 export function createProbeServer({ logPath, expectedConversationId = null } = {}) {
   const probeSessionId = randomUUID();
 
@@ -138,27 +188,69 @@ export function createProbeServer({ logPath, expectedConversationId = null } = {
         return;
       }
 
-      const { id = null, method, params } = rpc ?? {};
-      if (!params || typeof params !== 'object' || !params._meta || typeof params._meta !== 'object') {
-        sendJson(res, error(id, -32602, 'params._meta is required'));
+      const { id = null, method, params = {} } = rpc ?? {};
+      if (typeof method !== 'string') {
+        sendJson(res, error(id, -32600, 'invalid request'));
         return;
       }
-      if (req.headers['mcp-method'] !== method) {
+
+      if (logPath) {
+        const transportObservation = {
+          observationId: randomUUID(),
+          probeSessionId,
+          observedAt: new Date().toISOString(),
+          phase: 'rpc',
+          rpcMethod: method,
+          toolName: method === 'tools/call' && typeof params?.name === 'string' ? params.name : null,
+          headers: sanitizeHeaders(req.headers, expectedConversationId),
+          meta: sanitizeMeta(params?._meta, expectedConversationId),
+        };
+        await mkdir(dirname(logPath), { recursive: true });
+        await appendFile(logPath, JSON.stringify(transportObservation) + '\n', { encoding: 'utf8', mode: 0o600 });
+      }
+
+      const declaredMethod = req.headers['mcp-method'];
+      if (declaredMethod && declaredMethod !== method) {
         sendJson(res, error(id, -32602, 'mcp-method header mismatch'));
+        return;
+      }
+
+      if (method === 'initialize') {
+        sendJson(res, result(id, {
+          protocolVersion: negotiatedProtocolVersion(params?.protocolVersion),
+          capabilities: { tools: { listChanged: false } },
+          serverInfo: { name: 'identity-probe', version: '0.2.0' },
+        }));
+        return;
+      }
+
+      if (method === 'notifications/initialized') {
+        res.writeHead(202, { 'cache-control': 'no-store' }).end();
         return;
       }
 
       if (method === 'server/discover') {
         sendJson(res, result(id, {
-          protocolVersion,
-          serverInfo: { name: 'identity-probe', version: '0.1.0' },
-          securitySchemes: [{ type: 'noauth' }],
+          resultType: 'complete',
+          supportedVersions: ['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25', legacyProtocolVersion],
+          capabilities: { tools: {} },
+          instructions: 'Read-only Local Agent Bridge identity probe for PoC transport and identity-signal validation.',
+          ttlMs: 0,
+          cacheScope: 'private',
+          _meta: {
+            'io.modelcontextprotocol/serverInfo': { name: 'identity-probe', version: '0.2.0' },
+          },
         }));
         return;
       }
 
       if (method === 'tools/list') {
-        sendJson(res, result(id, { tools: [tool] }));
+        sendJson(res, result(id, {
+          resultType: 'complete',
+          ttlMs: 0,
+          cacheScope: 'public',
+          tools: allTools,
+        }));
         return;
       }
 
@@ -172,8 +264,19 @@ export function createProbeServer({ logPath, expectedConversationId = null } = {
         return;
       }
 
-      if (params.name !== 'identity_probe' || req.headers['mcp-name'] !== params.name) {
-        sendJson(res, error(id, -32602, 'tool name mismatch'));
+      const declaredTool = allTools.find((entry) => entry.name === params?.name);
+      if (!declaredTool) {
+        sendJson(res, error(id, -32601, 'unknown tool'));
+        return;
+      }
+      const declaredName = req.headers['mcp-name'];
+      if (declaredName && declaredName !== params.name) {
+        sendJson(res, error(id, -32602, 'mcp-name header mismatch'));
+        return;
+      }
+
+      if (safePocToolNames.has(params.name)) {
+        sendJson(res, result(id, await callSafePocTool(params.name, params.arguments ?? {})));
         return;
       }
 
@@ -183,7 +286,7 @@ export function createProbeServer({ logPath, expectedConversationId = null } = {
         observedAt: new Date().toISOString(),
         oauthVerified: false,
         headers: sanitizeHeaders(req.headers, expectedConversationId),
-        meta: sanitizeMeta(params._meta, expectedConversationId),
+        meta: sanitizeMeta(params?._meta, expectedConversationId),
       };
 
       if (logPath) {

@@ -11,9 +11,9 @@
 - 正式项目根：`/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge`
 - Runtime project identity boundary：`/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge/.git`（Adaptive Agent Runtime 当前以 Git common-dir 作为项目身份边界；没有额外 project_id UUID 字段）
 - Git branch：`main`
-- Git HEAD：`null` / unborn；当前尚无首个 commit
+- Git HEAD：`513ad89503adfdd68dba1f4ab9e4d8994b47fdb7`（本轮 fresh-read；后续以 `git rev-parse HEAD` 为准）
 - 唯一 logical Controller ID：`a697051d-402b-4062-a883-a29ba8b395e9`
-- 当前用户授权 Web execution target：`6a9e4037-0a00-83ea-bb8e-1301c5f6b979`
+- 当前用户授权 Web execution target：`6a9e4158-cc8c-83ea-9763-05a7fd51f597`
 - Bootstrap binding：`provenance=manual_user_authorized`、`binding=temporary`、`host_attested=false`、Runtime lease `mode=resume_only`
 - 重要语义：Runtime identity CLI 对当前唯一 Web alias 会显示 `VERIFIED / BOUND_REGISTERED_WEB_SESSION / legacy_single_binding`；这只表示 registry binding 可解析，**不等于 host-attested Web identity**，不得把它描述成强身份绑定成功。
 
@@ -90,3 +90,59 @@ Runtime collaborative 初始化器已建立并复用：
 `ChatGPT Web -> minimal identity_probe -> sanitized headers / MCP _meta / OAuth/client facts -> attestation correlation decision`
 
 目标是明确哪些信号可以作为机器验证输入、哪些只是相关性。只有形成可信 execution-session / host-session attestation 后，才继续 `LAB-GOV-02` 的真实 continuation Live-E2E，并最终淘汰 `manual_user_authorized` Bootstrap binding。
+
+## Current Web target reconciliation
+
+- 用户当前明确授权 Web execution entry：`6a9e4158-cc8c-83ea-9763-05a7fd51f597`
+- prior alias `6a9e4037-0a00-83ea-bb8e-1301c5f6b979`：historical only
+- Runtime lineage：新 session 已登记到同一 logical Controller
+- Runtime machine projection：`UNVERIFIED / historical_alias / STALE / EXPLICIT_CURRENT_TARGET_REQUIRED`
+- `controller_actions_allowed=false`，`host_attested=false`
+- 旧 manual lease 尚指向 prior alias；canonical authorize/rotation 被新 Runtime 门禁拒绝，因为没有 explicit verified current Web target
+- 因此不得把本次登记描述成 host-attested/current-target 强绑定成功；后续需要 Runtime 提供 Web target replace/unbind/verified rotation 能力，或由新 Bridge 提供可信 host attestation。
+
+
+## Product architecture boundary added during PoC
+
+- Local Tool Bridge / Computer Runtime 必须保持 model-agnostic；不得硬编码 ChatGPT Web 模型调用、模型路由或 Agent lifecycle。
+- 未来 Web ChatGPT Executor 是独立 adapter / executor plane，由 Adaptive Agent Runtime 路由；需要本机能力时再调用 Local Tool Bridge。
+- 推荐边界：`Adaptive Agent Runtime -> Web ChatGPT Executor -> Personal ChatGPT Web`；本机工具路径为 `Web ChatGPT Executor -> Local Tool Bridge -> ... -> Computer Runtime / local machine`。
+- Web conversation 与 Bridge execution session 的关联由外部 adapter/orchestration 层持有；Bridge 只报告其实际可验证的 transport/session/capability facts。
+
+## Current LAB-ID-02 PoC checkpoint
+
+- Plus Personal 当前真实 UI 已验证 `Plugins -> Create app` 存在。
+- New Plugin 表单已验证 Connection 支持 `Server URL / Tunnel`，Authentication 支持 `OAuth / No Auth / Mixed`。
+- 专用只读 `identity_probe` 正在 `127.0.0.1:33302` 运行；临时 localhost.run TLS ingress 的公网 `server/discover` 已 PASS。
+- 旧 `experiments/web-local-poc/proxy.mjs -> CatDesk` 链路不作为本轮 identity Web ingress，因为它会扩大到 CatDesk 完整工具面；本轮先只暴露只读 identity probe。
+- 当前唯一 UI 阻点：AI-Bridge browser 无法可靠修改原生 Authentication `<select>`；待值切为 `No Auth` 后可继续 Create -> real Web tool call。
+- N6 PREP：`experiments/web-local-poc/safe-poc-server.mjs` 已本地真实 PASS read/write/edit/fixed harmless command/background job start+poll；固定 workspace、固定动作，不接受任意路径或任意 shell；仍不得冒充 Web E2E。
+
+
+## LAB-ID-02 final PoC result — CONDITIONAL-GO
+
+第一轮真实 Personal ChatGPT Plus Web PoC 已完成，结论为 **CONDITIONAL-GO**：核心产品路径成立，没有发现平台级不可行 blocker；剩余问题属于安全化、能力泛化、产品化与 Computer Runtime 实现。
+
+真实通过链路：
+
+`ChatGPT Plus Personal -> Custom Plugin -> OpenAI Secure MCP Tunnel -> Local Bridge PoC -> isolated local workspace`
+
+本轮关键事实：
+
+- 在 Plus Personal 真实 UI 中成功创建并连接 `Local Bridge Identity Probe` 自定义 Plugin。
+- 使用独立 tunnel `tunnel_6a9e90a02f548191b3f2458617513158`，没有复用旧 AI-Bridge tunnel 作为本项目产品路径。
+- OpenAI `tunnel-client` runtime 对本项目 tunnel 报 `healthy=true`、`ready=true`，MCP session 初始化成功。
+- 为兼容当前 ChatGPT connector contract，`identity_probe` 已支持 OpenAI `server/discover` 的 `resultType/supportedVersions/capabilities/ttlMs/cacheScope/_meta.serverInfo` 结构，以及 `tools/list` 的 `resultType/ttlMs/cacheScope/tools` 结构。
+- 首次真实 Web `identity_probe` tool call 成功。
+- 随后通过同一 Plugin Refresh 更新安全 PoC tool inventory，并由普通 Personal Web 测试 chat 真实按顺序调用：`poc_read`、`poc_write`、`poc_edit`、`poc_command`、`poc_start_job`、`poc_poll_job`。
+- 本机固定隔离 workspace 最终 `write-target.txt` 内容为 `edited-by-chatgpt-web-poc`；固定 `/bin/pwd` command 返回隔离 workspace；后台 job 最终 finished。
+- 所有 PoC side effects 都限制在固定 test workspace / fixed command / fixed short job，不代表通用 Files/Shell 已安全上线。
+
+身份观测结论：
+
+- 真实 OpenAI tunnel 请求可观察到脱敏后的 `x-openai-session`、`x-openai-subject`、`x-request-id`、trace 与 forwarded-client-cert 类信号。
+- 同一 Web executor chat 的 `x-openai-session` 指纹在 read/write/edit/command/job start/poll 六次调用间稳定。
+- `x-openai-subject` 指纹在两个不同 Personal Web 测试 chat 间保持稳定。
+- 目前没有观察到可直接等同于 ChatGPT conversation ID 的机器字段；这些 header 只能先作为 transport/session/principal correlation facts，不能直接升级为 Adaptive Agent Runtime Controller host attestation。
+
+因此下一条真实关键路径切换为 `LAB-SAFE-01`：Auth -> Execution Session -> Capability -> Authorization -> Workspace/Shell isolation。Local Tool Bridge / Computer Runtime 继续保持 model-agnostic；Web ChatGPT Executor 仍属于未来独立 executor plane。
