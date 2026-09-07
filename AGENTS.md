@@ -72,6 +72,22 @@ and, when local capabilities are needed:
 
 Current interfaces must preserve this separation even during PoC shortcuts. Correlation between Web conversation/execution identity and Bridge execution sessions belongs in the external adapter/orchestration layer unless the Bridge is merely reporting machine-verifiable transport/session facts.
 
+### 1.4.2 Formal Web ChatGPT Executor contract
+
+The Web ChatGPT Executor is a provider-specific executor adapter behind the existing Adaptive Agent Runtime canonical Assignment / route / lifecycle machinery. Runtime remains responsible for Controller, Goal, DAG, READY/WIP, canonical Assignment, route selection, timeout/retry/cancel/recovery policy, terminal handling, Reviewer acceptance, ownership/generation fencing, and SAME-Controller continuation. Runtime must not contain ChatGPT DOM selectors, page-button logic, Playwright/CDP selectors, or browser implementation details.
+
+The Web ChatGPT Executor Adapter owns only the provider execution plane: authenticated Personal ChatGPT Web session reuse, real conversation creation/binding, unique adapter execution_id creation, assignment/execution/browser-session/conversation correlation, requested-versus-observed model handling, prompt dispatch, queued/running/terminal observation, automatic completion detection, result extraction, bounded timeout/cancel/recovery, and emission of machine-readable execution events.
+
+Browser automation is only an implementation mechanism. Opening ChatGPT, typing a prompt, scraping text, or manually creating a chat is not a formal Executor spawn. A formal execution requires a real dispatch primitive plus a unique execution_id and durable correlation from assignment -> execution -> conversation -> result -> terminal.
+
+Identity layers must remain distinct: Runtime logical Controller identity, Runtime assignment identity, Web Executor execution identity, browser session identity, ChatGPT conversation identity, provider/model identity, and Local Tool Bridge execution-session identity. If OpenAI does not expose machine-verifiable host/conversation attestation, the adapter may provide machine-verifiable adapter execution identity and persisted correlation, but must label OpenAI host attestation as unavailable/partial rather than fabricate it.
+
+### 1.4.3 Host-neutral pluggable executor routing
+
+Controller host type, Executor type, model/provider type, and Local Tool Plane are orthogonal. A Web Controller may route to Web ChatGPT, desktop Codex, Kimi, Grok, another external executor, or an independent Reviewer when the canonical route and real executor capability allow it. Web ChatGPT Executor may optionally call Local Tool Bridge for local capabilities. Local Tool Bridge and Computer Runtime remain independently runnable when Adaptive Agent Runtime is off.
+
+Adaptive Agent Runtime should evolve through its existing Executor/Assignment abstraction toward pluggable provider adapters such as web_chatgpt, web_claude, web_gemini, codex_desktop, kimi, grok, or local_llm. Provider-specific browser/session logic stays inside the adapter; adding a new provider must not modify Controller governance or Local Tool Bridge.
+
 SelfAlone is a separate project. It may be used only as an external E2E target / fixture when that is useful for validating the Bridge or Computer Runtime. This project must not modify SelfAlone main, reuse its task ledger or Controller identity, or take over its Controller lifecycle as part of normal development.
 
 ### 1.5 Controller-gated actions must follow machine facts when available
@@ -111,7 +127,7 @@ Agents must not infer that `smaller command = allowed` or `larger command = bloc
 
 The user has explicitly authorized the following current Web execution target to act as the **only project-level Controller execution entry during bootstrap development**:
 
-- `web_execution_target_id = 6a9e4158-cc8c-83ea-9763-05a7fd51f597`
+- `web_execution_target_id = 6a9e41a2-266c-83ea-9104-e768ed4ad3f2`
 - `provenance = manual_user_authorized`
 - `binding = temporary`
 - `host_attested = false`
@@ -126,7 +142,7 @@ The canonical Adaptive Agent Runtime registry now contains one project-specific 
 
 - `project_identity = /Users/echoman/Documents/ChatGPT/Local-Agent-Bridge/.git` (Git common-dir; this is the Runtime project identity boundary)
 - `logical_controller_id = a697051d-402b-4062-a883-a29ba8b395e9`
-- `web_execution_target_id = 6a9e4158-cc8c-83ea-9763-05a7fd51f597`
+- `web_execution_target_id = 6a9e41a2-266c-83ea-9104-e768ed4ad3f2`
 - `provenance = manual_user_authorized`
 - `binding = temporary`
 - `host_attested = false`
@@ -154,7 +170,7 @@ During this temporary phase:
 If the active Web conversation changes before strong binding exists, the new execution target must receive fresh explicit user authorization; agents must not silently inherit this Web ID as current ownership.
 
 
-Bootstrap machine-binding note (2026-09-07): the user-authorized current Web execution entry is `6a9e4158-cc8c-83ea-9763-05a7fd51f597`. Adaptive Agent Runtime has recorded it in this Controller's Web lineage, but currently projects it as `historical_alias / STALE / EXPLICIT_CURRENT_TARGET_REQUIRED`; `host_attested=false` and Controller actions are not machine-authorized by this alias alone. The prior alias `6a9e4037-0a00-83ea-bb8e-1301c5f6b979` is historical only and must not be treated as the current project Controller execution entry.
+Bootstrap machine-binding note (2026-09-07): Runtime canonical ownership currently selects Web execution target `6a9e41a2-266c-83ea-9104-e768ed4ad3f2` at generation 1 with provenance `manual_user_authorized` and `host_attested=false`. The earlier `6a9e4158-cc8c-83ea-9763-05a7fd51f597` entry remains lineage/history only. Adaptive Agent Runtime has recorded it in this Controller's Web lineage, but currently projects it as `historical_alias / STALE / EXPLICIT_CURRENT_TARGET_REQUIRED`; `host_attested=false` and Controller actions are not machine-authorized by this alias alone. The prior alias `6a9e4037-0a00-83ea-bb8e-1301c5f6b979` is historical only and must not be treated as the current project Controller execution entry.
 
 ## 3. Automatic retirement conditions for bootstrap binding
 

@@ -1,0 +1,11 @@
+{
+  "name": "local-agent-bridge-web-chatgpt-executor-poc",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test executor.test.mjs"
+  },
+  "dependencies": {
+    "chatgpt-web-mcp": "github:Goudu666/chatgpt-web-mcp#4a87c728bacbadc4ff05cdffa061eb5cf3265e49"
+  }
+}

@@ -4,11 +4,15 @@
 
 ## 架构
 
-长期架构必须保持解耦：
+长期架构必须保持两条可组合但独立的链：
 
-`Agent / ChatGPT Web -> Local Agent Bridge -> Files / Shell / Process / Browser / Computer Runtime -> local machine`
+产品本机工具链：Personal ChatGPT Web / other agent -> Local Agent Bridge -> Files / Shell / Process / Browser / Computer Runtime -> local machine。
 
-Adaptive Agent Runtime 可以作为开发期 orchestration infrastructure，通过 adapter 调用 Bridge；Bridge 也可以暴露 Runtime 所需的 assignment/lifecycle 适配信息。但核心 Bridge / Computer Runtime 不得要求 Runtime、Controller registry、Goal 或 TASK_LEDGER 才能启动和执行本机能力。
+Web Executor 链：Adaptive Agent Runtime -> canonical route -> Web ChatGPT Executor Adapter -> authenticated Personal ChatGPT Web session -> ChatGPT conversation -> Web model -> result/terminal -> SAME Controller continuation。
+
+需要本机能力时，只在 Executor 侧组合：Web ChatGPT Executor -> Local Tool Bridge -> local capabilities。
+
+Adaptive Agent Runtime 可以作为开发期 orchestration infrastructure；核心 Bridge / Computer Runtime 不得要求 Runtime、Controller registry、Goal、TASK_LEDGER、Web model routing 或 Web conversation lifecycle 才能启动和执行本机能力。
 
 ## 数据与接口
 
@@ -20,6 +24,9 @@ Adaptive Agent Runtime 可以作为开发期 orchestration infrastructure，通�
 - Runtime registration / ownership / generation。
 
 未来强绑定接口需要至少覆盖 execution-session authentication、host/session attestation、challenge/capability verification、execution-target identity、过期/撤销与 replay 防护。当前 `manual_user_authorized` 仅是 Bootstrap 治理授权，不是协议设计。
+
+
+Web Executor machine state 只保存 execution correlation，不成为第二份 TASK_LEDGER。最小字段包括 assignment_id、execution_id、attempt、browser_session_id、conversation_id（若可观察）、provider/model requested/observed、model_attestation、status、started/updated/terminal timestamps、result locator、terminal receipt、recovery generation 与 provenance。Runtime canonical Assignment lifecycle 仍是最终状态权威。
 
 ## 安全与外部依赖
 

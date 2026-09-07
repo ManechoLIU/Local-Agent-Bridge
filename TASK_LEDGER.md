@@ -4,12 +4,12 @@
 
 ## 当前目标
 
-- 当前 Goal：`LAB-SAFE-01` 在已通过的 Personal ChatGPT Web Plus → Custom Plugin → Secure MCP Tunnel → Local Bridge → Mac 链路上闭合 Auth / Execution Session / Capability / Authorization / Workspace / Shell 安全边界
-- 下一可见检查点：`LAB-SAFE-01` 给出可测试的 request identity / execution session / capability / authorization contract，并用 hardlink、nonexistent-target write/move 与 shell breakout RED→GREEN harness 验证
-- 当前活动项：`LAB-SAFE-01`（项目总控直接执行；无 Runtime assignment lease）
-- 当前阻塞：产品关键路径无平台级阻塞；第一轮 PoC 已判定 `CONDITIONAL-GO`。Runtime 强身份 Live-E2E 仍是独立治理 debt，不阻塞 Local Bridge 安全化与产品开发
-- 规则版本：Adaptive Agent Runtime `3032a7b57f898efc9872955c8886c8be11b48329`
-- Web target reconciliation：`6a9e4158-cc8c-83ea-9763-05a7fd51f597` 已通过 canonical `bind-web-session` 加入唯一 Controller lineage；`identity=UNVERIFIED`, `binding_mode=historical_alias`, `reason=EXPLICIT_CURRENT_TARGET_REQUIRED`, `controller_actions_allowed=false`。旧 `6a9e4037-0a00-83ea-bb8e-1301c5f6b979` 仅为历史 alias；manual lease 尚未旋转，原因是 installed Runtime 要求先建立 verified explicit current Web target。
+- 当前 Goal：保持 LAB-SAFE-01 Bridge 安全化主线不回退，同时启动独立 LAB-WEX-01 Web ChatGPT Executor PoC，证明 Runtime canonical Assignment -> Personal ChatGPT Web -> automatic result/terminal -> SAME Controller continuation
+- 下一可见检查点：LAB-WEX-01 先建立真实 assignment_id <-> execution_id <-> browser_session/conversation correlation 与自动 completion/result；再接现有 Runtime prepare/bind/watch/recovery/continuation，不把 browser automation 当 PASS
+- 当前活动项：LAB-WEX-01
+- 当前阻塞：无平台级产品 blocker。Runtime exact revision 65d381d 已 ACK；Live-E2E 因 Web Host attestation verifier unavailable 仅做 revision-scoped deferral，状态 current_deferred_live_e2e / blocking=false，不是 PASS。Web Executor production capability 仍 host_limited/configured=false，缺可信 child machine-event source 与 real dispatch adapter
+- 规则版本：Adaptive Agent Runtime `65d381d9715087610a8d715681f53c185b7b6212`；installed manifest sha256=`78902f7010d27990f33f8cdbe3a8ffb6595c07a16c3c3221ea5ad331f07140c7`；`web_agent_execution=status:host_limited, configured:false`，不得把 browser automation 或手工聊天冒充 production Web dispatch
+- Web ownership fresh fact：Runtime registry 当前唯一 Controller `a697051d-402b-4062-a883-a29ba8b395e9` 的 active_host=web，execution_target_session_id=`6a9e41a2-266c-83ea-9104-e768ed4ad3f2`，generation=1，provenance=manual_user_authorized，host_attested=false。canonical identity projection 因 HOST_SESSION_ID_UNAVAILABLE 为 DEGRADED；本次人工 wake 不是 strong Host attestation。
 
 
 ## 任务拆分
@@ -17,12 +17,17 @@
 | ID | 状态 / 负责人 | 目标与边界 | 依赖 / 阻塞 | 验收与验证 | 证据 / 下一步 |
 | --- | --- | --- | --- | --- | --- |
 | LAB-GOV-01 | `DONE` / 项目总控 | 建立本项目最小 Adaptive Agent Runtime 治理：独立 project identity、唯一 logical Controller、temporary Web binding、协作文档骨架、规则安装兼容 | 不得复用 SelfAlone 身份；初始化期间发现 unborn Git 生命周期缺陷 | Runtime registry 唯一 Controller；manual lease 存在；unborn snapshot/restore 回归 PASS；修复安装到当前 Runtime | project identity `.git`；Controller `a697051d-402b-4062-a883-a29ba8b395e9`；Runtime `e639d0656d8161f02f00aace6f6d7daa374e349a` |
-| LAB-GOV-02 | `BLOCKED` / 项目总控 | 最终闭合 Runtime continuation 强身份 Live-E2E：host-attested current target → confirmed wake → clean CLOSED controller cycle → accept-live-e2e | 当前只有 `manual_user_authorized / resume_only / host_attested=false`；用户已明确要求该缺口不得阻塞当前开发，Runtime `3032a7b...` 提供 revision-scoped deferral | 当前开发期要求 `current_deferred_live_e2e` + launch-guard allowed；最终仍必须取得真实 host-attested E2E，不得把 deferral 当 PASS | 继续 `LAB-ID-02`；新 Bridge identity/attestation 成立后恢复本任务并做真实验收 |
+| LAB-GOV-02 | `BLOCKED` / 项目总控 | 最终闭合 Runtime continuation 强身份 Live-E2E：host-attested current target → confirmed wake → clean CLOSED controller cycle → accept-live-e2e | 当前 Web Host attestation verifier unavailable；Runtime `65d381d...` 已 exact ACK，并按本次人工 wake 事实做 revision-scoped deferral；人工 wake 不是 strong Host attestation | 当前 `current_deferred_live_e2e / blocking=false / launch-guard allowed` 仅允许非身份敏感开发继续；最终仍须真实 host-attested E2E，不得把 deferral 当 PASS | Host verifier 可用后恢复本任务并完成 confirmed wake + CLOSED cycle + accept-live-e2e |
 | LAB-BASE-01 | `DONE` / 项目总控 | 收编既有 CatDesk / chatgpt-local-coder PoC、旧 Web/桌面成果与安全调查，不重新克隆或重做已完成调查 | 以 Git/filesystem/CHECKPOINT 证据为准 | 既有路径、安全结论、未验证项和交接风险已恢复 | `CHECKPOINT.md`；CatDesk PoC `/Users/echoman/CatDesk-PoC-20260907`；下一步只在事实失效时复验 |
 | LAB-ID-01 | `DONE` / 项目总控 | 建立最小只读 `identity_probe`，只观察和脱敏身份信号，不宣称认证 | 不开放完整 Files/Shell/Browser | 当前 `node --test experiments/identity-probe/server.test.mjs` 5/5 PASS；`oauthVerified=false` 明确保留；已兼容 ChatGPT `server/discover` / `tools/list` contract | `experiments/identity-probe/server.mjs`、`server.test.mjs` |
 | LAB-ID-02 | `DONE / CONDITIONAL-GO` / 项目总控 | 第一轮核心 PoC：Personal ChatGPT Web Plus → Custom Plugin/MCP → OpenAI Secure MCP Tunnel → Local Bridge → Mac；真实完成 read/write/edit/command/job，同时捕获 identity/auth signals | 无平台级 blocker；当前 PoC harness 仍是固定能力、安全隔离版本，不代表通用 Files/Shell 已可上线 | 真实 Personal Web `tools/call` 已依次完成 `poc_read`、`poc_write`、`poc_edit`、`poc_command`、`poc_start_job`、`poc_poll_job`；本机文件最终为 `edited-by-chatgpt-web-poc`；job finished；正式判定 `CONDITIONAL-GO` | `Local Bridge Identity Probe` 已安装并连接；独立 Secure MCP Tunnel `tunnel_6a9e90a02f548191b3f2458617513158` 曾用于本轮证据；进入 `LAB-SAFE-01` |
-| LAB-SAFE-01 | `ACTIVE` / 项目总控 | 闭合 Auth → Execution Session → Capability → Authorization → Workspace/Shell isolation；Bridge 只保留 model-agnostic transport/session/capability facts | `LAB-ID-02` 已完成；`x-openai-session`/`x-openai-subject` 目前只可作为 OpenAI tunnel correlation facts，尚不得等同 Web conversation / Runtime Controller identity | 先形成 contract + RED tests；hardlink escape、nonexistent-target write/move、shell breakout 必须 fail closed；再验证 fixed capability → scoped general capability 的升级 | 立即定义 threat model / request context / capability policy，并对已知 CatDesk 风险建 RED harness |
+| LAB-SAFE-01 | `READY` / 项目总控 | 闭合 Auth → Execution Session → Capability → Authorization → Workspace/Shell isolation；Bridge 只保留 model-agnostic transport/session/capability facts | `LAB-ID-02` 已完成；`x-openai-session`/`x-openai-subject` 目前只可作为 OpenAI tunnel correlation facts，尚不得等同 Web conversation / Runtime Controller identity | 先形成 contract + RED tests；hardlink escape、nonexistent-target write/move、shell breakout 必须 fail closed；再验证 fixed capability → scoped general capability 的升级 | 立即定义 threat model / request context / capability policy，并对已知 CatDesk 风险建 RED harness |
 | LAB-COMP-01 | `BLOCKED` / 项目总控 | 定义并验证独立 Computer Runtime 最小 API、授权与 Bridge 调用 E2E | 依赖 `LAB-ID-02` 与安全能力边界；本轮不做 GUI/Computer 产品实现 | Bridge → Computer Runtime 的真实授权调用与隔离证据 | 等待 `LAB-ID-02`，本轮不实施 |
+| LAB-WEX-01 | `ACTIVE` / 项目总控 | 最小 Web ChatGPT Executor Adapter PoC：复用真实登录 Personal ChatGPT Web；建立 execution_id、conversation correlation、自动 completion/result；不触碰 Bridge 产品边界 | Runtime 已有 Web prepare/bind/watch/recovery/continuation 骨架，但 manifest 为 host_limited/configured=false；当前宿主无可靠 child dispatch primitive，因此由 Controller 直接开发 adapter PoC | 先达到 adapter-level PARTIAL：真实 Web 模型执行 + durable execution correlation + 自动 terminal/result；再接 Runtime canonical lifecycle | 借鉴 chatgpt-use logged-in relay/session/conversation/completion 与 chatgpt-web-mcp persistent browser/model/recovery pattern；不采用 access-token/cookie 抽取作为主路 |
+| LAB-WEX-02 | `BLOCKED` / 项目总控 | Runtime canonical integration：provider=chatgpt_web route -> adapter spawn -> machine started -> canonical lease -> terminal -> SAME Controller continuation | 依赖 LAB-WEX-01 的可复验 adapter machine-event source；不得用 DOM/tab/本地随意 JSON 自证 Host attestation | 完整 assignment -> execution -> result -> terminal -> continuation 闭环才允许 Web Executor PASS | 优先扩展 Runtime 现有 web_agent_execution，不另造第二 lifecycle |
+| LAB-WEX-03 | `BLOCKED` / 项目总控 | 并发与恢复：两个 Web child；reload/browser restart/long response/interrupted/retry/cancel | 依赖 LAB-WEX-02 canonical lifecycle | 两 child 不串线；恢复后关联稳定；中断/cancel 有可信 terminal | WEX-02 后执行 |
+| LAB-WEX-04 | `BLOCKED` / 项目总控 | 解耦组合验收：Web Executor 可选调用 Local Tool Bridge；Runtime OFF Bridge 独立；Bridge OFF Web Executor 完成纯 reasoning | 依赖 LAB-WEX-02；本机 capability 仍受 LAB-SAFE-01 安全边界 | independence gates + optional local-tool E2E | 不把 model/runtime lifecycle 逻辑塞回 Bridge |
+| LAB-WEX-05 | `BLOCKED` / 独立 Reviewer | Architecture / Lifecycle / Security 独立审查与 PASS/PARTIAL/NO-GO | 依赖 WEX-01..04 证据；无真实 reviewer dispatch primitive 时不得假装已派发 | 检查层次解耦、terminal/continuation、凭据与 identity provenance | 等真实 Reviewer executor availability |
 
 ## 当前事实摘要
 
@@ -30,17 +35,17 @@
 - Runtime project identity boundary：`/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge/.git`
 - Git：`main`；已建立首个 governance baseline `b909f3ebcbabf92cd07245876949f7ad749ab4bb`，后续 worktree / delegated assignment 可基于稳定 revision。
 - 唯一 logical Controller：`a697051d-402b-4062-a883-a29ba8b395e9`。
-- 当前用户授权 Web execution target：`6a9e4158-cc8c-83ea-9763-05a7fd51f597`。
+- Runtime current Web execution target：`6a9e41a2-266c-83ea-9104-e768ed4ad3f2`，generation=1，provenance=manual_user_authorized，host_attested=false；本次人工 wake 不提升 attestation。
 - Bootstrap binding：`provenance=manual_user_authorized`、`binding=temporary`、`host_attested=false`、Runtime lease mode=`resume_only`。
-- 当前 `LAB-SAFE-01` 为 Controller 直接执行的 `ACTIVE` 产品工作；Runtime assignment state 仍无 non-terminal lease，因此不存在需要重复派发/恢复的 executor assignment。
+- Runtime assignment state fresh-read 仍为 leases={} / lineages={}，没有可恢复 non-terminal assignment。当前只有 Controller direct WIP=LAB-WEX-01；LAB-SAFE-01=READY。没有真实 dispatch primitive 时不得通过写 ACTIVE、开 browser tab 或手工新聊天冒充 child spawn。
 - SelfAlone 是完全独立项目，只可作为未来外部 E2E target / fixture；不得修改其 main、复用其 Controller/台账或接管 lifecycle。
 
 ## 最近证据
 
 | 任务 | 候选 / 环境 | 验证结果 | 证据位置 / 失效条件 |
 | --- | --- | --- | --- |
-| LAB-GOV-01 | installed Runtime | unborn project regression 已 PASS；installed Runtime 当前为 `3032a7b57f898efc9872955c8886c8be11b48329`，新增 Web host attestation unavailable 的显式 revision-scoped Live-E2E deferral | 若安装 revision 再变化需重新 handshake |
-| LAB-GOV-01 | controller registry | 本项目只有 `a697051d-402b-4062-a883-a29ba8b395e9` 一个 Controller；Web lineage 含历史 `6a9e4037-0a00-83ea-bb8e-1301c5f6b979` 与当前用户授权 `6a9e4158-cc8c-83ea-9763-05a7fd51f597`；Runtime 尚无 explicit current Web target | `~/.codex/adaptive-delivery-controllers.json`；后续 canonical ownership/generation 变更时失效 |
+| LAB-GOV-01 | installed Runtime | installed Runtime exact revision 已 fresh-read 为 `65d381d9715087610a8d715681f53c185b7b6212`；manifest impact=`live_assignments`，Web host attestation 仍 unavailable，`web_agent_execution` 仍 `host_limited/configured=false` | 本 revision 已完成 canonical ACK；Live-E2E 不得伪造，按当前 host-attestation 实际能力单独处理 |
+| LAB-GOV-01 | controller registry | 本项目仅 `a697051d-402b-4062-a883-a29ba8b395e9` 一个 Controller；canonical target 当前为 Web `6a9e41a2-266c-83ea-9104-e768ed4ad3f2` generation=1；provenance=manual_user_authorized，host_attested=false；identity projection=DEGRADED/HOST_SESSION_ID_UNAVAILABLE | `~/.codex/adaptive-delivery-controllers.json`；后续 ownership/generation 变更时失效 |
 | LAB-ID-01 | local Node test | 5 tests PASS / 0 FAIL | `node --test experiments/identity-probe/server.test.mjs`；实现或测试变化时重跑 |
 | LAB-BASE-01 | historical PoC | hardlink read escape 已复现；CatDesk identity/shell/computer 边界仍不足以直接 Go | `CHECKPOINT.md` 与 `/Users/echoman/CatDesk-PoC-20260907`；若上游/实现变化需复验 |
 
@@ -50,4 +55,9 @@
 | LAB-ID-02 | Safe Web-E2E harness local preflight | `safe-poc-server.mjs` 对固定隔离 workspace 的 read/write/edit/`/bin/pwd`/background job start+poll 全部本地 PASS；不接受任意路径或任意 shell | `experiments/web-local-poc/safe-poc-server.mjs`；仅为 N6 PREP，不能替代 Personal Web E2E |
 | LAB-ID-02 | Personal Plus real Web E2E | `Local Bridge Identity Probe` 自定义 Plugin 经独立 OpenAI Secure MCP Tunnel 调用本机；真实 Web `tools/call` 依次命中 read/write/edit/fixed command/start job/poll job；workspace 最终写入 `edited-by-chatgpt-web-poc`，job 返回 finished | 脱敏证据：`experiments/web-local-poc/logs/identity-probe-web.jsonl`（运行态，不提交）；PoC 结论 `CONDITIONAL-GO` |
 | LAB-ID-02 | Identity correlation | 同一 Web executor chat 的 `x-openai-session` 指纹在 6 次连续 tool calls 中稳定；`x-openai-subject` 指纹跨两个独立测试 chat 稳定；未观察到可直接等同 ChatGPT conversation ID 的机器字段 | 这些值当前只作为 OpenAI tunnel/session/principal correlation facts；未验证语义前不得用于 Runtime Controller host attestation |
-| LAB-GOV-02 | Runtime rule handshake | Runtime `3032a7b57f898efc9872955c8886c8be11b48329` exact ACK；按用户明确“临时绑定不得阻塞开发”要求执行 revision-scoped Live-E2E deferral；`launch-guard allowed` | `current_deferred_live_e2e` 不是强身份 PASS；后续 Bridge host attestation 可用时必须恢复真实 Live-E2E |
+| LAB-GOV-02 | Runtime rule handshake | Runtime exact revision `65d381d9715087610a8d715681f53c185b7b6212` 已 canonical ACK；manifest sha256=`78902f7010d27990f33f8cdbe3a8ffb6595c07a16c3c3221ea5ad331f07140c7`；当前按 verifier unavailable 做 exact-revision `current_deferred_live_e2e`，`launch-guard allowed` | deferral 不是强身份 PASS；本次人工 wake 也不是 Host attestation；Host verifier 可用后必须恢复真实 Live-E2E |
+
+| LAB-WEX-01 | Runtime executor revalidation | installed Runtime 65d381d manifest 明确 web_agent_execution=status:host_limited/configured:false；代码已存在 prepare_web_assignment_dispatch、bind_web_assignment_dispatch、watch/recover 与 SAME-controller continuation | 复用现有 canonical Runtime path，不另造 Assignment lifecycle |
+| LAB-WEX-01 | Existing pattern revalidation | chatgpt-use fresh HEAD 89634b2（2026-09-07）支持 logged-in Web relay/profile/session、conversation pinning、model selection、completion polling，但其 browser channel 自述 concurrency=1；chatgpt-web-mcp 具备 dedicated persistent profile、conversation/model/reload recovery 与 mutation-observer completion pattern | 只借鉴 browser/session/lifecycle；不复制其独立 ledger，也不优先使用 access-token/cookie/private API 方案 |
+| LAB-WEX-01 | Adapter offline gate | 新增 `experiments/web-chatgpt-executor`：独立 execution_id、assignment/execution/browser/conversation correlation、Personal Chat mode fail-closed、UI-observed model attestation=partial、queued/started/completed/failed event journal；4/4 Node tests PASS | 运行态 state/profile 不提交；raw prompt 不写 execution state；依赖 pin 到 chatgpt-web-mcp commit `4a87c728...` |
+| LAB-WEX-01 | Real browser preflight | dedicated ChatGPT Web browser 已真实启动；`signedIn=false`，profile=`~/.chatgpt-web-mcp/chrome-profile`；因此下一步是用户在该专用浏览器完成一次正常 ChatGPT 登录 | 这是当前唯一真实用户动作；不得复制 cookie/token 或借旧 AI-Bridge session 冒充登录 |
