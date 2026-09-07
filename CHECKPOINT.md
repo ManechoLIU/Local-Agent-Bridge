@@ -150,9 +150,12 @@ Runtime collaborative 初始化器已建立并复用：
 
 ## LAB-SAFE-01 security boundary progress
 
-- `experiments/security-boundary` Rust Harness 已扩到 16/16 PASS。
+- `experiments/security-boundary` Rust Harness 已扩到 17/17 PASS。
 - Authorization prototype 明确绑定 `principal_id / execution_session_id / capability_id / workspace_id`；不引用 ChatGPT model、Web conversation lifecycle、Runtime Controller/Goal/DAG。
 - Capability authority 新增 TTL、revocation、session-generation fencing、request nonce replay protection；authority key/state 0600 原子持久化，重启后 replay/revocation 仍保持。
+- Operational hardening 已补：master key 使用 versioned generation，rotation 采用“先落新 key、再原子提交 state pointer”的 crash-safe 顺序并带 expected-generation fence；state dir 0700、key/state 0600，symlink state path fail closed。
+- Local Tool Bridge 现在在任何 backend side effect 之前把 provider `x-request-id`/nonce replay state 持久化；同 provider request 重放在进程内与重启后都被 403 拒绝。ingress tests 5/5 PASS。
+- 第一次真实 Grok 4.6 xhigh Security Reviewer 调用确实启动并读取 immutable `d512734..0756cfa`，但宿主执行超时后没有得到最终 JSON verdict，因此该 review attempt 标记 `result_unknown`，没有冒充 Reviewer PASS，也不把它作为 SAFE-01 closure evidence。
 - Local ingress proof 使用 per-capability HMAC 逐请求绑定 principal/session/workspace、request ID/nonce、MCP method/tool 与 body hash；proof 可映射到 `x-lab-*` ingress headers，但 signing secret 不出本机 signer。
 - `x-openai-session` / `x-openai-subject` 明确留在 correlation-only 层：Harness 已验证它们不能单独作为 authorization source。
 - Unix Files prototype 使用 directory FD + `openat/O_NOFOLLOW/fstat/fstatat/renameat`，已闭合 hardlink read/write、symlink existing write、nonexistent target under symlink parent、traversal 与 secure move 的当前测试门。

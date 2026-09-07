@@ -46,24 +46,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         capabilities,
     };
 
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
     let mut authority = CapabilityAuthority::load_or_create_private(&state_dir)?;
-    let issued = match authority.issued_capability(&capability_id) {
-        Ok(value) => value,
-        Err(_) => {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX);
-            authority.issue(grant, now_ms, ttl_ms, 1)?
-        }
+    if env_flag("LAB_BRIDGE_ROTATE_MASTER_KEY") {
+        let expected = required_env("LAB_BRIDGE_EXPECTED_KEY_GENERATION")?
+            .parse::<u64>()
+            .map_err(|_| "LAB_BRIDGE_EXPECTED_KEY_GENERATION must be an integer")?;
+        authority.rotate_master_key_private(&state_dir, expected)?;
+    }
+    let issued = if authority.lease(&capability_id).is_some() {
+        authority.issued_capability_at(&capability_id, now_ms).map_err(|error| {
+            format!(
+                "existing capability {capability_id} is not reusable: {error}; rotate the capability/session identity explicitly"
+            )
+        })?
+    } else {
+        authority.issue(grant, now_ms, ttl_ms, 1)?
     };
     authority.save_private(&state_dir)?;
 
     // UDS ownership/permissions are the local ingress authentication boundary.
-    // A dummy key is internal-only because the router is never exposed on TCP.
-    let ingress =
-        BridgeIngress::new_trusted_unix_socket(authority, issued, context, &backend_url, policy)?;
+    // Capability replay state is persisted before any backend side effect.
+    let ingress = BridgeIngress::new_trusted_unix_socket(
+        authority,
+        issued,
+        context,
+        &backend_url,
+        policy,
+        state_dir.clone(),
+    )?;
     let app = ingress.router();
 
     let socket = PathBuf::from(&socket_path);
@@ -103,6 +118,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+}
+
+fn env_flag(name: &str) -> bool {
+    matches!(
+        env::var(name).ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
 }
 
 fn required_env(name: &str) -> Result<String, Box<dyn std::error::Error>> {

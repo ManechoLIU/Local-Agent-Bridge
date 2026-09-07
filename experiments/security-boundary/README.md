@@ -12,11 +12,12 @@ The macOS shell prototype uses `/usr/bin/sandbox-exec` as a **PoC isolation back
 
 ## Current executable gates
 
-`cargo test --manifest-path experiments/security-boundary/Cargo.toml` currently covers 16 passing tests, including:
+`cargo test --manifest-path experiments/security-boundary/Cargo.toml` currently covers 17 passing tests, including:
 
 - capability grant binding across principal/session/capability/workspace;
 - signed local-ingress request proofs that bind capability/principal/session/workspace + request id/nonce + MCP method/tool + body hash with HMAC-SHA256;
 - capability issuance TTL, revocation, session-generation fencing and replay rejection;
+- generation-fenced master-key rotation with crash-safe key-first/state-pointer commit ordering;
 - private 0600 authority key/state persistence with replay + revocation surviving restart;
 - signed ingress header serialization without exporting the per-capability signing secret;
 - explicit proof that `x-openai-subject` / `x-openai-session`-style correlation facts remain diagnostic and cannot authorize by themselves;
@@ -42,7 +43,7 @@ The security RED tests there first reproduced the current upstream behavior. Aft
 
 ## Remaining limitations before product promotion
 
-- Capability issuance/TTL/revocation/session-generation/replay now have a working local authority prototype with private restart persistence; the remaining product step is wiring a real local ingress signer/verifier around the Bridge HTTP/Unix-socket boundary and defining operational rotation/recovery policy.
+- Capability issuance/TTL/revocation/session-generation/replay now have a working local authority with private restart persistence; production ingress persists request IDs before backend dispatch, and master-key rotation is generation-fenced with versioned keys. Remaining product work is same-UID threat-boundary closure/decision plus packaging and recovery drills.
 - OpenAI tunnel correlation headers are not promoted to authenticated Web conversation or Runtime Controller identity.
 - `sandbox-exec` is macOS-specific and treated as a replaceable backend. Linux already has CatDesk Landlock support; Windows still needs a product-grade filesystem/network isolation decision.
 - The Unix inode checks substantially reduce symlink/hardlink/TOCTOU risk, but a malicious concurrent same-UID process can still race hard-link creation around an already-open file. A stronger worker/process ownership boundary is required if same-UID hostile concurrency is in scope.

@@ -8,7 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -157,18 +157,27 @@ struct CapabilityRecord {
     lease: CapabilityLease,
     revoked: bool,
     used_nonces: HashSet<String>,
+    #[serde(default)]
+    used_request_ids: HashSet<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CapabilityAuthoritySnapshot {
     schema_version: u32,
+    #[serde(default = "default_key_generation")]
+    key_generation: u64,
     records: HashMap<String, CapabilityRecord>,
     session_generations: HashMap<String, u64>,
+}
+
+fn default_key_generation() -> u64 {
+    1
 }
 
 #[derive(Debug)]
 pub struct CapabilityAuthority {
     master_key: [u8; 32],
+    key_generation: u64,
     records: HashMap<String, CapabilityRecord>,
     session_generations: HashMap<String, u64>,
 }
@@ -183,6 +192,7 @@ impl CapabilityAuthority {
     pub fn new_for_test(master_key: [u8; 32]) -> Self {
         Self {
             master_key,
+            key_generation: 1,
             records: HashMap::new(),
             session_generations: HashMap::new(),
         }
@@ -190,32 +200,38 @@ impl CapabilityAuthority {
 
     pub fn load_or_create_private(state_dir: impl AsRef<Path>) -> Result<Self, String> {
         let state_dir = state_dir.as_ref();
-        std::fs::create_dir_all(state_dir)
-            .map_err(|error| format!("capability state directory create failed: {error}"))?;
-        let key_path = state_dir.join("authority.key");
+        prepare_private_dir(state_dir)?;
         let state_path = state_dir.join("authority-state.json");
-        let master_key = if key_path.exists() {
-            let raw = std::fs::read_to_string(&key_path)
-                .map_err(|error| format!("capability authority key read failed: {error}"))?;
-            decode_hex_32(raw.trim())?
-        } else {
-            let mut key = [0_u8; 32];
-            OsRng.fill_bytes(&mut key);
-            write_private_atomic(&key_path, hex_encode(&key).as_bytes())?;
-            key
-        };
         if !state_path.exists() {
-            return Ok(Self::new_for_test(master_key));
+            let authority = Self::new_random();
+            authority.save_private(state_dir)?;
+            return Ok(authority);
         }
-        let raw = std::fs::read(&state_path)
-            .map_err(|error| format!("capability authority state read failed: {error}"))?;
+        let raw = read_private_file(&state_path, "capability authority state")?;
         let snapshot: CapabilityAuthoritySnapshot = serde_json::from_slice(&raw)
             .map_err(|error| format!("capability authority state parse failed: {error}"))?;
-        if snapshot.schema_version != 1 {
+        if snapshot.schema_version != 1 && snapshot.schema_version != 2 {
             return Err("unsupported capability authority state schema".into());
         }
+        let key_generation = snapshot.key_generation.max(1);
+        let key_path = private_key_path(state_dir, key_generation);
+        let legacy_key = state_dir.join("authority.key");
+        let selected = if key_path.exists() {
+            key_path
+        } else if key_generation == 1 && legacy_key.exists() {
+            legacy_key
+        } else {
+            return Err(format!(
+                "capability authority key generation {key_generation} is missing"
+            ));
+        };
+        let raw_key = read_private_file(&selected, "capability authority key")?;
+        let raw_key = String::from_utf8(raw_key)
+            .map_err(|_| "capability authority key is not UTF-8".to_string())?;
+        let master_key = decode_hex_32(raw_key.trim())?;
         Ok(Self {
             master_key,
+            key_generation,
             records: snapshot.records,
             session_generations: snapshot.session_generations,
         })
@@ -223,20 +239,60 @@ impl CapabilityAuthority {
 
     pub fn save_private(&self, state_dir: impl AsRef<Path>) -> Result<(), String> {
         let state_dir = state_dir.as_ref();
-        std::fs::create_dir_all(state_dir)
-            .map_err(|error| format!("capability state directory create failed: {error}"))?;
-        let key_path = state_dir.join("authority.key");
+        prepare_private_dir(state_dir)?;
+        let key_path = private_key_path(state_dir, self.key_generation);
         if !key_path.exists() {
             write_private_atomic(&key_path, hex_encode(&self.master_key).as_bytes())?;
         }
         let snapshot = CapabilityAuthoritySnapshot {
-            schema_version: 1,
+            schema_version: 2,
+            key_generation: self.key_generation,
             records: self.records.clone(),
             session_generations: self.session_generations.clone(),
         };
         let encoded = serde_json::to_vec_pretty(&snapshot)
             .map_err(|error| format!("capability authority state encode failed: {error}"))?;
         write_private_atomic(&state_dir.join("authority-state.json"), &encoded)
+    }
+
+    pub fn key_generation(&self) -> u64 {
+        self.key_generation
+    }
+
+    pub fn rotate_master_key_private(
+        &mut self,
+        state_dir: impl AsRef<Path>,
+        expected_generation: u64,
+    ) -> Result<u64, String> {
+        if self.key_generation != expected_generation {
+            return Err("master key generation fence mismatch".into());
+        }
+        let next = self
+            .key_generation
+            .checked_add(1)
+            .ok_or_else(|| "master key generation overflow".to_string())?;
+        let mut new_key = [0_u8; 32];
+        OsRng.fill_bytes(&mut new_key);
+        let state_dir = state_dir.as_ref();
+        prepare_private_dir(state_dir)?;
+        // Commit ordering is deliberate: write the new key first, then atomically
+        // publish state that points at it. A crash before the state commit keeps
+        // the previous generation authoritative; a crash after it has the key.
+        let new_key_path = private_key_path(state_dir, next);
+        if new_key_path.exists() {
+            return Err("next master key generation already exists".into());
+        }
+        write_private_atomic(&new_key_path, hex_encode(&new_key).as_bytes())?;
+        let previous_key = self.master_key;
+        let previous_generation = self.key_generation;
+        self.master_key = new_key;
+        self.key_generation = next;
+        if let Err(error) = self.save_private(state_dir) {
+            self.master_key = previous_key;
+            self.key_generation = previous_generation;
+            return Err(error);
+        }
+        Ok(next)
     }
 
     pub fn issue(
@@ -278,6 +334,7 @@ impl CapabilityAuthority {
                 lease,
                 revoked: false,
                 used_nonces: HashSet::new(),
+                used_request_ids: HashSet::new(),
             },
         );
         Ok(IssuedCapability {
@@ -305,6 +362,32 @@ impl CapabilityAuthority {
             capability_id: capability_id.to_string(),
             signing_secret,
         })
+    }
+
+    pub fn issued_capability_at(
+        &self,
+        capability_id: &str,
+        now_ms: u64,
+    ) -> Result<IssuedCapability, String> {
+        let record = self
+            .records
+            .get(capability_id)
+            .ok_or_else(|| "unknown capability".to_string())?;
+        if record.revoked {
+            return Err("capability revoked".into());
+        }
+        if now_ms < record.lease.issued_at_ms || now_ms > record.lease.expires_at_ms {
+            return Err("capability expired or not yet valid".into());
+        }
+        let current_generation = self
+            .session_generations
+            .get(&record.lease.grant.execution_session_id)
+            .copied()
+            .unwrap_or(record.lease.session_generation);
+        if current_generation != record.lease.session_generation {
+            return Err("capability belongs to a stale execution session generation".into());
+        }
+        self.issued_capability(capability_id)
     }
 
     pub fn revoke(&mut self, capability_id: &str) -> bool {
@@ -372,8 +455,11 @@ impl CapabilityAuthority {
         if proof.request_id.trim().is_empty() || proof.nonce.trim().is_empty() {
             return Err("request id and nonce are required".into());
         }
+        if record.used_request_ids.contains(&proof.request_id) {
+            return Err("request id replay detected".into());
+        }
         if record.used_nonces.contains(&proof.nonce) {
-            return Err("request replay detected".into());
+            return Err("request nonce replay detected".into());
         }
         let body_hash = sha256_hex(body);
         if body_hash != proof.body_sha256 {
@@ -395,6 +481,7 @@ impl CapabilityAuthority {
             .lease
             .grant
             .authorize(&context, required_capability)?;
+        record.used_request_ids.insert(proof.request_id.clone());
         record.used_nonces.insert(proof.nonce.clone());
         Ok(context)
     }
@@ -728,6 +815,40 @@ fn checked_components(path: &Path) -> Result<Vec<OsString>, String> {
     Ok(output)
 }
 
+fn prepare_private_dir(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("private state directory inspect failed: {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("private state directory must be a real directory, not a symlink".into());
+        }
+    } else {
+        std::fs::create_dir_all(path)
+            .map_err(|error| format!("capability state directory create failed: {error}"))?;
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("private state directory permission update failed: {error}"))?;
+    Ok(())
+}
+
+fn read_private_file(path: &Path, label: &str) -> Result<Vec<u8>, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("{label} inspect failed: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!("{label} must be a regular file, not a symlink"));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(format!(
+            "{label} permissions are too broad; require 0600-style privacy"
+        ));
+    }
+    std::fs::read(path).map_err(|error| format!("{label} read failed: {error}"))
+}
+
+fn private_key_path(state_dir: &Path, generation: u64) -> PathBuf {
+    state_dir.join(format!("authority.key.{generation}"))
+}
+
 fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
@@ -755,6 +876,11 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("private state sync failed: {error}"))?;
     std::fs::rename(&temporary, path)
         .map_err(|error| format!("private state atomic replace failed: {error}"))?;
+    let directory =
+        File::open(parent).map_err(|error| format!("private state parent open failed: {error}"))?;
+    directory
+        .sync_all()
+        .map_err(|error| format!("private state parent sync failed: {error}"))?;
     Ok(())
 }
 

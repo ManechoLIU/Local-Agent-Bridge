@@ -12,6 +12,7 @@ use reqwest::Url;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -97,6 +98,7 @@ struct BridgeIngressInner {
     backend_url: Url,
     client: reqwest::Client,
     policy: ToolPolicy,
+    state_dir: Option<PathBuf>,
 }
 
 impl BridgeIngress {
@@ -151,6 +153,7 @@ impl BridgeIngress {
                 backend_url,
                 client: reqwest::Client::new(),
                 policy,
+                state_dir: None,
             }),
         })
     }
@@ -161,6 +164,7 @@ impl BridgeIngress {
         context: ExecutionContext,
         backend_url: &str,
         policy: ToolPolicy,
+        state_dir: impl Into<PathBuf>,
     ) -> Result<Self, String> {
         if issued.capability_id != context.capability_id {
             return Err("issued capability does not match ingress execution context".into());
@@ -183,6 +187,7 @@ impl BridgeIngress {
                 backend_url,
                 client: reqwest::Client::new(),
                 policy,
+                state_dir: Some(state_dir.into()),
             }),
         })
     }
@@ -270,14 +275,21 @@ async fn handle_mcp(
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX);
-    if let Err(error) = state
-        .inner
-        .authority
-        .lock()
-        .await
-        .verify_request(&proof, &body, method, tool_name, capability, now_ms)
     {
-        return text_response(StatusCode::FORBIDDEN, &error);
+        let mut authority = state.inner.authority.lock().await;
+        if let Err(error) =
+            authority.verify_request(&proof, &body, method, tool_name, capability, now_ms)
+        {
+            return text_response(StatusCode::FORBIDDEN, &error);
+        }
+        if let Some(state_dir) = &state.inner.state_dir {
+            if let Err(error) = authority.save_private(state_dir) {
+                return text_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("capability replay state persistence failed: {error}"),
+                );
+            }
+        }
     }
 
     match forward_to_backend(&state, &headers, &proof.to_headers(), body).await {

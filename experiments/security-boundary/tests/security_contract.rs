@@ -404,7 +404,7 @@ fn revocation_and_replay_state_survive_private_restart() {
         .unwrap();
     authority.save_private(state_dir.path()).unwrap();
 
-    let key_mode = fs::metadata(state_dir.path().join("authority.key"))
+    let key_mode = fs::metadata(state_dir.path().join("authority.key.1"))
         .unwrap()
         .permissions()
         .mode()
@@ -528,6 +528,83 @@ fn normal_write_and_move_stay_inside_workspace() {
         .unwrap();
     assert_eq!(workspace.read_text("sub/b.txt").unwrap(), "hello");
     assert!(!workspace_dir.path().join("sub/a.txt").exists());
+}
+
+#[test]
+fn master_key_rotation_is_generation_fenced_and_crash_safe() {
+    let state_dir = tempdir().unwrap();
+    let (context, grant) = grant();
+    let mut authority = CapabilityAuthority::new_for_test([19_u8; 32]);
+    let issued_before = authority.issue(grant, 100, 10_000, 1).unwrap();
+    authority.save_private(state_dir.path()).unwrap();
+    assert_eq!(authority.key_generation(), 1);
+
+    let body = b"rotation-body";
+    let old_proof = sign_request(
+        &issued_before,
+        &context,
+        "rotation-old",
+        "rotation-nonce-old",
+        "tools/call",
+        "read",
+        body,
+    )
+    .unwrap();
+
+    assert_eq!(
+        authority
+            .rotate_master_key_private(state_dir.path(), 1)
+            .unwrap(),
+        2
+    );
+    assert_eq!(authority.key_generation(), 2);
+    assert!(state_dir.path().join("authority.key.1").is_file());
+    assert!(state_dir.path().join("authority.key.2").is_file());
+    assert!(
+        authority
+            .rotate_master_key_private(state_dir.path(), 1)
+            .is_err()
+    );
+
+    assert!(
+        authority
+            .verify_request(
+                &old_proof,
+                body,
+                "tools/call",
+                "read",
+                Capability::FileRead,
+                200,
+            )
+            .unwrap_err()
+            .contains("MAC")
+    );
+
+    let issued_after = authority.issued_capability_at("cap-a", 200).unwrap();
+    let new_proof = sign_request(
+        &issued_after,
+        &context,
+        "rotation-new",
+        "rotation-nonce-new",
+        "tools/call",
+        "read",
+        body,
+    )
+    .unwrap();
+    authority
+        .verify_request(
+            &new_proof,
+            body,
+            "tools/call",
+            "read",
+            Capability::FileRead,
+            200,
+        )
+        .unwrap();
+
+    let restarted = CapabilityAuthority::load_or_create_private(state_dir.path()).unwrap();
+    assert_eq!(restarted.key_generation(), 2);
+    assert!(restarted.issued_capability_at("cap-a", 200).is_ok());
 }
 
 #[test]

@@ -58,6 +58,8 @@ Bridge ingress 的下一层已验证为 **local-ingress signed request proof**�
 
 正式 Bridge 进程边界开始收敛为两个 crate：`bridge-security-core` 负责 capability authority 与 workspace/shell enforcement；`local-tool-bridge` 负责 model-agnostic MCP ingress、local authentication、method/tool→capability 映射和 signed request proof，再调用 loopback/Unix-socket backend。该分层不包含 Web model routing、Controller lifecycle 或 DAG。
 
+Operational authority state uses a 0700 private directory, versioned 0600 master-key files and a 0600 state snapshot. Master-key rotation is generation-fenced and crash ordered: write/sync the new key generation first, then atomically publish state that points to it. Request replay state is persisted before forwarding to any side-effecting backend; persistence failure returns an error and no backend call occurs.
+
 ### Local ingress transport
 
 正式候选优先使用 Unix-domain socket 而不是额外 loopback TCP shared-secret hop：socket 以 0600 创建，`tunnel-client`/本机 adapter 连接 UDS 后，Local Tool Bridge 才生成 per-request HMAC capability proof 并转发到 loopback-only backend。这样 OpenAI tunnel 只到本机 transport adapter，ChatGPT/Web 不需要持有 capability signing secret。UDS 仍不是同 UID 恶意进程的强隔离边界；若威胁模型包含 hostile same-UID process，需要额外 worker ownership/peer-credential/code-signing 或独立用户/沙箱边界。
