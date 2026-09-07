@@ -5,10 +5,13 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  chooseRequestedModel,
   classifyModelAttestation,
   executeWebAssignment,
   loadExecution,
-  selectPersonalChatMode
+  reasoningEffortIndex,
+  selectPersonalChatMode,
+  stableConversationId
 } from "./executor.mjs";
 
 class FakeBrowser {
@@ -32,13 +35,23 @@ class FakeBrowser {
     };
   }
 
+  async newChat() {
+    this.newChatCalled = true;
+    return { created: true };
+  }
+
+  async selectMode(mode) {
+    this.selectedMode = mode;
+    return { selected: mode };
+  }
+
   async sendMessage(input) {
     this.sentInput = input;
     if (this.failDispatch) throw new Error("synthetic dispatch failure");
     return {
       sent: true,
       waiting: false,
-      conversationId: "conv-test-123"
+      conversationId: "WEB"
     };
   }
 
@@ -46,7 +59,7 @@ class FakeBrowser {
     this.polls += 1;
     if (this.polls === 1) {
       return {
-        conversationId: "conv-test-123",
+        conversationId: "6a9ea545-a168-83e9-aedd-25330fad4b66",
         response: "partial",
         assistantMessageCount: 1,
         generating: true,
@@ -54,7 +67,7 @@ class FakeBrowser {
       };
     }
     return {
-      conversationId: "conv-test-123",
+      conversationId: "6a9ea545-a168-83e9-aedd-25330fad4b66",
       response: "done",
       assistantMessageCount: 1,
       generating: false,
@@ -92,6 +105,39 @@ test("selectPersonalChatMode rejects Work and selects ordinary Chat", () => {
   );
 });
 
+test("stableConversationId rejects placeholders and accepts stable IDs", () => {
+  assert.equal(stableConversationId("WEB"), null);
+  assert.equal(stableConversationId("pending"), null);
+  assert.equal(
+    stableConversationId("6a9ea545-a168-83e9-aedd-25330fad4b66"),
+    "6a9ea545-a168-83e9-aedd-25330fad4b66"
+  );
+});
+
+test("chooseRequestedModel fails closed on unavailable or ambiguous models", () => {
+  assert.equal(
+    chooseRequestedModel("GPT-5.6 Sol", ["GPT-5.6 Sol", "GPT-5.5"]),
+    "GPT-5.6 Sol"
+  );
+  assert.throws(
+    () => chooseRequestedModel("GPT", ["GPT-5.6 Sol", "GPT-5.5"]),
+    /not uniquely available/
+  );
+  assert.throws(
+    () => chooseRequestedModel("GPT-9", ["GPT-5.6 Sol", "GPT-5.5"]),
+    /not uniquely available/
+  );
+});
+
+test("reasoningEffortIndex maps Runtime effort to the three Web UI tiers", () => {
+  assert.equal(reasoningEffortIndex("low"), 0);
+  assert.equal(reasoningEffortIndex("medium"), 1);
+  assert.equal(reasoningEffortIndex("high"), 2);
+  assert.equal(reasoningEffortIndex("xhigh"), 2);
+  assert.equal(reasoningEffortIndex("max"), 2);
+  assert.throws(() => reasoningEffortIndex("impossible"), /unsupported/);
+});
+
 test("model attestation stays partial because the model is only UI-observed", () => {
   assert.deepEqual(classifyModelAttestation("GPT-5.6 Sol", "GPT-5.6 Sol"), {
     model_requested: "GPT-5.6 Sol",
@@ -118,6 +164,18 @@ test("execution creates durable assignment/execution/conversation correlation an
     {
       stateDir,
       browserModules: modules,
+      modelRouter: async (_browser, requested) => ({
+        available: ["GPT-5.6 Sol", "GPT-5.5"],
+        selected: requested || "GPT-5.6 Sol",
+        changed: false
+      }),
+      reasoningRouter: async (_browser, requested) => ({
+        requested,
+        observed_index: 1,
+        observed_label: "Medium",
+        attestation: "partial",
+        changed: true
+      }),
       timeoutMs: 2000,
       pollIntervalMs: 1
     }
@@ -126,14 +184,15 @@ test("execution creates durable assignment/execution/conversation correlation an
   assert.equal(record.status, "completed");
   assert.equal(record.assignment_id, "LAB-WEX-01-POC-01");
   assert.match(record.execution_id, /^wex_[0-9a-f-]{36}$/i);
-  assert.equal(record.conversation_id, "conv-test-123");
+  assert.equal(record.conversation_id, "6a9ea545-a168-83e9-aedd-25330fad4b66");
   assert.match(record.browser_session_id, /^bwex_[0-9a-f]{16}$/);
   assert.equal(record.mode_observed, "聊天");
   assert.equal(record.model_attestation, "partial");
   assert.equal(record.model_match, true);
   assert.equal(await readFile(record.result_locator, "utf8"), "done");
-  assert.equal(browser.sentInput.mode, "聊天");
-  assert.equal(browser.sentInput.newChat, true);
+  assert.equal(record.mode_observed, "聊天");
+  assert.equal(browser.newChatCalled, true);
+  assert.equal(browser.sentInput.newChat, false);
   assert.equal(browser.sentInput.temporary, false);
   assert.equal(browser.sentInput.wait, false);
 
@@ -147,8 +206,15 @@ test("execution creates durable assignment/execution/conversation correlation an
     .trim()
     .split("\n")
     .map(JSON.parse);
-  assert.deepEqual(events.map((event) => event.event), ["queued", "started", "completed"]);
-  assert.equal(events.at(-1).conversation_id, "conv-test-123");
+  assert.deepEqual(events.map((event) => event.event), [
+    "queued",
+    "started",
+    "conversation_bound",
+    "completed"
+  ]);
+  assert.equal(events[1].conversation_id, null);
+  assert.equal(events[2].conversation_id, "6a9ea545-a168-83e9-aedd-25330fad4b66");
+  assert.equal(events.at(-1).conversation_id, "6a9ea545-a168-83e9-aedd-25330fad4b66");
 });
 
 test("failed dispatch emits failed terminal without fabricating a conversation", async () => {
@@ -163,7 +229,24 @@ test("failed dispatch emits failed terminal without fabricating a conversation",
         task_id: "LAB-WEX-01",
         prompt: "test"
       },
-      { stateDir, browserModules: modules, timeoutMs: 500, pollIntervalMs: 1 }
+      {
+        stateDir,
+        browserModules: modules,
+        modelRouter: async () => ({
+          available: ["GPT-5.6 Sol", "GPT-5.5"],
+          selected: "GPT-5.6 Sol",
+          changed: false
+        }),
+        reasoningRouter: async () => ({
+          requested: null,
+          observed_index: null,
+          observed_label: null,
+          attestation: "unavailable",
+          changed: false
+        }),
+        timeoutMs: 500,
+        pollIntervalMs: 1
+      }
     ),
     /synthetic dispatch failure/
   );
