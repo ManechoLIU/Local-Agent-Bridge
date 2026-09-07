@@ -56,6 +56,8 @@ Bridge ingress 的下一层已验证为 **local-ingress signed request proof**�
 
 `x-openai-session` / `x-openai-subject` 继续只记为 correlation observations；即使字段稳定，也不能单独生成上述 proof，因此不会被提升为 authorization source。Capability authority 的 PoC 状态使用 0600 key/state 文件原子持久化，replay nonce 与 revocation 在进程重启后继续生效。正式产品仍需把 signer/verifier 接入真实 loopback/Unix-socket ingress，并定义 key rotation、crash recovery 与同 UID hostile-process 边界。
 
+正式 Bridge 进程边界开始收敛为两个 crate：`bridge-security-core` 负责 capability authority 与 workspace/shell enforcement；`local-tool-bridge` 负责 model-agnostic MCP ingress、local authentication、method/tool→capability 映射和 signed request proof，再调用 loopback/Unix-socket backend。该分层不包含 Web model routing、Controller lifecycle 或 DAG。
+
 ## Harness
 
 当前最小 Harness：

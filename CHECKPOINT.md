@@ -160,3 +160,12 @@ Runtime collaborative 初始化器已建立并复用：
 - CatDesk 独立 worktree `/Users/echoman/CatDesk-PoC-20260907/worktrees/lab-safe-01` 先以真实 upstream 行为得到 RED：hardlink read、nonexistent write/move symlink-parent、macOS shell outside-workspace 全部失败安全门；candidate patch 后 8 个新增 security tests 全部 PASS；`cargo test security_` 为 9/9（含一个既有 connector security-name test）。
 - CatDesk candidate full suite 为 216 PASS / 6 FAIL；六个 FAIL 都属于 `change_tracking`，在未修改 upstream `bfac47b` 上已复现，因此不是本 security candidate 引入。
 - 下一步仍是 `LAB-SAFE-01`：把当前本机 contract 接入正式 Bridge ingress，补 capability issuance / expiry / revocation / replay protection，并在扩大通用 Files/Shell 前继续 fail closed。
+
+## LAB-SAFE-01 local ingress candidate
+
+- 已把安全核心从单纯 experiment 提升为 `crates/bridge-security-core` 生产候选 crate；`experiments/security-boundary` 改为对该 crate 的外部 Harness，保持 16/16 PASS。
+- 新增 `crates/local-tool-bridge`：本地 ingress 只允许 loopback backend；要求独立 local ingress key；按 MCP method/tool 映射 capability；成功后生成逐请求 HMAC `x-lab-*` proof 并转发到本地 backend。
+- local ingress proof 绑定 principal/session/workspace/capability、request id/nonce、MCP method/tool、body hash 和 provenance；ingress key 与 capability signing secret 均不转发给 backend。
+- `x-openai-subject` 等 correlation headers 不作为本地授权，也不被 ingress 转发成 trusted proof。
+- ingress tests 4/4 PASS：认证+signed proof、correlation-only 不可替代 local key、缺 capability 在 backend 前 fail closed、backend 必须 loopback。
+- 下一步：真实连接 `tunnel-client -> local-tool-bridge ingress -> CatDesk security candidate`，再验证 read/write/edit/shell/job 的 scoped capability E2E 与 revoke/replay 行为。
