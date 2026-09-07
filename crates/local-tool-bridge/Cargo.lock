@@ -556,6 +556,7 @@ dependencies = [
  "bridge-security-core",
  "hyper",
  "hyper-util",
+ "libc",
  "reqwest",
  "serde_json",
  "sha2",

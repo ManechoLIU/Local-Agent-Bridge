@@ -8,7 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -203,6 +203,21 @@ impl CapabilityAuthority {
         prepare_private_dir(state_dir)?;
         let state_path = state_dir.join("authority-state.json");
         if !state_path.exists() {
+            let has_key_artifacts = std::fs::read_dir(state_dir)
+                .map_err(|error| format!("capability state directory read failed: {error}"))?
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("authority.key")
+                });
+            if has_key_artifacts {
+                return Err(
+                    "capability authority state is missing while key material exists; fail closed"
+                        .into(),
+                );
+            }
             let authority = Self::new_random();
             authority.save_private(state_dir)?;
             return Ok(authority);
@@ -241,8 +256,18 @@ impl CapabilityAuthority {
         let state_dir = state_dir.as_ref();
         prepare_private_dir(state_dir)?;
         let key_path = private_key_path(state_dir, self.key_generation);
-        if !key_path.exists() {
-            write_private_atomic(&key_path, hex_encode(&self.master_key).as_bytes())?;
+        let expected_key = hex_encode(&self.master_key);
+        if key_path.exists() {
+            let on_disk = read_private_file(&key_path, "capability authority key")?;
+            let on_disk = String::from_utf8(on_disk)
+                .map_err(|_| "capability authority key is not UTF-8".to_string())?;
+            if on_disk.trim() != expected_key {
+                return Err(
+                    "capability authority key file conflicts with in-memory generation".into(),
+                );
+            }
+        } else {
+            write_private_atomic(&key_path, expected_key.as_bytes())?;
         }
         let snapshot = CapabilityAuthoritySnapshot {
             schema_version: 2,
@@ -271,18 +296,23 @@ impl CapabilityAuthority {
             .key_generation
             .checked_add(1)
             .ok_or_else(|| "master key generation overflow".to_string())?;
-        let mut new_key = [0_u8; 32];
-        OsRng.fill_bytes(&mut new_key);
         let state_dir = state_dir.as_ref();
         prepare_private_dir(state_dir)?;
         // Commit ordering is deliberate: write the new key first, then atomically
-        // publish state that points at it. A crash before the state commit keeps
-        // the previous generation authoritative; a crash after it has the key.
+        // publish state that points at it. If a prior attempt crashed after writing
+        // key.N+1 but before publishing state, reuse that orphan key on retry.
         let new_key_path = private_key_path(state_dir, next);
-        if new_key_path.exists() {
-            return Err("next master key generation already exists".into());
-        }
-        write_private_atomic(&new_key_path, hex_encode(&new_key).as_bytes())?;
+        let new_key = if new_key_path.exists() {
+            let raw = read_private_file(&new_key_path, "next capability authority key")?;
+            let raw = String::from_utf8(raw)
+                .map_err(|_| "next capability authority key is not UTF-8".to_string())?;
+            decode_hex_32(raw.trim())?
+        } else {
+            let mut generated = [0_u8; 32];
+            OsRng.fill_bytes(&mut generated);
+            write_private_atomic(&new_key_path, hex_encode(&generated).as_bytes())?;
+            generated
+        };
         let previous_key = self.master_key;
         let previous_generation = self.key_generation;
         self.master_key = new_key;
@@ -291,6 +321,12 @@ impl CapabilityAuthority {
             self.master_key = previous_key;
             self.key_generation = previous_generation;
             return Err(error);
+        }
+        let previous_path = private_key_path(state_dir, previous_generation);
+        if previous_path.exists() {
+            std::fs::remove_file(&previous_path)
+                .map_err(|error| format!("previous master key cleanup failed: {error}"))?;
+            sync_directory(state_dir)?;
         }
         Ok(next)
     }
@@ -524,12 +560,20 @@ fn derive_capability_secret(
     master_key: &[u8; 32],
     lease: &CapabilityLease,
 ) -> Result<[u8; 32], String> {
+    let mut capabilities = lease
+        .grant
+        .capabilities
+        .iter()
+        .map(|capability| format!("{capability:?}"))
+        .collect::<Vec<_>>();
+    capabilities.sort();
     let message = format!(
-        "v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "v2\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         lease.grant.principal_id,
         lease.grant.execution_session_id,
         lease.grant.capability_id,
         lease.grant.workspace_id,
+        capabilities.join(","),
         lease.issued_at_ms,
         lease.expires_at_ms,
         lease.session_generation,
@@ -826,6 +870,12 @@ fn prepare_private_dir(path: &Path) -> Result<(), String> {
         std::fs::create_dir_all(path)
             .map_err(|error| format!("capability state directory create failed: {error}"))?;
     }
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("private state directory metadata failed: {error}"))?;
+    let current_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != current_uid {
+        return Err("private state directory owner does not match current euid".into());
+    }
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
         .map_err(|error| format!("private state directory permission update failed: {error}"))?;
     Ok(())
@@ -845,6 +895,14 @@ fn read_private_file(path: &Path, label: &str) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|error| format!("{label} read failed: {error}"))
 }
 
+fn sync_directory(path: &Path) -> Result<(), String> {
+    let directory =
+        File::open(path).map_err(|error| format!("private state parent open failed: {error}"))?;
+    directory
+        .sync_all()
+        .map_err(|error| format!("private state parent sync failed: {error}"))
+}
+
 fn private_key_path(state_dir: &Path, generation: u64) -> PathBuf {
     state_dir.join(format!("authority.key.{generation}"))
 }
@@ -853,8 +911,7 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "private state path has no parent".to_string())?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| format!("private state parent create failed: {error}"))?;
+    prepare_private_dir(parent)?;
     let temporary = parent.join(format!(
         ".{}.{}.tmp",
         path.file_name()
@@ -876,11 +933,7 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("private state sync failed: {error}"))?;
     std::fs::rename(&temporary, path)
         .map_err(|error| format!("private state atomic replace failed: {error}"))?;
-    let directory =
-        File::open(parent).map_err(|error| format!("private state parent open failed: {error}"))?;
-    directory
-        .sync_all()
-        .map_err(|error| format!("private state parent sync failed: {error}"))?;
+    sync_directory(parent)?;
     Ok(())
 }
 
@@ -967,7 +1020,8 @@ pub fn run_home_confined_shell(
 
     let profile = r#"(version 1)
 (deny default)
-(allow process*)
+(allow process-exec)
+(allow process-fork)
 (allow file-read-metadata
   (require-all
     (require-not (subpath (param "DENIED_HOME")))
@@ -988,8 +1042,6 @@ pub fn run_home_confined_shell(
 (allow file-read-data (subpath (param "WORKSPACE")))
 (allow file-write* (subpath (param "WORKSPACE")))
 (allow sysctl-read)
-(allow mach-lookup)
-(allow ipc-posix-shm)
 (allow signal)
 "#;
 

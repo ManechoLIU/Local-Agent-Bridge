@@ -145,6 +145,7 @@ name = "local-agent-bridge-security-boundary"
 version = "0.1.0"
 dependencies = [
  "bridge-security-core",
+ "serde_json",
  "tempfile",
 ]
 

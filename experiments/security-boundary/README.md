@@ -12,7 +12,7 @@ The macOS shell prototype uses `/usr/bin/sandbox-exec` as a **PoC isolation back
 
 ## Current executable gates
 
-`cargo test --manifest-path experiments/security-boundary/Cargo.toml` currently covers 17 passing tests, including:
+`cargo test --manifest-path experiments/security-boundary/Cargo.toml` currently covers 19 passing tests, including:
 
 - capability grant binding across principal/session/capability/workspace;
 - signed local-ingress request proofs that bind capability/principal/session/workspace + request id/nonce + MCP method/tool + body hash with HMAC-SHA256;
@@ -43,7 +43,7 @@ The security RED tests there first reproduced the current upstream behavior. Aft
 
 ## Remaining limitations before product promotion
 
-- Capability issuance/TTL/revocation/session-generation/replay now have a working local authority with private restart persistence; production ingress persists request IDs before backend dispatch, and master-key rotation is generation-fenced with versioned keys. Remaining product work is same-UID threat-boundary closure/decision plus packaging and recovery drills.
+- Capability issuance/TTL/revocation/session-generation/replay now have a working local authority with private restart persistence; production ingress persists request IDs before backend dispatch, and master-key rotation is generation-fenced with versioned keys. The v1 same-UID threat boundary is now explicitly scoped; crash/replay recovery and generation-fenced key rotation have real-process coverage. Remaining work is independent post-fix security review and packaging.
 - OpenAI tunnel correlation headers are not promoted to authenticated Web conversation or Runtime Controller identity.
 - `sandbox-exec` is macOS-specific and treated as a replaceable backend. Linux already has CatDesk Landlock support; Windows still needs a product-grade filesystem/network isolation decision.
 - The Unix inode checks substantially reduce symlink/hardlink/TOCTOU risk, but a malicious concurrent same-UID process can still race hard-link creation around an already-open file. A stronger worker/process ownership boundary is required if same-UID hostile concurrency is in scope.

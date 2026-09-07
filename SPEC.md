@@ -44,3 +44,10 @@
 - Shell/Process 有真实、可解释的 filesystem / network / environment / credential 权限边界，而非仅依赖 cwd。
 - Browser 与独立 Computer Runtime 的授权、session ownership、目标隔离和 E2E 均有真实证据。
 - 在 Adaptive Agent Runtime 完全未运行时，Bridge / Computer Runtime 核心产品链仍可独立工作。
+
+## v1 本机威胁模型
+
+- v1 必须防御来自 ChatGPT/Web/Remote tunnel/prompt 的越权请求、capability 重放/过期/撤销绕过、workspace hardlink/symlink/path escape、Shell filesystem/network/environment escape，以及其他 OS 用户通过私有状态/UDS 直接接入。
+- v1 **不声称**能够防御已经以与 Bridge 相同 macOS 用户身份运行的恶意本地进程。same-UID 恶意进程可读取/调试该用户进程或访问该用户本就有权访问的数据，因此 0600 UDS 不是这类对手的强隔离边界。
+- 当前临时 CatDesk loopback backend 也只在上述 v1 边界内成立：same-UID 恶意进程可尝试绕过 Local Tool Bridge 直接访问本机 backend。正式文档与 UI 不得把当前方案描述成 same-UID malware isolation。
+- 若未来把 same-UID hostile process 纳入安全目标，必须升级为独立 OS principal / sandbox worker、受认证的 backend peer，或把 Files/Shell/Jobs backend 直接并入 Local Tool Bridge，从结构上移除可绕过的同 UID backend。

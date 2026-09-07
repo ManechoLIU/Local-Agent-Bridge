@@ -68,7 +68,19 @@ Operational authority state uses a 0700 private directory, versioned 0600 master
 
 当前已验证的产品形状为 `Personal ChatGPT Web -> OpenAI Secure MCP Tunnel -> tunnel-client direct unix_socket -> 0600 Local Tool Bridge UDS -> signed capability proof -> loopback-only hardened CatDesk backend -> Files/Shell/Jobs -> Mac`。tunnel-client 原生支持 HTTP-over-Unix-socket (`url=... + unix_socket=...`)；因此不需要为了 Secure MCP 再暴露一个 Local Tool Bridge TCP listener。Web/Cloud 一侧只知道 tunnel，不持有 Local Tool Bridge capability signing secret。
 
-此链已经在真实 Personal Plus Chat 中完成 read/write/edit/harmless command/background job。安全层仍把 OpenAI tunnel correlation 与本地 authorization 分开；正式上线前只剩 operational key lifecycle、crash recovery 与 same-UID adversary 假设需要明确。
+此链已经在真实 Personal Plus Chat 中完成 read/write/edit/harmless command/background job。安全层仍把 OpenAI tunnel correlation 与本地 authorization 分开；当前 operational key lifecycle、crash/replay recovery 与 v1 same-UID scope 已明确；上线前剩余安全门是修复后 immutable candidate 的独立复审与 packaging。
+
+### v1 same-UID threat decision
+
+当前 v1 安全目标明确覆盖 remote/cloud/prompt-originated adversary、其他 OS 用户、capability replay/expiry/revocation、workspace path/inode escape 和 Shell filesystem/network/environment escape；不宣称隔离已经以同一 macOS UID 运行的恶意本地进程。0600 UDS 与 0700/0600 state files 用于隔离其他用户和减少偶然访问，不是 same-UID malware boundary。当前 CatDesk loopback backend 因此只作为迁移期 backend；更高保证版本应把 Files/Shell/Jobs 实现直接收进 Local Tool Bridge 或放到独立 OS principal/sandboxed worker 后面。
+
+这项 scope decision 不影响 `x-openai-*` 身份诚实性：OpenAI correlation headers 仍不成为 authorization source。
+
+### Backend authentication and UDS peer boundary
+
+Local Tool Bridge 的 UDS transport boundary 现在要求 socket parent 为 current-euid-owned real directory 并收紧至 0700，socket 本身为 0600；macOS 使用 `getpeereid`、Linux 使用 `SO_PEERCRED` 校验连接 peer UID。Bridge backend URL 只接受 numeric loopback IP，禁止 hostname、credentials、query/fragment，并关闭 HTTP redirect。Bridge 与迁移期 CatDesk backend 之间使用独立 0600 本机 key；CatDesk 在配置该 key 时对无 key/错误 key 的直接 loopback 请求返回 401。该 backend key 不属于 Web/OpenAI identity，也不替代 capability grant。
+
+Authority state fail-closed：如果 state snapshot 缺失但 versioned key material 已存在，不会新建空 authority；restart 使用相同 capability ID 时，persisted grant 必须与当前 principal/session/workspace/capability set 完全一致，否则要求显式换 capability identity。capability set 参与派生 signing secret，防止本地 state scope 被静默改写。
 
 ## Harness
 

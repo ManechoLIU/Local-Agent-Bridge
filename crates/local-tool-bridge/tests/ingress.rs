@@ -2,7 +2,7 @@ use axum::{
     Router,
     body::{Body, Bytes},
     extract::State,
-    http::{HeaderMap, Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode, header},
     routing::post,
 };
 use bridge_security_core::{Capability, CapabilityAuthority, CapabilityGrant, ExecutionContext};
@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use tower::ServiceExt;
 
 const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+const BACKEND_KEY: &str = "backend-0123456789abcdef0123456789abcdef0123456789abcdef";
 
 #[derive(Clone, Default)]
 struct Capture(Arc<Mutex<Option<(HeaderMap, Bytes)>>>);
@@ -57,7 +58,18 @@ fn bridge(backend_url: &str, capabilities: Vec<Capability>) -> BridgeIngress {
         .as_millis() as u64;
     let mut authority = CapabilityAuthority::new_for_test([21_u8; 32]);
     let issued = authority.issue(grant, now - 1000, 60_000, 1).unwrap();
-    BridgeIngress::new(authority, issued, context, KEY.as_bytes(), backend_url).unwrap()
+    let state_dir = tempfile::tempdir().unwrap().keep();
+    authority.save_private(&state_dir).unwrap();
+    BridgeIngress::new(
+        authority,
+        issued,
+        context,
+        KEY.as_bytes(),
+        backend_url,
+        BACKEND_KEY,
+        state_dir,
+    )
+    .unwrap()
 }
 
 fn trusted_bridge(
@@ -90,6 +102,7 @@ fn trusted_bridge(
         issued,
         context,
         backend_url,
+        BACKEND_KEY,
         local_tool_bridge::ToolPolicy::catdesk_default(),
         state_dir,
     )
@@ -132,7 +145,36 @@ async fn authenticated_loopback_ingress_forwards_signed_proof_without_secret() {
     );
     assert!(headers.get("x-lab-request-mac").is_some());
     assert!(headers.get("x-lab-request-nonce").is_some());
+    assert_eq!(headers.get("x-lab-backend-key").unwrap(), BACKEND_KEY);
     assert!(headers.get("x-openai-subject").is_none());
+}
+
+#[tokio::test]
+async fn backend_redirect_is_not_followed() {
+    use axum::response::IntoResponse;
+
+    let redirected_capture = Capture::default();
+    let redirected_url = backend_server(redirected_capture.clone()).await;
+    let redirect_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let redirect_addr = redirect_listener.local_addr().unwrap();
+    let location = redirected_url.clone();
+    let app_redirect = Router::new().route(
+        "/mcp",
+        post(move || {
+            let location = location.clone();
+            async move { (StatusCode::FOUND, [(header::LOCATION, location)]).into_response() }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(redirect_listener, app_redirect).await.unwrap();
+    });
+    let first_url = format!("http://127.0.0.1:{}/mcp", redirect_addr.port());
+    let app = bridge(&first_url, vec![Capability::FileRead]).router();
+    let body = r#"{"jsonrpc":"2.0","id":"redirect","method":"tools/call","params":{"name":"read","arguments":{}}}"#;
+
+    let response = app.oneshot(mcp_request(body, Some(KEY))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert!(redirected_capture.0.lock().await.is_none());
 }
 
 #[tokio::test]
@@ -211,6 +253,7 @@ async fn trusted_uds_ingress_persists_request_id_replay_before_backend() {
         issued,
         context,
         &backend_url,
+        BACKEND_KEY,
         local_tool_bridge::ToolPolicy::catdesk_default(),
         state_dir.path(),
     )
@@ -219,6 +262,18 @@ async fn trusted_uds_ingress_persists_request_id_replay_before_backend() {
     let after_restart = restarted_app.oneshot(request()).await.unwrap();
     assert_eq!(after_restart.status(), StatusCode::FORBIDDEN);
     assert!(capture.0.lock().await.is_none());
+}
+
+#[test]
+fn resources_read_requires_file_read_capability() {
+    assert_eq!(
+        local_tool_bridge::required_capability("resources/read", "").unwrap(),
+        Capability::FileRead
+    );
+    assert_eq!(
+        local_tool_bridge::required_capability("resources/list", "").unwrap(),
+        Capability::Discovery
+    );
 }
 
 #[test]
@@ -244,7 +299,40 @@ fn backend_must_be_loopback() {
             issued,
             context,
             KEY.as_bytes(),
-            "https://example.com/mcp"
+            "https://example.com/mcp",
+            BACKEND_KEY,
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn backend_hostname_localhost_is_rejected() {
+    let context = ExecutionContext {
+        principal_id: "p2".into(),
+        execution_session_id: "s2".into(),
+        capability_id: "c2".into(),
+        workspace_id: "w2".into(),
+    };
+    let grant = CapabilityGrant {
+        principal_id: "p2".into(),
+        execution_session_id: "s2".into(),
+        capability_id: "c2".into(),
+        workspace_id: "w2".into(),
+        capabilities: vec![Capability::Discovery],
+    };
+    let mut authority = CapabilityAuthority::new_for_test([25_u8; 32]);
+    let issued = authority.issue(grant, 1, 1000, 1).unwrap();
+    assert!(
+        BridgeIngress::new(
+            authority,
+            issued,
+            context,
+            KEY.as_bytes(),
+            "http://localhost:9999/mcp",
+            BACKEND_KEY,
+            tempfile::tempdir().unwrap().keep(),
         )
         .is_err()
     );

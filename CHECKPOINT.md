@@ -150,11 +150,11 @@ Runtime collaborative 初始化器已建立并复用：
 
 ## LAB-SAFE-01 security boundary progress
 
-- `experiments/security-boundary` Rust Harness 已扩到 17/17 PASS。
+- `experiments/security-boundary` Rust Harness 已扩到 19/19 PASS。
 - Authorization prototype 明确绑定 `principal_id / execution_session_id / capability_id / workspace_id`；不引用 ChatGPT model、Web conversation lifecycle、Runtime Controller/Goal/DAG。
 - Capability authority 新增 TTL、revocation、session-generation fencing、request nonce replay protection；authority key/state 0600 原子持久化，重启后 replay/revocation 仍保持。
 - Operational hardening 已补：master key 使用 versioned generation，rotation 采用“先落新 key、再原子提交 state pointer”的 crash-safe 顺序并带 expected-generation fence；state dir 0700、key/state 0600，symlink state path fail closed。
-- Local Tool Bridge 现在在任何 backend side effect 之前把 provider `x-request-id`/nonce replay state 持久化；同 provider request 重放在进程内与重启后都被 403 拒绝。ingress tests 5/5 PASS。
+- Local Tool Bridge 现在在任何 backend side effect 之前把 provider `x-request-id`/nonce replay state 持久化；同 provider request 重放在进程内与重启后都被 403 拒绝。ingress tests 8/8 PASS；真实进程/UDS hardening tests 3/3 PASS。
 - 第一次真实 Grok 4.6 xhigh Security Reviewer 调用确实启动并读取 immutable `d512734..0756cfa`，但宿主执行超时后没有得到最终 JSON verdict，因此该 review attempt 标记 `result_unknown`，没有冒充 Reviewer PASS，也不把它作为 SAFE-01 closure evidence。
 - Local ingress proof 使用 per-capability HMAC 逐请求绑定 principal/session/workspace、request ID/nonce、MCP method/tool 与 body hash；proof 可映射到 `x-lab-*` ingress headers，但 signing secret 不出本机 signer。
 - `x-openai-session` / `x-openai-subject` 明确留在 correlation-only 层：Harness 已验证它们不能单独作为 authorization source。
@@ -191,3 +191,21 @@ Runtime collaborative 初始化器已建立并复用：
 - Web start job 为 `sleep 1; printf web-secure-job-done`；真实 Web poll 后，又从 UDS Local Tool Bridge 本地复核同一 job `8bf9e70b-df92-464a-845a-57ef66cccc79`：`state=succeeded`、`success=true`、`commandSuccess=true`、`exitCode=0`、stdout=`web-secure-job-done`。
 - 因此 `Personal ChatGPT Plus -> OpenAI Secure MCP Tunnel -> direct Unix socket -> signed Local Tool Bridge -> hardened CatDesk -> macOS workspace/sandbox` 的 scoped general Files/Shell/Jobs 全链已经真实通过。
 - 该结果不改变身份诚实性：`x-openai-session`/`x-openai-subject` 仍只是 correlation facts，不是 Runtime Controller/Web conversation host attestation。剩余 SAFE-01 工作是独立 Security Review、key rotation/crash recovery、same-UID hostile-process 威胁边界和 packaging。
+
+## LAB-SAFE-01 recovery + v1 threat decision
+
+- 新增真实进程恢复测试 `crates/local-tool-bridge/tests/runtime_recovery.rs`：启动真实 `local-tool-bridge` binary，经 UDS 发固定 provider request-id，首次 200；kill 后以 master-key rotation 重启；旧 request-id 必须 403，fresh request-id 必须 200；持久状态必须为 key generation 2；rotation 后旧 generation key 清理、当前 key.2 保留；UDS=0600、socket parent=0700、state dir=0700。另加 symlink socket-parent fail-closed 与 restart grant-mismatch fail-closed，合计 3/3 PASS。
+- v1 安全范围已明确：防 remote/cloud/prompt-originated、其他 OS 用户、capability replay/expiry/revocation、workspace/File/Shell escape；不宣称防御已运行在同一 macOS UID 下的恶意本地进程。
+- 当前 CatDesk loopback backend 因此是 migration backend；same-UID adversary 可绕过 Bridge 直接访问它这一点作为已披露限制保留。若未来需要 same-UID isolation，应直接内建 backend 或使用独立 OS principal/受认证 worker。
+
+## LAB-SAFE-01 Grok FINDINGS remediation
+
+- 第二次真实 Grok 4.6 xhigh Security Reviewer 已对 immutable `8fd6f6c` 完整返回 `FINDINGS`：1 Critical / 5 Important / 5 Minor。
+- Critical（UDS parent/peer trust）已修：Local Tool Bridge 在 bind 前验证 socket parent 为真实目录、owner=current euid，并收紧 0700；existing socket 必须是当前 euid 拥有的 Unix socket；macOS `getpeereid` / Linux `SO_PEERCRED` 验证 peer UID；socket 0600。
+- Backend important 已修：backend URL 只接受 numeric loopback IP、拒绝 `localhost`/credentials/query/fragment；reqwest redirect policy=none；Bridge→CatDesk 增加独立 0600 backend key。实测 CatDesk direct loopback 无 key=401，正确 key=200。CatDesk candidate commit=`8206454`。
+- Authority crash/replay important 已修：已有 key material 但 state 缺失时 fail-closed；state/key owner+permission/symlink 检查；request-id/nonce 在 backend side effect 前持久化；重启后 replay 仍拒绝。
+- Capability integrity important 已修：grant capability set 进入派生 signing secret；同 capability ID restart 时 grant 与当前配置不一致直接拒绝；`resources/read` 明确要求 `FileRead`。
+- macOS sandbox important 已收紧：去掉 broad `(allow process*)`、`mach-lookup`、`ipc-posix-shm`，仅保留 process exec/fork；security tests 保持 GREEN；macOS harness 不再因 `sandbox-exec` 缺失而静默成功。
+- Rotation/minor 已修：key.N+1 orphan 可在 crash retry 复用，state commit 后清理 previous key；shared-key HTTP ingress 也要求 state_dir 并持久化 replay；backend hostname `localhost` 被拒绝；redirect 不跟随。
+- 当前验证：security boundary 19/19 PASS；Local Tool Bridge ingress 8/8 PASS；real-process recovery/UDS hardening 3/3 PASS；CatDesk backend-auth test PASS、security tests 9/9 PASS。CatDesk 全量 217 PASS / 6 historical change_tracking baseline FAIL，未出现本轮新增失败。
+- 下一步只对新的 immutable candidate 做独立复审；复审前不得把 SAFE-01 写成 CLOSED。

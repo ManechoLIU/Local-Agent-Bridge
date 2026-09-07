@@ -1,6 +1,6 @@
 use bridge_security_core::*;
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
@@ -558,7 +558,7 @@ fn master_key_rotation_is_generation_fenced_and_crash_safe() {
         2
     );
     assert_eq!(authority.key_generation(), 2);
-    assert!(state_dir.path().join("authority.key.1").is_file());
+    assert!(!state_dir.path().join("authority.key.1").exists());
     assert!(state_dir.path().join("authority.key.2").is_file());
     assert!(
         authority
@@ -608,10 +608,69 @@ fn master_key_rotation_is_generation_fenced_and_crash_safe() {
 }
 
 #[test]
+fn missing_state_with_existing_key_material_fails_closed() {
+    let state_dir = tempdir().unwrap();
+    std::fs::write(state_dir.path().join("authority.key.1"), "00".repeat(32)).unwrap();
+    std::fs::set_permissions(
+        state_dir.path().join("authority.key.1"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let error = CapabilityAuthority::load_or_create_private(state_dir.path()).unwrap_err();
+    assert!(error.contains("state is missing"), "{error}");
+}
+
+#[test]
+fn capability_scope_is_bound_into_derived_signing_secret() {
+    let (context, grant) = grant();
+    let mut authority = CapabilityAuthority::new_for_test([29_u8; 32]);
+    let issued = authority.issue(grant, 100, 10_000, 1).unwrap();
+    let body = b"scope-body";
+    let proof = sign_request(
+        &issued,
+        &context,
+        "scope-request",
+        "scope-nonce",
+        "tools/call",
+        "read",
+        body,
+    )
+    .unwrap();
+    let state_dir = tempdir().unwrap();
+    authority.save_private(state_dir.path()).unwrap();
+    let state_path = state_dir.path().join("authority-state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    state["records"]["cap-a"]["lease"]["grant"]["capabilities"] = serde_json::json!(["Shell"]);
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut restarted = CapabilityAuthority::load_or_create_private(state_dir.path()).unwrap();
+    let error = restarted
+        .verify_request(
+            &proof,
+            body,
+            "tools/call",
+            "read",
+            Capability::FileRead,
+            200,
+        )
+        .unwrap_err();
+    assert!(
+        error.contains("MAC") || error.contains("capability not granted"),
+        "{error}"
+    );
+}
+
+#[test]
 fn macos_shell_blocks_sensitive_fs_network_and_env_but_allows_workspace_io() {
-    if !Path::new("/usr/bin/sandbox-exec").exists() {
-        return;
-    }
+    #[cfg(not(target_os = "macos"))]
+    return;
+    #[cfg(target_os = "macos")]
+    assert!(
+        Path::new("/usr/bin/sandbox-exec").exists(),
+        "macOS security harness requires /usr/bin/sandbox-exec"
+    );
     use std::net::TcpListener;
 
     let home = PathBuf::from(std::env::var("HOME").unwrap());

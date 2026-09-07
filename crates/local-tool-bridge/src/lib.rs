@@ -12,6 +12,7 @@ use reqwest::Url;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    net::IpAddr,
     path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -65,9 +66,9 @@ impl ToolPolicy {
             | "initialize"
             | "tools/list"
             | "resources/list"
-            | "resources/read"
             | "resources/templates/list"
             | "ping" => Ok(Capability::Discovery),
+            "resources/read" => Ok(Capability::FileRead),
             method if method.starts_with("notifications/") => Ok(Capability::Discovery),
             "tools/call" => self.tools.get(tool_name).cloned().ok_or_else(|| {
                 format!("tool is not authorized by the current Bridge capability map: {tool_name}")
@@ -96,6 +97,7 @@ struct BridgeIngressInner {
     context: ExecutionContext,
     local_auth: LocalIngressAuth,
     backend_url: Url,
+    backend_key: String,
     client: reqwest::Client,
     policy: ToolPolicy,
     state_dir: Option<PathBuf>,
@@ -108,6 +110,8 @@ impl BridgeIngress {
         context: ExecutionContext,
         ingress_key: &[u8],
         backend_url: &str,
+        backend_key: &str,
+        state_dir: impl Into<PathBuf>,
     ) -> Result<Self, String> {
         Self::new_with_policy(
             authority,
@@ -115,7 +119,9 @@ impl BridgeIngress {
             context,
             ingress_key,
             backend_url,
+            backend_key,
             ToolPolicy::catdesk_default(),
+            state_dir,
         )
     }
 
@@ -125,7 +131,9 @@ impl BridgeIngress {
         context: ExecutionContext,
         ingress_key: &[u8],
         backend_url: &str,
+        backend_key: &str,
         policy: ToolPolicy,
+        state_dir: impl Into<PathBuf>,
     ) -> Result<Self, String> {
         if ingress_key.len() < 32 {
             return Err("local ingress key must be at least 32 bytes".into());
@@ -133,15 +141,8 @@ impl BridgeIngress {
         if issued.capability_id != context.capability_id {
             return Err("issued capability does not match ingress execution context".into());
         }
-        let backend_url =
-            Url::parse(backend_url).map_err(|error| format!("invalid backend URL: {error}"))?;
-        if backend_url.scheme() != "http" {
-            return Err("backend URL must use loopback http".into());
-        }
-        let host = backend_url.host_str().unwrap_or_default();
-        if !matches!(host, "127.0.0.1" | "localhost" | "::1") {
-            return Err("backend URL must be loopback-only".into());
-        }
+        let backend_url = validate_backend_url(backend_url)?;
+        validate_backend_key(backend_key)?;
         let mut ingress_key_sha256 = [0_u8; 32];
         ingress_key_sha256.copy_from_slice(&Sha256::digest(ingress_key));
         Ok(Self {
@@ -151,9 +152,10 @@ impl BridgeIngress {
                 context,
                 local_auth: LocalIngressAuth::SharedKey(ingress_key_sha256),
                 backend_url,
-                client: reqwest::Client::new(),
+                backend_key: backend_key.to_string(),
+                client: backend_client()?,
                 policy,
-                state_dir: None,
+                state_dir: Some(state_dir.into()),
             }),
         })
     }
@@ -163,21 +165,15 @@ impl BridgeIngress {
         issued: IssuedCapability,
         context: ExecutionContext,
         backend_url: &str,
+        backend_key: &str,
         policy: ToolPolicy,
         state_dir: impl Into<PathBuf>,
     ) -> Result<Self, String> {
         if issued.capability_id != context.capability_id {
             return Err("issued capability does not match ingress execution context".into());
         }
-        let backend_url =
-            Url::parse(backend_url).map_err(|error| format!("invalid backend URL: {error}"))?;
-        if backend_url.scheme() != "http" {
-            return Err("backend URL must use loopback http".into());
-        }
-        let host = backend_url.host_str().unwrap_or_default();
-        if !matches!(host, "127.0.0.1" | "localhost" | "::1") {
-            return Err("backend URL must be loopback-only".into());
-        }
+        let backend_url = validate_backend_url(backend_url)?;
+        validate_backend_key(backend_key)?;
         Ok(Self {
             inner: Arc::new(BridgeIngressInner {
                 authority: Mutex::new(authority),
@@ -185,7 +181,8 @@ impl BridgeIngress {
                 context,
                 local_auth: LocalIngressAuth::TrustedUnixSocket,
                 backend_url,
-                client: reqwest::Client::new(),
+                backend_key: backend_key.to_string(),
+                client: backend_client()?,
                 policy,
                 state_dir: Some(state_dir.into()),
             }),
@@ -317,6 +314,7 @@ async fn forward_to_backend(
     for (name, value) in proof_headers {
         request = request.header(name, value);
     }
+    request = request.header("x-lab-backend-key", &state.inner.backend_key);
     let backend = request
         .send()
         .await
@@ -339,6 +337,44 @@ async fn forward_to_backend(
     response
         .body(Body::from(bytes))
         .map_err(|error| format!("backend response build failed: {error}"))
+}
+
+fn validate_backend_url(value: &str) -> Result<Url, String> {
+    let url = Url::parse(value).map_err(|error| format!("invalid backend URL: {error}"))?;
+    if url.scheme() != "http" {
+        return Err("backend URL must use loopback http".into());
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("backend URL must not contain credentials, query, or fragment".into());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "backend URL host is required".to_string())?;
+    let ip = host
+        .parse::<IpAddr>()
+        .map_err(|_| "backend URL host must be a numeric loopback IP".to_string())?;
+    if !ip.is_loopback() {
+        return Err("backend URL must be loopback-only".into());
+    }
+    Ok(url)
+}
+
+fn validate_backend_key(value: &str) -> Result<(), String> {
+    if value.as_bytes().len() < 32 {
+        return Err("backend authentication key must be at least 32 bytes".into());
+    }
+    Ok(())
+}
+
+fn backend_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("backend HTTP client creation failed: {error}"))
 }
 
 fn valid_ingress_key(headers: &HeaderMap, expected: &[u8; 32]) -> bool {
