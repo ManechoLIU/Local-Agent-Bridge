@@ -26,7 +26,7 @@
 
 - 正式项目根：`/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge`
 - Runtime project identity boundary：`/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge/.git`
-- Git：`main`，unborn；当前没有首个 commit/HEAD。
+- Git：`main`；已建立首个 governance baseline `b909f3ebcbabf92cd07245876949f7ad749ab4bb`，后续 worktree / delegated assignment 可基于稳定 revision。
 - 唯一 logical Controller：`a697051d-402b-4062-a883-a29ba8b395e9`。
 - 当前 Web execution target：`6a9e4037-0a00-83ea-bb8e-1301c5f6b979`。
 - Bootstrap binding：`provenance=manual_user_authorized`、`binding=temporary`、`host_attested=false`、Runtime lease mode=`resume_only`。
