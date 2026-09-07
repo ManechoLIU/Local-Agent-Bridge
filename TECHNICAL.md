@@ -62,6 +62,12 @@ Bridge ingress 的下一层已验证为 **local-ingress signed request proof**�
 
 正式候选优先使用 Unix-domain socket 而不是额外 loopback TCP shared-secret hop：socket 以 0600 创建，`tunnel-client`/本机 adapter 连接 UDS 后，Local Tool Bridge 才生成 per-request HMAC capability proof 并转发到 loopback-only backend。这样 OpenAI tunnel 只到本机 transport adapter，ChatGPT/Web 不需要持有 capability signing secret。UDS 仍不是同 UID 恶意进程的强隔离边界；若威胁模型包含 hostile same-UID process，需要额外 worker ownership/peer-credential/code-signing 或独立用户/沙箱边界。
 
+### Verified Secure MCP production-shaped path
+
+当前已验证的产品形状为 `Personal ChatGPT Web -> OpenAI Secure MCP Tunnel -> tunnel-client direct unix_socket -> 0600 Local Tool Bridge UDS -> signed capability proof -> loopback-only hardened CatDesk backend -> Files/Shell/Jobs -> Mac`。tunnel-client 原生支持 HTTP-over-Unix-socket (`url=... + unix_socket=...`)；因此不需要为了 Secure MCP 再暴露一个 Local Tool Bridge TCP listener。Web/Cloud 一侧只知道 tunnel，不持有 Local Tool Bridge capability signing secret。
+
+此链已经在真实 Personal Plus Chat 中完成 read/write/edit/harmless command/background job。安全层仍把 OpenAI tunnel correlation 与本地 authorization 分开；正式上线前只剩 operational key lifecycle、crash recovery 与 same-UID adversary 假设需要明确。
+
 ## Harness
 
 当前最小 Harness：

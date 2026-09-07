@@ -178,3 +178,13 @@ Runtime collaborative 初始化器已建立并复用：
 - 实测完成 `server/discover`、`tools/list`、`catdesk_instruction`、read、write、edit、`/bin/pwd`、background `start_command -> poll_command`。write/edit 最终内容为 `edited-through-signed-ingress`，job 输出 `job-secure-done`。
 - 首次 shell E2E 暴露 `.catdesk-sandbox` scratch 会污染 workspace/change tracking；CatDesk candidate 已新增 commit `707b95e`，把 sandbox HOME/TMP scratch 移到 `~/.catdesk/sandbox` 并显式授权该 scratch，复跑后 workspace 只剩业务文件。
 - 下一步是把 OpenAI Secure MCP `tunnel-client` 的 local target 从 TCP/旧 probe 切到该 UDS ingress，证明 `Personal ChatGPT Web -> Secure MCP Tunnel -> UDS Local Tool Bridge -> hardened CatDesk -> Mac` 全链。
+
+## LAB-SAFE-01 Personal Plus full secure-chain E2E
+
+- OpenAI Secure MCP Tunnel 已从旧 identity probe TCP target 切到 direct Unix-socket target：`url=http://localhost/mcp` + `unix_socket=/tmp/lab-real-ingress-e2e/bridge.sock`。tunnel-client startup 机器日志记录 `mcp channel route resolved ... unix_socket_path=...`，随后 `mcp session initialized protocol=2026-07-28 server=catdesk version=4.0.0`，health/ready 均 PASS。
+- ChatGPT Plugins 中对现有 `Local Bridge Identity Probe` 执行 Refresh，tunnel-client 收到真实 `openai-mcp-discover` / `tools/list` control-plane command，CatDesk 返回 10 个当前工具。
+- 新建普通 Personal Chat（非 Work），真实 Web model 只使用该 Plugin，按顺序调用 `read -> write -> edit -> run_command -> start_command -> poll_command`。
+- 本机 workspace 证据：`read-test.txt=hello-from-secure-catdesk`；`web-secure-target.txt=edited-by-personal-web-through-signed-bridge`；`/bin/pwd` 返回隔离 workspace。
+- Web start job 为 `sleep 1; printf web-secure-job-done`；真实 Web poll 后，又从 UDS Local Tool Bridge 本地复核同一 job `8bf9e70b-df92-464a-845a-57ef66cccc79`：`state=succeeded`、`success=true`、`commandSuccess=true`、`exitCode=0`、stdout=`web-secure-job-done`。
+- 因此 `Personal ChatGPT Plus -> OpenAI Secure MCP Tunnel -> direct Unix socket -> signed Local Tool Bridge -> hardened CatDesk -> macOS workspace/sandbox` 的 scoped general Files/Shell/Jobs 全链已经真实通过。
+- 该结果不改变身份诚实性：`x-openai-session`/`x-openai-subject` 仍只是 correlation facts，不是 Runtime Controller/Web conversation host attestation。剩余 SAFE-01 工作是独立 Security Review、key rotation/crash recovery、same-UID hostile-process 威胁边界和 packaging。
