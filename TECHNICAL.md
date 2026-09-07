@@ -82,6 +82,12 @@ Local Tool Bridge 的 UDS transport boundary 现在要求 socket parent 为 curr
 
 Authority state fail-closed：如果 state snapshot 缺失但 versioned key material 已存在，不会新建空 authority；restart 使用相同 capability ID 时，persisted grant 必须与当前 principal/session/workspace/capability set 完全一致，否则要求显式换 capability identity。capability set 参与派生 signing secret，防止本地 state scope 被静默改写。
 
+### Hardened backend mode and signal confinement
+
+迁移期 CatDesk backend 默认进入 authenticated local-backend mode：未提供有效 `CATDESK_LOCAL_BACKEND_KEY_FILE` 时 hardened backend 不启动可用 MCP；只有显式 `CATDESK_ALLOW_UNAUTHENTICATED_LOCAL_BACKEND=1` 才进入 legacy compatibility mode。这样 Bridge 的 backend authentication 不依赖部署者“记得设置 env”。
+
+macOS shell Seatbelt 的 signal 权限只允许 `target self` 与 `target children`；prompt-originated shell 不得 signal Bridge、CatDesk 或其他外部 same-UID 进程。Harness 同时验证 outside process signal 失败、child signal 成功。
+
 ## Harness
 
 当前最小 Harness：

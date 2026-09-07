@@ -608,6 +608,29 @@ fn master_key_rotation_is_generation_fenced_and_crash_safe() {
 }
 
 #[test]
+fn committed_rotation_stays_successful_if_previous_key_cleanup_cannot_remove_path() {
+    let state_dir = tempdir().unwrap();
+    let (_context, grant) = grant();
+    let mut authority = CapabilityAuthority::new_for_test([23_u8; 32]);
+    authority.issue(grant, 100, 10_000, 1).unwrap();
+    authority.save_private(state_dir.path()).unwrap();
+
+    let previous = state_dir.path().join("authority.key.1");
+    let backup = state_dir.path().join("authority.key.1.backup");
+    std::fs::rename(&previous, &backup).unwrap();
+    std::fs::create_dir(&previous).unwrap();
+
+    let next = authority
+        .rotate_master_key_private(state_dir.path(), 1)
+        .unwrap();
+    assert_eq!(next, 2);
+    assert_eq!(authority.key_generation(), 2);
+    let restarted = CapabilityAuthority::load_or_create_private(state_dir.path()).unwrap();
+    assert_eq!(restarted.key_generation(), 2);
+    assert!(state_dir.path().join("authority.key.2").is_file());
+}
+
+#[test]
 fn missing_state_with_existing_key_material_fails_closed() {
     let state_dir = tempdir().unwrap();
     std::fs::write(state_dir.path().join("authority.key.1"), "00".repeat(32)).unwrap();
@@ -740,6 +763,34 @@ fn macos_shell_blocks_sensitive_fs_network_and_env_but_allows_workspace_io() {
         !network.status.success(),
         "network escape unexpectedly succeeded"
     );
+
+    let mut outside_process = std::process::Command::new("/bin/sleep")
+        .arg("5")
+        .spawn()
+        .unwrap();
+    let outside_signal = run_home_confined_shell(
+        workspace_dir.path(),
+        &format!("/bin/kill -0 {}", outside_process.id()),
+    )
+    .unwrap();
+    assert!(
+        !outside_signal.status.success(),
+        "sandbox unexpectedly allowed signaling an outside same-UID process"
+    );
+    let _ = outside_process.kill();
+    let _ = outside_process.wait();
+
+    let child_signal = run_home_confined_shell(
+        workspace_dir.path(),
+        "sleep 5 & child=$!; kill $child; wait $child || true; printf child-signal-ok",
+    )
+    .unwrap();
+    assert!(
+        child_signal.status.success(),
+        "sandbox should allow signaling its own child: {}",
+        String::from_utf8_lossy(&child_signal.stderr)
+    );
+    assert!(String::from_utf8_lossy(&child_signal.stdout).contains("child-signal-ok"));
 
     unsafe { std::env::set_var("LAB_SECURITY_SECRET", "must-not-leak") };
     let env = run_home_confined_shell(workspace_dir.path(), "/usr/bin/env").unwrap();

@@ -12,7 +12,7 @@ The macOS shell prototype uses `/usr/bin/sandbox-exec` as a **PoC isolation back
 
 ## Current executable gates
 
-`cargo test --manifest-path experiments/security-boundary/Cargo.toml` currently covers 19 passing tests, including:
+`cargo test --manifest-path experiments/security-boundary/Cargo.toml` currently covers 20 passing tests, including:
 
 - capability grant binding across principal/session/capability/workspace;
 - signed local-ingress request proofs that bind capability/principal/session/workspace + request id/nonce + MCP method/tool + body hash with HMAC-SHA256;

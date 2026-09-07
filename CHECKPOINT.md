@@ -150,7 +150,7 @@ Runtime collaborative 初始化器已建立并复用：
 
 ## LAB-SAFE-01 security boundary progress
 
-- `experiments/security-boundary` Rust Harness 已扩到 19/19 PASS。
+- `experiments/security-boundary` Rust Harness 已扩到 20/20 PASS。
 - Authorization prototype 明确绑定 `principal_id / execution_session_id / capability_id / workspace_id`；不引用 ChatGPT model、Web conversation lifecycle、Runtime Controller/Goal/DAG。
 - Capability authority 新增 TTL、revocation、session-generation fencing、request nonce replay protection；authority key/state 0600 原子持久化，重启后 replay/revocation 仍保持。
 - Operational hardening 已补：master key 使用 versioned generation，rotation 采用“先落新 key、再原子提交 state pointer”的 crash-safe 顺序并带 expected-generation fence；state dir 0700、key/state 0600，symlink state path fail closed。
@@ -209,3 +209,12 @@ Runtime collaborative 初始化器已建立并复用：
 - Rotation/minor 已修：key.N+1 orphan 可在 crash retry 复用，state commit 后清理 previous key；shared-key HTTP ingress 也要求 state_dir 并持久化 replay；backend hostname `localhost` 被拒绝；redirect 不跟随。
 - 当前验证：security boundary 19/19 PASS；Local Tool Bridge ingress 8/8 PASS；real-process recovery/UDS hardening 3/3 PASS；CatDesk backend-auth test PASS、security tests 9/9 PASS。CatDesk 全量 217 PASS / 6 historical change_tracking baseline FAIL，未出现本轮新增失败。
 - 下一步只对新的 immutable candidate 做独立复审；复审前不得把 SAFE-01 写成 CLOSED。
+
+## LAB-SAFE-01 post-fix review round 1
+
+- 独立 Grok 4.6 xhigh 对 immutable `2bbbdccdab53588f486fccad5126bf33636163e8` 完整返回 `FINDINGS`：0 Critical / 2 Important / 0 Minor。
+- Important #1：CatDesk backend auth 在未设置 key env 时仍默认 Disabled。已在 CatDesk candidate `b94e85b0ba6b64e6a1dd360fa4838d80840794a2` 修复为默认 fail-closed；只有显式 `CATDESK_ALLOW_UNAUTHENTICATED_LOCAL_BACKEND=1` 才允许 legacy unauthenticated mode。`hardened_local_backend_mode_fails_closed_without_key_path` 与 direct loopback 401 测试 PASS。
+- Important #2：macOS Seatbelt `(allow signal)` 可让 prompt-originated shell signal 外部 same-UID 进程。Bridge security core 与 CatDesk profile 已改为仅 `(target self)` + `(target children)`；新增真实外部 `/bin/sleep` signal-denied + child signal-allowed harness，PASS。
+- Rotation cleanup 进一步收口：一旦 N+1 state 已提交，previous-key cleanup 失败不再把已完成 rotation 报成失败；新增 cleanup-failure recovery test。当前 security boundary 20/20 PASS。
+- CatDesk security candidate 当前精确 HEAD=`b94e85b0ba6b64e6a1dd360fa4838d80840794a2`；backend default fail-closed 与 signal confinement 已提交。
+- SAFE-01 仍保持 ACTIVE，等待新的 immutable main candidate 独立复审；不得提前写 PASS/CLOSED。

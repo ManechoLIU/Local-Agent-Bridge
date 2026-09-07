@@ -323,11 +323,12 @@ impl CapabilityAuthority {
             return Err(error);
         }
         let previous_path = private_key_path(state_dir, previous_generation);
-        if previous_path.exists() {
-            std::fs::remove_file(&previous_path)
-                .map_err(|error| format!("previous master key cleanup failed: {error}"))?;
-            sync_directory(state_dir)?;
+        if previous_path.exists() && std::fs::remove_file(&previous_path).is_ok() {
+            let _ = sync_directory(state_dir);
         }
+        // State already committed to the new generation. Cleanup failure must not
+        // report rotation failure and cause callers to retry the old fence. The
+        // retired key is no longer authoritative and can be removed on maintenance.
         Ok(next)
     }
 
@@ -1042,7 +1043,8 @@ pub fn run_home_confined_shell(
 (allow file-read-data (subpath (param "WORKSPACE")))
 (allow file-write* (subpath (param "WORKSPACE")))
 (allow sysctl-read)
-(allow signal)
+(allow signal (target self))
+(allow signal (target children))
 "#;
 
     let mut process = Command::new("/usr/bin/sandbox-exec");
