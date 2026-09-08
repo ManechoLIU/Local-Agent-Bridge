@@ -30,6 +30,12 @@ Web Host Attestation 链：Adaptive Agent Runtime -> trusted verifier interface 
 
 Web Executor machine state 只保存 execution correlation，不成为第二份 TASK_LEDGER。最小字段包括 assignment_id、execution_id、attempt、browser_session_id、conversation_id（若可观察）、provider/model requested/observed、model_attestation、status、started/updated/terminal timestamps、result locator、terminal receipt、recovery generation 与 provenance。Runtime canonical Assignment lifecycle 仍是最终状态权威。
 
+### Computer Runtime v1 bounded desktop actions
+
+Computer Runtime 当前候选把桌面能力放在独立 `crates/computer-runtime`，不依赖 Adaptive Agent Runtime 或 AI-Bridge Compute Helper。MCP 动作面包括 `computer_list_apps/list_windows/active_window`、`computer_activate_app`、`computer_screenshot`、`computer_find`、`computer_click`、`computer_type`、`computer_key`、`computer_scroll`。每个 session-bound 调用必须携带 `expected_session_generation`；可作用于窗口的动作还必须引用 fresh observation 中的 exact `(window_id,pid)`，click 必须引用由同 session 的 find observation 产生的 opaque element locator。observation 有 TTL 和 bounded history，stale/missing generation、forged window/element、ownership mismatch 均在 provider side effect 前 fail closed。
+
+macOS native helper v1 直接使用 CGWindow/Accessibility/CoreGraphics；screenshot 要求 Screen Recording，并限制尺寸/编码字节；find/click/type/key/scroll 要求 Accessibility，且 mutation 前重新核验 observed window 仍是目标、需要输入的动作要求 exact focused Accessibility window。find locator 绑定 AX path + element fingerprint，click 时重新 resolve 并验证 fingerprint，降低 stale element 误击风险。当前实机 Screen Recording=true、Accessibility=false，所以 native screenshot 已真实 E2E，UI mutation 仍必须等待授权后在 harmless fixture 上验证，不可用 mock 结果冒充 real action PASS。
+
 ## Web Host Attestation + Re-entry contract
 
 该 capability 是独立 adapter，不是 Local Tool Bridge / Computer Runtime 子模块。Runtime OFF 时 Bridge / Computer Runtime 仍可独立运行；只有需要 Web Controller strong identity / unattended continuation 时 Runtime 才调用该 adapter。
