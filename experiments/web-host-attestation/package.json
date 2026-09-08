@@ -1,0 +1,8 @@
+{
+  "name": "local-agent-bridge-web-host-attestation",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test attestation.test.mjs"
+  }
+}

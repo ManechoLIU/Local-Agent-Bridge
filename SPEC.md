@@ -7,13 +7,14 @@
 - 建立新的 **Local Agent Bridge / Local Tool Bridge**，让 ChatGPT Web 或其他 Agent 能安全调用本机 Files、Shell、Process、Browser 与独立 Computer Runtime。
 - Bridge 与 Computer Runtime 可以被 Adaptive Agent Runtime 调用，但产品必须支持不启动任何项目治理 Runtime 的独立运行模式。
 - 建立机器可验证的 execution-session identity / host-session attestation / capability verification / execution-target identity，最终淘汰当前 manual Web Controller binding。
+- 将 **Web Host Attestation + Re-entry Adapter** 纳入正式产品范围：由真实 browser/Host machine boundary 为 exact ChatGPT Web conversation/execution target 生成 freshness/anti-replay attestation，并为 Adaptive Agent Runtime 提供可选 verifier + SAME-Controller re-entry/wake 能力；该 adapter 与 Local Tool Bridge / Computer Runtime 解耦。
 - 在安全边界成立后，提供足以支持真实开发工作的读写、进程、浏览器和桌面执行能力。
 
 ## 非目标
 
 - 不把 Adaptive Agent Runtime、SelfAlone Controller、Goal 或 TASK_LEDGER 设计成 Bridge / Computer Runtime 的产品运行依赖。
 - 不复用 SelfAlone 的 project identity、logical Controller 或 lifecycle。
-- 不把 prompt 中的 conversation ID、随机 URL path、`Mcp-Session-Id`、进程存活或页面 DOM 观察当作 host-attested identity。
+- 不把 prompt 中的 conversation ID、随机 URL path、`Mcp-Session-Id`、进程存活、页面 DOM/标题/截图或**单纯 URL** 当作 host-attested identity；browser navigation machine observation 只有在同时绑定 browser target/document identity、fresh challenge、generation/ownership fence 与 Host-signed receipt 时才可进入 attestation verifier。
 - 当前治理初始化阶段不实现完整 Files/Shell/Browser/Computer Runtime 产品能力。
 
 ## 用户流程
@@ -44,6 +45,9 @@
 - Shell/Process 有真实、可解释的 filesystem / network / environment / credential 权限边界，而非仅依赖 cwd。
 - Browser 与独立 Computer Runtime 的授权、session ownership、目标隔离和 E2E 均有真实证据。
 - 在 Adaptive Agent Runtime 完全未运行时，Bridge / Computer Runtime 核心产品链仍可独立工作。
+- Web Host Attestation + Re-entry Adapter 必须真实证明：machine-verifiable exact conversation target、fresh challenge/nonce、target generation、ownership generation、Host provenance/receipt 与 anti-replay；`manual_user_authorized`、`ui_observed conversation_id`、tab/URL/title 单独均不得升级 VERIFIED。
+- Same-controller Live-E2E 必须完成 `existing Web Controller -> child/executor terminal -> Runtime canonical continuation -> Host-attested same target -> automatic re-entry/submit -> Controller fresh-read + project-wide recompute -> next runnable`，全程不依赖用户再发“继续”。
+- Host attestation/re-entry Harness 必须覆盖 stale target、stale generation、wrong conversation、duplicate/replay、temporary disconnect、transient re-entry unavailable、supervisor restart；失败路径 fail closed。
 
 ## v1 本机威胁模型
 

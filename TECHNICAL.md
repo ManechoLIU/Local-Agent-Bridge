@@ -14,6 +14,8 @@ Web Executor 链：Adaptive Agent Runtime -> canonical route -> Web ChatGPT Exec
 
 Adaptive Agent Runtime 可以作为开发期 orchestration infrastructure；核心 Bridge / Computer Runtime 不得要求 Runtime、Controller registry、Goal、TASK_LEDGER、Web model routing 或 Web conversation lifecycle 才能启动和执行本机能力。
 
+Web Host Attestation 链：Adaptive Agent Runtime -> trusted verifier interface -> Web Host Attestation + Re-entry Adapter -> browser/Host machine boundary -> exact ChatGPT Web target。该 adapter 不属于 Local Tool Bridge，也不拥有 Runtime lifecycle；它只提供 Host identity attestation、freshness/replay verification 与 exact-target re-entry/submit receipt。
+
 ## 数据与接口
 
 身份层必须显式区分：
@@ -27,6 +29,28 @@ Adaptive Agent Runtime 可以作为开发期 orchestration infrastructure；核�
 
 
 Web Executor machine state 只保存 execution correlation，不成为第二份 TASK_LEDGER。最小字段包括 assignment_id、execution_id、attempt、browser_session_id、conversation_id（若可观察）、provider/model requested/observed、model_attestation、status、started/updated/terminal timestamps、result locator、terminal receipt、recovery generation 与 provenance。Runtime canonical Assignment lifecycle 仍是最终状态权威。
+
+## Web Host Attestation + Re-entry contract
+
+该 capability 是独立 adapter，不是 Local Tool Bridge / Computer Runtime 子模块。Runtime OFF 时 Bridge / Computer Runtime 仍可独立运行；只有需要 Web Controller strong identity / unattended continuation 时 Runtime 才调用该 adapter。
+
+### Machine target observation
+
+Host adapter 必须从 browser/Host machine integration 读取当前 top-level document target，而不是从 prompt、DOM 文本、页面标题、截图或模型自报身份。最小 machine observation 绑定：`host_type=chatgpt_web`、browser target/tab identity、top-frame identity、document/loader identity、canonical secure origin、exact conversation identity、observation timestamp 与 machine-source provenance。conversation route 即使来自 browser navigation state，也只有与 target/frame/document identity 一起由 Host 机器边界签名后才可验证；单纯 URL 不具有 strong identity 语义。
+
+当前 browser integration 已实机证明可在不读 DOM 的情况下取得 top-frame `frame id + loader id + securityOrigin` 等 browser machine facts；这仅证明可行 input surface，不等于 Runtime attestation PASS。不得把 `x-openai-session / x-openai-subject` 或 `ui_observed conversation_id` 升级为 strong identity。
+
+### Attestation envelope
+
+v1 envelope 至少绑定：`conversation_id`、`host_type`、`browser_target_id`、`top_frame_id`、`document_id/loader_id`、`issued_at/expires_at`、Runtime challenge nonce、Host nonce、`target_generation`、`ownership_generation`、Host provenance、receipt id 与 Host authentication tag/signature。Runtime verifier 必须验证 freshness、challenge exact match、generation/ownership、target/conversation consistency，并对 challenge/receipt 做 consume-once anti-replay。
+
+Verifier 返回的是 verified target claims，不修改 Controller registry、Assignment lifecycle 或 TASK_LEDGER。`manual_user_authorized / temporary` 不得由 verifier 自动升级；只有真实 machine attestation 才可标 `host_attested=true`。
+
+### Re-entry / wake
+
+Re-entry request 绑定 verified target、fresh wake id/challenge、continuation payload hash、expected target generation 与 ownership generation。adapter 在 focus/submit **前**重新观察 machine target并二次校验；focus 后、submit 前再次 fence；submit 后返回 Host receipt，明确区分 `dispatch_attempted` 与 `submit_confirmed`。old target / stale generation / wrong conversation / target replacement / transient unavailable 均 fail closed 或返回可重试的 machine status，不得伪造成功。
+
+Runtime 继续复用既有 SAME-Controller continuation、generation fencing、ownership fencing、bounded rearm 与 canonical lifecycle；Host adapter 只补齐 identity verifier + exact-target re-entry 最后一公里，不另造第二 wake system。
 
 ## 安全与外部依赖
 
