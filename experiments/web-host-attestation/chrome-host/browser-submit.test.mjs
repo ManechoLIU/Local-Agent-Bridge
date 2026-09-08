@@ -247,6 +247,47 @@ test("invalid prepare result with unprovable rollback persists rollback_unconfir
   assert.equal(f.journal.records.get("wake-1").phase, "rollback_unconfirmed");
 });
 
+test("prepared false with missing status requires exact rollback and is never retryable", async () => {
+  const f = fixture({
+    prepareResult: {
+      prepared: false,
+      ready_to_dispatch: false,
+      dispatch_attempted: false,
+      submit_confirmed: false,
+      retryable: true,
+      baseline_user_message_count: 2,
+      initial_send_control: null
+    }
+  });
+  const result = await submitContinuationThroughChrome(f.options);
+  assert.equal(result.status, "prepare_result_invalid");
+  assert.equal(result.retryable, false);
+  assert.equal(result.dispatch_attempted, false);
+  assert.equal(f.calls.filter(call => call[0] === "rollback").length, 1);
+  assert.equal(f.journal.records.size, 0);
+});
+
+test("unknown prepared-false status requires exact rollback instead of trusting retryable", async () => {
+  const f = fixture({
+    prepareResult: {
+      prepared: false,
+      ready_to_dispatch: false,
+      dispatch_attempted: false,
+      submit_confirmed: false,
+      retryable: true,
+      status: "future_prepare_state",
+      baseline_user_message_count: 2,
+      initial_send_control: null
+    }
+  });
+  const result = await submitContinuationThroughChrome(f.options);
+  assert.equal(result.status, "future_prepare_state");
+  assert.equal(result.retryable, false);
+  assert.equal(result.dispatch_attempted, false);
+  assert.equal(f.calls.filter(call => call[0] === "rollback").length, 1);
+  assert.equal(f.journal.records.size, 0);
+});
+
 test("partial composer preparation performs exact rollback before returning", async () => {
   const f = fixture({
     prepareResult: {
