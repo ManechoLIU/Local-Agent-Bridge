@@ -190,11 +190,14 @@ export async function submitContinuationThroughChrome(options) {
   const priorWake = await journal.get(wakeId);
   if (priorWake) {
     trace.failure_stage = "wake_replay";
+    const replayConfirmed = priorWake.phase === "submit_confirmed";
     return browserReceipt({
-      status: "wake_replayed_browser_journal",
+      status: replayConfirmed
+        ? "wake_replayed_submit_confirmed"
+        : "wake_replayed_browser_journal",
       retryable: false,
       dispatchAttempted: Boolean(priorWake.dispatch_attempted),
-      submitConfirmed: false,
+      submitConfirmed: replayConfirmed,
       receiptFactory,
       diagnostics: trace
     });
@@ -296,7 +299,21 @@ export async function submitContinuationThroughChrome(options) {
       conversationId,
       payloadSha256
     });
-    if (rollback.succeeded) await journal.remove(wakeId);
+    if (rollback.succeeded) {
+      await journal.remove(wakeId);
+    } else {
+      await journal.put({
+        wake_id: wakeId,
+        browser_target_id: browserTargetId,
+        conversation_id: conversationId,
+        target_generation: targetGeneration,
+        ownership_generation: ownershipGeneration,
+        payload_sha256: payloadSha256,
+        phase: "rollback_unconfirmed",
+        dispatch_attempted: false,
+        updated_at_ms: Date.now()
+      });
+    }
     return browserReceipt({
       status: rollback.succeeded ? "prepare_result_invalid" : "rollback_unconfirmed",
       retryable: rollback.succeeded,
@@ -308,46 +325,60 @@ export async function submitContinuationThroughChrome(options) {
   }
 
   trace.composer_preparation.ok = prepared.prepared === true;
-  trace.composer_preparation.status = String(prepared.status || "");
+  const rawPrepareStatus = String(prepared.status == null ? "" : prepared.status).trim();
+  const prepareStatusValid = rawPrepareStatus.length > 0 && rawPrepareStatus.length <= 128;
+  const cleanPrepareFailure = prepareStatusValid && new Set([
+    "invalid_payload",
+    "wrong_conversation",
+    "composer_unavailable",
+    "composer_not_empty",
+    "controller_active"
+  ]).has(rawPrepareStatus);
+  trace.composer_preparation.status = prepareStatusValid
+    ? rawPrepareStatus
+    : "prepare_result_invalid";
+
   if (!prepared.prepared) {
-    const prepareStatus = requiredText(prepared.status, "page prepare status", 128);
     trace.failure_stage = "composer_preflight";
-    if (prepareStatus === "composer_preparation_unconfirmed") {
-      const rollback = await safeRollback({
-        rollbackPreparedByHash,
-        diagnostics: trace,
-        browserTargetId,
-        conversationId,
-        payloadSha256
-      });
-      if (rollback.succeeded) {
-        await journal.remove(wakeId);
-      } else {
-        await journal.put({
-          wake_id: wakeId,
-          browser_target_id: browserTargetId,
-          conversation_id: conversationId,
-          target_generation: targetGeneration,
-          ownership_generation: ownershipGeneration,
-          payload_sha256: payloadSha256,
-          phase: "rollback_unconfirmed",
-          dispatch_attempted: false,
-          updated_at_ms: Date.now()
-        });
-      }
+    if (cleanPrepareFailure) {
+      await journal.remove(wakeId);
       return browserReceipt({
-        status: rollback.succeeded ? prepareStatus : "rollback_unconfirmed",
-        retryable: false,
+        status: rawPrepareStatus,
+        retryable: Boolean(prepared.retryable),
         dispatchAttempted: false,
         submitConfirmed: false,
         receiptFactory,
         diagnostics: trace
       });
     }
-    await journal.remove(wakeId);
+
+    const rollback = await safeRollback({
+      rollbackPreparedByHash,
+      diagnostics: trace,
+      browserTargetId,
+      conversationId,
+      payloadSha256
+    });
+    if (rollback.succeeded) {
+      await journal.remove(wakeId);
+    } else {
+      await journal.put({
+        wake_id: wakeId,
+        browser_target_id: browserTargetId,
+        conversation_id: conversationId,
+        target_generation: targetGeneration,
+        ownership_generation: ownershipGeneration,
+        payload_sha256: payloadSha256,
+        phase: "rollback_unconfirmed",
+        dispatch_attempted: false,
+        updated_at_ms: Date.now()
+      });
+    }
     return browserReceipt({
-      status: prepareStatus,
-      retryable: Boolean(prepared.retryable),
+      status: rollback.succeeded
+        ? (prepareStatusValid ? rawPrepareStatus : "prepare_result_invalid")
+        : "rollback_unconfirmed",
+      retryable: false,
       dispatchAttempted: false,
       submitConfirmed: false,
       receiptFactory,
@@ -383,7 +414,21 @@ export async function submitContinuationThroughChrome(options) {
       conversationId,
       payloadSha256
     });
-    if (rollback.succeeded) await journal.remove(wakeId);
+    if (rollback.succeeded) {
+      await journal.remove(wakeId);
+    } else {
+      await journal.put({
+        wake_id: wakeId,
+        browser_target_id: browserTargetId,
+        conversation_id: conversationId,
+        target_generation: targetGeneration,
+        ownership_generation: ownershipGeneration,
+        payload_sha256: payloadSha256,
+        phase: "rollback_unconfirmed",
+        dispatch_attempted: false,
+        updated_at_ms: Date.now()
+      });
+    }
     return browserReceipt({
       status: rollback.succeeded
         ? "machine_target_changed_before_trusted_dispatch"

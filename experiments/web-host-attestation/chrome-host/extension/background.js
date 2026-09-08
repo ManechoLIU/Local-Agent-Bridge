@@ -139,10 +139,14 @@ startupRecovery.then(function (results) {
 async function handleCommand(message) {
   const op = String(message && message.op || "");
   if (op === "observe_conversation") {
-    return { observation: await observeConversation(message.conversation_id) };
+    return await submitTransactions.run(async function () {
+      return { observation: await observeConversation(message.conversation_id) };
+    });
   }
   if (op === "observe_target") {
-    return { observation: await observeTarget(message.browser_target_id) };
+    return await submitTransactions.run(async function () {
+      return { observation: await observeTarget(message.browser_target_id) };
+    });
   }
   if (op === "submit_continuation") {
     return await submitTransactions.run(async function () {

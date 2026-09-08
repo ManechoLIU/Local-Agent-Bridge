@@ -53,6 +53,7 @@ function fixture(overrides = {}) {
     exact_new_user_message: true
   };
 
+  let observeCalls = 0;
   const options = {
     chromeApi: {
       scripting: {
@@ -68,10 +69,15 @@ function fixture(overrides = {}) {
       }
     },
     getTargets: async () => [target(overrides.targetConversation || CONVERSATION)],
-    observeTarget: async () => ({
-      browser_target_id: "target-1",
-      conversation_id: overrides.observedConversation || CONVERSATION
-    }),
+    observeTarget: async () => {
+      observeCalls += 1;
+      return {
+        browser_target_id: "target-1",
+        conversation_id: observeCalls > 1 && overrides.observedConversationAfterFirst
+          ? overrides.observedConversationAfterFirst
+          : overrides.observedConversation || CONVERSATION
+      };
+    },
     dispatchTrustedClick: async input => {
       calls.push(["trusted_click", input.browser_target_id]);
       if (overrides.trustedClickError) throw overrides.trustedClickError;
@@ -83,6 +89,9 @@ function fixture(overrides = {}) {
           coordinates_changed_since_prepare: Boolean(overrides.coordinatesChanged),
           focus_emulation: true
         });
+      }
+      if (overrides.trustedClickErrorAfterArm) {
+        throw overrides.trustedClickErrorAfterArm;
       }
       return {
         dispatched: true,
@@ -222,6 +231,22 @@ test("pre-dispatch error with unprovable rollback becomes non-retryable and reta
   assert.equal(f.journal.records.get("wake-1").phase, "rollback_unconfirmed");
 });
 
+test("invalid prepare result with unprovable rollback persists rollback_unconfirmed", async () => {
+  const f = fixture({
+    prepareResult: { status: "malformed" },
+    rollbackResult: {
+      cleared: false,
+      already_absent: false,
+      status: "composer_hash_mismatch"
+    }
+  });
+  const result = await submitContinuationThroughChrome(f.options);
+  assert.equal(result.status, "rollback_unconfirmed");
+  assert.equal(result.retryable, false);
+  assert.equal(result.dispatch_attempted, false);
+  assert.equal(f.journal.records.get("wake-1").phase, "rollback_unconfirmed");
+});
+
 test("partial composer preparation performs exact rollback before returning", async () => {
   const f = fixture({
     prepareResult: {
@@ -266,6 +291,50 @@ test("partial composer preparation with unprovable ownership retains journal and
   assert.equal(result.dispatch_attempted, false);
   assert.equal(result.retryable, false);
   assert.equal(f.journal.records.get("wake-1").phase, "rollback_unconfirmed");
+});
+
+test("prepare_result_invalid with unprovable rollback records rollback_unconfirmed", async () => {
+  const f = fixture({
+    prepareResult: {},
+    rollbackResult: {
+      cleared: false,
+      already_absent: false,
+      status: "composer_hash_mismatch"
+    }
+  });
+  const result = await submitContinuationThroughChrome(f.options);
+  assert.equal(result.status, "rollback_unconfirmed");
+  assert.equal(result.dispatch_attempted, false);
+  assert.equal(f.journal.records.get("wake-1").phase, "rollback_unconfirmed");
+});
+
+test("target drift before trusted dispatch with rollback failure records rollback_unconfirmed", async () => {
+  const f = fixture({
+    observedConversationAfterFirst: OTHER,
+    rollbackResult: {
+      cleared: false,
+      already_absent: false,
+      status: "composer_hash_mismatch"
+    }
+  });
+  const result = await submitContinuationThroughChrome(f.options);
+  assert.equal(result.status, "rollback_unconfirmed");
+  assert.equal(result.dispatch_attempted, false);
+  assert.equal(f.journal.records.get("wake-1").phase, "rollback_unconfirmed");
+});
+
+test("live failure after dispatch_armed but before mousePressed exact-rolls back and remains pre-dispatch", async () => {
+  const error = preDispatchError({
+    status: "target_frame_changed_after_dispatch_arm",
+    retryable: false,
+    failureStage: "dispatch_arm_target_validation"
+  });
+  const f = fixture({ trustedClickErrorAfterArm: error });
+  const result = await submitContinuationThroughChrome(f.options);
+  assert.equal(result.dispatch_attempted, false);
+  assert.equal(result.status, "target_frame_changed_after_dispatch_arm");
+  assert.equal(f.calls.filter(call => call[0] === "rollback").length, 1);
+  assert.equal(f.journal.records.size, 0);
 });
 
 test("possible dispatch with unknown result never rolls back and remains RESULT_UNKNOWN", async () => {
@@ -336,6 +405,28 @@ test("exact same browser wake journal replay is rejected without a second dispat
   const result = await submitContinuationThroughChrome(f.options);
   assert.equal(result.status, "wake_replayed_browser_journal");
   assert.equal(result.dispatch_attempted, true);
+  assert.equal(f.calls.length, 0);
+});
+
+test("confirmed wake tombstone replay preserves confirmation without a second dispatch", async () => {
+  const journal = memoryJournal([{
+    schema_version: 1,
+    wake_id: "wake-1",
+    browser_target_id: "target-1",
+    conversation_id: CONVERSATION,
+    target_generation: 4,
+    ownership_generation: 8,
+    payload_sha256: "a".repeat(64),
+    phase: "submit_confirmed",
+    dispatch_attempted: true,
+    updated_at_ms: 1
+  }]);
+  const f = fixture({ journal });
+  const result = await submitContinuationThroughChrome(f.options);
+  assert.equal(result.status, "wake_replayed_submit_confirmed");
+  assert.equal(result.dispatch_attempted, true);
+  assert.equal(result.submit_confirmed, true);
+  assert.equal(result.retryable, false);
   assert.equal(f.calls.length, 0);
 });
 
