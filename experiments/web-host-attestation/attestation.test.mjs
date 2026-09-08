@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import { mkdtempSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -12,6 +13,8 @@ import {
   validateMachineObservation,
   verifyReentryReceipt
 } from "./attestation.mjs";
+import { createHostDriver } from "./host-driver.mjs";
+import { createRuntimeHostProvider } from "./provider.mjs";
 
 const SECRET = "host-attestation-secret-0123456789abcdef0123456789abcdef";
 const CONVERSATION = "6a9e4158-cc8c-83ea-9763-05a7fd51f597";
@@ -81,6 +84,20 @@ test("fresh machine attestation verifies once and consumes challenge", () => {
   assert.throws(() => verifier.verifyAndConsume(attestation), /already consumed/);
 });
 
+test("attestation envelope browser target must exactly match machine observation", () => {
+  const time = clock();
+  const verifier = new RuntimeHostVerifier(SECRET, { clock: time.now });
+  const challenge = verifier.issueChallenge({ conversation_id: CONVERSATION, target_generation: 4, ownership_generation: 8 });
+  time.add(100);
+  const attestation = signHostAttestation({ secret: SECRET, challenge, observation: observation(time.now()), clock: time.now });
+  const mismatched = { ...attestation, browser_target_id: "different-machine-target" };
+  const unsigned = { ...mismatched };
+  delete unsigned.host_mac_sha256;
+  // A Host signer could produce a self-authenticating but internally inconsistent envelope.
+  const resigned = signHostAttestationForTest(unsigned);
+  assert.throws(() => verifier.verifyAndConsume(resigned), /browser target mismatch/);
+});
+
 test("wrong conversation and stale generations fail closed", () => {
   const time = clock();
   const verifier = new RuntimeHostVerifier(SECRET, { clock: time.now });
@@ -138,6 +155,18 @@ class Driver {
     if (this.mutateAfterSubmit) this.current = this.mutateAfterSubmit;
     return { dispatch_attempted: true, submit_confirmed: true, host_submit_receipt: "browser-submit-1" };
   }
+}
+
+function signHostAttestationForTest(unsigned) {
+  return { ...unsigned, host_mac_sha256: createHmac("sha256", SECRET).update(canonicalJsonForTest(unsigned)).digest("hex") };
+}
+
+function canonicalJsonForTest(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJsonForTest).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJsonForTest(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 test("same-controller re-entry checks exact target before focus, before submit and after submit", async () => {
@@ -211,6 +240,7 @@ test("transient Host submit failure returns machine receipt distinct from confir
   const driver = new Driver(observation(time.now()));
   const error = new Error("browser temporarily unavailable");
   error.retryable = true;
+  error.dispatch_attempted = false;
   driver.failure = error;
   const adapter = new WebReentryAdapter(SECRET, driver, { clock: time.now });
   const receipt = await adapter.reenter({
@@ -221,11 +251,109 @@ test("transient Host submit failure returns machine receipt distinct from confir
     expected_target_generation: 4,
     expected_ownership_generation: 8
   });
-  assert.equal(receipt.dispatch_attempted, true);
+  assert.equal(receipt.dispatch_attempted, false);
   assert.equal(receipt.submit_confirmed, false);
   assert.equal(receipt.retryable, true);
   assert.equal(receipt.status, "transient_unavailable");
+  assert.equal(receipt.result_class, "CONFIRMED_FAILURE_BEFORE_DISPATCH");
+  assert.equal(receipt.auto_retry_allowed, true);
   verifyReentryReceipt(SECRET, receipt, { wake_id: "wake-transient", conversation_id: CONVERSATION, target_generation: 4, ownership_generation: 8 });
+});
+
+test("submit uncertainty and post-submit target verification failure are RESULT_UNKNOWN and never auto-retry", async () => {
+  const { verified, time } = verifiedFixture();
+  const uncertainDriver = new Driver(observation(time.now()));
+  const uncertainError = new Error("transport disconnected during submit");
+  uncertainError.retryable = true;
+  uncertainDriver.failure = uncertainError;
+  const uncertain = await new WebReentryAdapter(SECRET, uncertainDriver, { clock: time.now }).reenter({
+    verified_target: verified,
+    wake_id: "wake-uncertain",
+    wake_nonce: "n",
+    continuation_payload: "x",
+    expected_target_generation: 4,
+    expected_ownership_generation: 8
+  });
+  assert.equal(uncertain.dispatch_attempted, true);
+  assert.equal(uncertain.result_class, "RESULT_UNKNOWN");
+  assert.equal(uncertain.status, "result_unknown");
+  assert.equal(uncertain.retryable, false);
+  assert.equal(uncertain.auto_retry_allowed, false);
+
+  const changedDriver = new Driver(observation(time.now()));
+  changedDriver.mutateAfterSubmit = observation(time.now(), { loader_id: "post-submit-loader" });
+  const changed = await new WebReentryAdapter(SECRET, changedDriver, { clock: time.now }).reenter({
+    verified_target: verified,
+    wake_id: "wake-post-submit-change",
+    wake_nonce: "n",
+    continuation_payload: "x",
+    expected_target_generation: 4,
+    expected_ownership_generation: 8
+  });
+  assert.equal(changed.result_class, "RESULT_UNKNOWN");
+  assert.equal(changed.status, "result_unknown");
+  assert.equal(changed.auto_retry_allowed, false);
+});
+
+test("stable host driver consumes machine-boundary frame observations and validates calls", async () => {
+  const calls = [];
+  const driver = createHostDriver({
+    observeTarget: async (targetId) => ({
+      tab_id: targetId,
+      observed_at_ms: 1_800_000_000_100,
+      frameTree: { frameTree: { frame: { id: "top", loaderId: "loader", securityOrigin: "https://chatgpt.com", url: `https://chatgpt.com/c/${CONVERSATION}` } } }
+    }),
+    focusTarget: async (targetId) => calls.push(["focus", targetId]),
+    submitContinuation: async (input) => ({ dispatch_attempted: true, submit_confirmed: true, host_submit_receipt: `submitted:${input.wake_id}` })
+  });
+  const observed = await driver.observeTarget("browser-target-7");
+  assert.equal(observed.browser_target_id, "browser-target-7");
+  assert.equal(observed.top_frame_id, "top");
+  await driver.focusTarget("browser-target-7");
+  assert.deepEqual(calls, [["focus", "browser-target-7"]]);
+  await assert.rejects(() => driver.observeTarget(""), /browser_target_id is required/);
+  await assert.rejects(() => driver.submitContinuation({ browser_target_id: "browser-target-7", conversation_id: CONVERSATION, payload: "", wake_id: "w", wake_nonce: "n" }), /payload is required/);
+  assert.throws(() => createHostDriver({ observeTarget() {} }), /focusTarget/);
+});
+
+test("stable provider exposes receipts without owning Runtime lifecycle", async () => {
+  const time = clock();
+  const rawDriver = new Driver(observation(time.now()));
+  const provider = createRuntimeHostProvider({ secret: SECRET, driver: rawDriver, clock: time.now });
+  assert.deepEqual(provider.capabilities, ["issueChallenge", "verifyAttestation", "submitReentry"]);
+  assert.equal("wake" in provider, false);
+  assert.equal("retry" in provider, false);
+  const challenge = provider.issueChallenge({ conversation_id: CONVERSATION, target_generation: 4, ownership_generation: 8 });
+  time.add(100);
+  const attestation = signHostAttestation({ secret: SECRET, challenge, observation: observation(time.now()), clock: time.now });
+  const verified = provider.verifyAttestation(attestation, { conversation_id: CONVERSATION, target_generation: 4, ownership_generation: 8 });
+  const receipt = await provider.submitReentry({ verified_target: verified, wake_id: "provider-wake", wake_nonce: "n", continuation_payload: "resume", expected_target_generation: 4, expected_ownership_generation: 8 });
+  assert.equal(receipt.result_class, "SUBMIT_CONFIRMED");
+});
+
+test("receipt verifier rejects authenticated contradictory result state", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  const receipt = await new WebReentryAdapter(SECRET, driver, { clock: time.now }).reenter({
+    verified_target: verified,
+    wake_id: "wake-contradiction",
+    wake_nonce: "n",
+    continuation_payload: "resume",
+    expected_target_generation: 4,
+    expected_ownership_generation: 8
+  });
+  const unsigned = { ...receipt, result_class: "RESULT_UNKNOWN", auto_retry_allowed: false };
+  delete unsigned.host_mac_sha256;
+  const resigned = signHostAttestationForTest(unsigned);
+  assert.throws(
+    () => verifyReentryReceipt(SECRET, resigned, {
+      wake_id: "wake-contradiction",
+      conversation_id: CONVERSATION,
+      target_generation: 4,
+      ownership_generation: 8
+    }),
+    /result-unknown state is inconsistent/
+  );
 });
 
 test("supervisor restart preserves consumed challenge and wake anti-replay state", async () => {

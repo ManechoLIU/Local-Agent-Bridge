@@ -194,6 +194,7 @@ export class RuntimeHostVerifier {
 
     const observation = validateMachineObservation(attestation.machine_observation);
     if (observation.conversation_id !== attestation.conversation_id) throw new Error("machine observation conversation mismatch");
+    if (observation.browser_target_id !== attestation.browser_target_id) throw new Error("machine observation browser target mismatch");
     if (attestation.observed_at_ms !== observation.observed_at_ms) throw new Error("attestation observation timestamp mismatch");
     if (attestation.observed_at_ms < challenge.issued_at_ms - this.attestationSkewMs || attestation.observed_at_ms > now + this.attestationSkewMs) {
       throw new Error("host attestation machine observation is not fresh for challenge");
@@ -311,15 +312,18 @@ export class WebReentryAdapter {
         wake_nonce: nonce
       });
     } catch (error) {
+      const confirmedBeforeDispatch = error?.dispatch_attempted === false;
       return this.#signedReceipt({
         wakeId,
         nonce,
         verified,
         payload,
-        dispatch_attempted: true,
+        dispatch_attempted: !confirmedBeforeDispatch,
         submit_confirmed: false,
-        retryable: Boolean(error?.retryable),
-        status: error?.retryable ? "transient_unavailable" : "submit_failed",
+        retryable: confirmedBeforeDispatch && Boolean(error?.retryable),
+        auto_retry_allowed: confirmedBeforeDispatch && Boolean(error?.retryable),
+        result_class: confirmedBeforeDispatch ? "CONFIRMED_FAILURE_BEFORE_DISPATCH" : "RESULT_UNKNOWN",
+        status: confirmedBeforeDispatch && error?.retryable ? "transient_unavailable" : confirmedBeforeDispatch ? "submit_failed_before_dispatch" : "result_unknown",
         host_submit_receipt: null
       });
     }
@@ -334,24 +338,31 @@ export class WebReentryAdapter {
         dispatch_attempted: true,
         submit_confirmed: false,
         retryable: false,
-        status: "target_changed_after_submit",
+        auto_retry_allowed: false,
+        result_class: "RESULT_UNKNOWN",
+        status: "result_unknown",
         host_submit_receipt: submit?.host_submit_receipt ?? null
       });
     }
+    const dispatchAttempted = Boolean(submit?.dispatch_attempted);
+    const submitConfirmed = Boolean(submit?.submit_confirmed);
+    const resultUnknown = dispatchAttempted && !submitConfirmed;
     return this.#signedReceipt({
       wakeId,
       nonce,
       verified,
       payload,
-      dispatch_attempted: Boolean(submit?.dispatch_attempted),
-      submit_confirmed: Boolean(submit?.submit_confirmed),
-      retryable: Boolean(submit?.retryable),
-      status: submit?.submit_confirmed ? "submit_confirmed" : submit?.status || "submit_unconfirmed",
+      dispatch_attempted: dispatchAttempted,
+      submit_confirmed: submitConfirmed,
+      retryable: resultUnknown ? false : Boolean(submit?.retryable),
+      auto_retry_allowed: resultUnknown ? false : !dispatchAttempted && Boolean(submit?.retryable),
+      result_class: submitConfirmed ? "SUBMIT_CONFIRMED" : resultUnknown ? "RESULT_UNKNOWN" : "CONFIRMED_FAILURE_BEFORE_DISPATCH",
+      status: submitConfirmed ? "submit_confirmed" : resultUnknown ? "result_unknown" : submit?.status || "submit_failed_before_dispatch",
       host_submit_receipt: submit?.host_submit_receipt ?? null
     });
   }
 
-  #signedReceipt({ wakeId, nonce, verified, payload, dispatch_attempted, submit_confirmed, retryable, status, host_submit_receipt }) {
+  #signedReceipt({ wakeId, nonce, verified, payload, dispatch_attempted, submit_confirmed, retryable, auto_retry_allowed, result_class, status, host_submit_receipt }) {
     const receipt = {
       schema_version: 1,
       receipt_id: `wr_${randomUUID()}`,
@@ -365,6 +376,8 @@ export class WebReentryAdapter {
       dispatch_attempted,
       submit_confirmed,
       retryable,
+      auto_retry_allowed,
+      result_class,
       status,
       host_submit_receipt,
       observed_at_ms: nowMs(this.clock),
@@ -384,5 +397,30 @@ export function verifyReentryReceipt(secret, receipt, { wake_id, conversation_id
   if (receipt.conversation_id !== conversation_id) throw new Error("wrong Web conversation receipt");
   if (receipt.target_generation !== target_generation) throw new Error("stale target generation receipt");
   if (receipt.ownership_generation !== ownership_generation) throw new Error("stale ownership generation receipt");
+
+  const dispatchAttempted = receipt.dispatch_attempted;
+  const submitConfirmed = receipt.submit_confirmed;
+  const retryable = receipt.retryable;
+  const autoRetryAllowed = receipt.auto_retry_allowed;
+  const resultClass = receipt.result_class;
+  if (![dispatchAttempted, submitConfirmed, retryable, autoRetryAllowed].every((value) => typeof value === "boolean")) {
+    throw new Error("re-entry receipt result flags are invalid");
+  }
+  if (submitConfirmed && !dispatchAttempted) throw new Error("re-entry receipt confirms submit without dispatch");
+  if (resultClass === "SUBMIT_CONFIRMED") {
+    if (!dispatchAttempted || !submitConfirmed || retryable || autoRetryAllowed) {
+      throw new Error("re-entry receipt confirmed-submit state is inconsistent");
+    }
+  } else if (resultClass === "RESULT_UNKNOWN") {
+    if (!dispatchAttempted || submitConfirmed || retryable || autoRetryAllowed) {
+      throw new Error("re-entry receipt result-unknown state is inconsistent");
+    }
+  } else if (resultClass === "CONFIRMED_FAILURE_BEFORE_DISPATCH") {
+    if (dispatchAttempted || submitConfirmed || autoRetryAllowed !== retryable) {
+      throw new Error("re-entry receipt pre-dispatch failure state is inconsistent");
+    }
+  } else {
+    throw new Error("re-entry receipt result_class is invalid");
+  }
   return receipt;
 }
