@@ -225,3 +225,13 @@ Runtime collaborative 初始化器已建立并复用：
 - Therefore LAB-SAFE-01 is formally `DONE / GO`. This GO is scoped to Local Tool Bridge Auth / Execution Session / Capability / Authorization / Workspace / Shell / backend-auth / recovery security; it does not upgrade Web host attestation and does not mean the whole product is complete.
 - Current verified gates: security-boundary 20/20 PASS; local-tool-bridge ingress 8/8 PASS; real-process/UDS recovery 3/3 PASS; CatDesk targeted security 10/10 PASS; real Personal Plus Web scoped Files/Shell/Jobs E2E previously PASS.
 - Next product critical path is LAB-COMP-01: independent Computer Runtime v0 API, capability/session ownership, bounded action semantics, Bridge E2E, and Runtime-OFF independence.
+
+
+## 2026-09-08 Current continuation checkpoint
+
+- main HEAD after current integration work: 916793e (Chrome Host attestation driver), preceded by 9065013 (Computer action fencing hardening).
+- LAB-COMP-01 remains ACTIVE. Computer contract 8/8, native macOS 1/1, Bridge-to-Computer real E2E 1/1, Bridge ingress 10/10 and recovery 3/3 are PASS. Screen Recording is available and real bounded PNG screenshot is proven. Native Accessibility is currently false, so real find/click/type/key/scroll harmless fixture E2E remains blocked and must not be reported PASS.
+- LAB-HOST-01 remains ACTIVE. main 916793e contains a Chrome MV3 debugger machine-boundary candidate, Native Messaging Host signer, 0600 Unix socket Runtime client, exact-origin installer and Runtime-facing verifier integration. Host + Chrome/native harness is 32/32 PASS, including a real native subprocess transport/sign/verify E2E. Real unpacked-extension machine attestation in Chrome is not yet completed; submit_continuation is explicitly not implemented.
+- Runtime exact installed revision is 921ed8aaf09215ead06b215fbe81089799577616, impact live_assignments, manifest sha256 dcc5c589f4c6e9b02882ecdb5a009d244e048881ea8cad6d63b5e0686aa042af. The unique project Controller a697051d-402b-4062-a883-a29ba8b395e9 has ACKed this exact revision. live_e2e_required remains true and has not been accepted.
+- Current Runtime canonical Web ownership is session 6a9e4037-0a00-83ea-bb8e-1301c5f6b979, generation 2, provenance manual_user_authorized, binding temporary, host_attested=false. This is not strong Host identity and must not be upgraded by prompt claims, URL/title/tab observation, manual continuation or manual_fenced receipts.
+- LAB-GOV-02 and LAB-WEX-02 remain BLOCKED until product Host machine attestation and real same-target submit/re-entry complete the no-user-continue Live-E2E.

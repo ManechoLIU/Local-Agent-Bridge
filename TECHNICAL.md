@@ -132,3 +132,12 @@ macOS shell Seatbelt 的 signal 权限只允许 `target self` 与 `target childr
 - 身份链未形成机器可信证据前，不把 PoC 描述为安全 Bridge Go。
 - 高副作用能力必须在对应身份/授权/隔离 Harness 通过后逐步开放。
 - Runtime 开发期故障不得通过伪造 machine receipt 解锁；产品自身恢复也必须区分 process liveness、session continuity 与授权 continuity。
+
+
+## Chrome Host machine-boundary candidate (2026-09-08)
+
+main 916793e adds an independent product-side Chrome Host path for LAB-HOST-01. The MV3 extension uses chrome.debugger target discovery plus Target.getTargetInfo and Page.getFrameTree. A ChatGPT route is only candidate-location input; after debugger attach the exact target id and top-frame conversation route must agree, with top-frame id, loader id, https://chatgpt.com origin and fresh timestamp bound into the machine observation. Duplicate targets for the same conversation fail closed. DOM text, title, screenshot content, prompt claims and x-openai correlation headers are not accepted as identity evidence.
+
+The Host HMAC key remains in a local Native Messaging process. Runtime-facing calls use a 0600 Unix socket with request-id fencing; the state directory is 0700 and installer-generated Host key is 0600. The installer writes an exact-extension-origin Native Messaging manifest. This remains a same-user boundary and does not claim hostile same-UID isolation.
+
+The Runtime-facing integration exposes challenge issuance, Host attestation request, verifier consumption and re-entry delegation, but owns no Runtime lifecycle, Assignment ledger, retry scheduler or wake system. Deterministic Host + Chrome/native harness is 32/32 PASS, including a real native subprocess socket -> Native Messaging framing -> Host HMAC -> Runtime verifier E2E. Real Chrome unpacked-extension attestation is still pending, and submit_continuation intentionally returns submit_not_implemented, so LAB-GOV-02 and LAB-WEX-02 remain blocked.
