@@ -14,17 +14,32 @@ function target(conversation) {
   };
 }
 
-function fixture(overrides) {
-  let calls = 0;
+function fixture(overrides = {}) {
+  const calls = [];
+  let scriptIndex = 0;
   const options = {
     chromeApi: {
       scripting: {
-        async executeScript() {
-          calls += 1;
-          if (overrides && overrides.executeThrows) throw new Error("lost receipt");
+        async executeScript(input) {
+          calls.push(["script", input.func.name]);
+          scriptIndex += 1;
+          if (overrides.executeThrowsAt === scriptIndex) throw new Error("lost script receipt");
+          if (scriptIndex === 1) {
+            return [{
+              frameId: 0,
+              result: overrides.prepareResult || {
+                ready_to_dispatch: true,
+                dispatch_attempted: false,
+                submit_confirmed: false,
+                retryable: false,
+                status: "ready_to_dispatch",
+                click_point: { x: 120, y: 210 }
+              }
+            }];
+          }
           return [{
             frameId: 0,
-            result: overrides && overrides.pageResult || {
+            result: overrides.confirmResult || {
               dispatch_attempted: true,
               submit_confirmed: true,
               retryable: false,
@@ -35,13 +50,19 @@ function fixture(overrides) {
       }
     },
     getTargets: async function () {
-      return [target(overrides && overrides.targetConversation || CONVERSATION)];
+      return [target(overrides.targetConversation || CONVERSATION)];
     },
     observeTarget: async function () {
+      calls.push(["observe"]);
       return {
         browser_target_id: "target-1",
-        conversation_id: overrides && overrides.observedConversation || CONVERSATION
+        conversation_id: overrides.observedConversation || CONVERSATION
       };
+    },
+    dispatchTrustedClick: async function (targetId, point) {
+      calls.push(["trusted_click", targetId, point]);
+      if (overrides.trustedClickThrows) throw new Error("trusted input result unknown");
+      return { dispatched: true };
     },
     message: {
       browser_target_id: "target-1",
@@ -50,52 +71,29 @@ function fixture(overrides) {
     },
     receiptFactory: function () { return "receipt-1"; }
   };
-  return { options: options, calls: function () { return calls; } };
+  return { options, calls };
 }
 
-test("Chrome submit refuses wrong conversation before script execution", async function () {
+test("Chrome submit refuses wrong conversation before preparation", async function () {
   const f = fixture({ targetConversation: OTHER });
   const result = await submitContinuationThroughChrome(f.options);
   assert.equal(result.dispatch_attempted, false);
   assert.equal(result.status, "wrong_conversation_before_dispatch");
-  assert.equal(f.calls(), 0);
+  assert.equal(f.calls.length, 0);
 });
 
-test("Chrome submit refuses changed machine observation before script execution", async function () {
+test("Chrome submit refuses changed machine observation before preparation", async function () {
   const f = fixture({ observedConversation: OTHER });
   const result = await submitContinuationThroughChrome(f.options);
   assert.equal(result.dispatch_attempted, false);
   assert.equal(result.status, "machine_target_changed_before_dispatch");
-  assert.equal(f.calls(), 0);
+  assert.deepEqual(f.calls, [["observe"]]);
 });
 
-test("lost executeScript result is result unknown and never retryable", async function () {
-  const f = fixture({ executeThrows: true });
-  const result = await submitContinuationThroughChrome(f.options);
-  assert.deepEqual(result, {
-    dispatch_attempted: true,
-    submit_confirmed: false,
-    retryable: false,
-    status: "result_unknown",
-    host_submit_receipt: "chrome_submit_receipt-1"
-  });
-});
-
-test("confirmed page submit returns opaque Host submit receipt", async function () {
-  const f = fixture({});
-  const result = await submitContinuationThroughChrome(f.options);
-  assert.deepEqual(result, {
-    dispatch_attempted: true,
-    submit_confirmed: true,
-    retryable: false,
-    status: "submit_confirmed",
-    host_submit_receipt: "chrome_submit_receipt-1"
-  });
-});
-
-test("confirmed pre-dispatch page failure remains safely retryable", async function () {
+test("preparation failure stays pre-dispatch and can remain retryable", async function () {
   const f = fixture({
-    pageResult: {
+    prepareResult: {
+      ready_to_dispatch: false,
       dispatch_attempted: false,
       submit_confirmed: false,
       retryable: true,
@@ -110,4 +108,57 @@ test("confirmed pre-dispatch page failure remains safely retryable", async funct
     status: "composer_unavailable",
     host_submit_receipt: null
   });
+  assert.equal(f.calls.some(c => c[0] === "trusted_click"), false);
+});
+
+test("trusted browser input is the only dispatch action", async function () {
+  const f = fixture();
+  const result = await submitContinuationThroughChrome(f.options);
+  assert.equal(result.submit_confirmed, true);
+  const clicks = f.calls.filter(c => c[0] === "trusted_click");
+  assert.deepEqual(clicks, [["trusted_click", "target-1", { x: 120, y: 210 }]]);
+  assert.deepEqual(result, {
+    dispatch_attempted: true,
+    submit_confirmed: true,
+    retryable: false,
+    status: "submit_confirmed",
+    host_submit_receipt: "chrome_submit_receipt-1"
+  });
+});
+
+test("trusted input exception is result unknown and never retryable", async function () {
+  const f = fixture({ trustedClickThrows: true });
+  const result = await submitContinuationThroughChrome(f.options);
+  assert.deepEqual(result, {
+    dispatch_attempted: true,
+    submit_confirmed: false,
+    retryable: false,
+    status: "result_unknown",
+    host_submit_receipt: "chrome_submit_receipt-1"
+  });
+});
+
+test("lost confirmation result after trusted dispatch is result unknown", async function () {
+  const f = fixture({ executeThrowsAt: 2 });
+  const result = await submitContinuationThroughChrome(f.options);
+  assert.equal(result.dispatch_attempted, true);
+  assert.equal(result.submit_confirmed, false);
+  assert.equal(result.retryable, false);
+  assert.equal(result.status, "result_unknown");
+});
+
+test("unconfirmed page state after trusted dispatch remains result unknown", async function () {
+  const f = fixture({
+    confirmResult: {
+      dispatch_attempted: true,
+      submit_confirmed: false,
+      retryable: false,
+      status: "result_unknown"
+    }
+  });
+  const result = await submitContinuationThroughChrome(f.options);
+  assert.equal(result.dispatch_attempted, true);
+  assert.equal(result.submit_confirmed, false);
+  assert.equal(result.retryable, false);
+  assert.equal(result.status, "result_unknown");
 });

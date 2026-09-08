@@ -1,4 +1,4 @@
-export async function pageSubmitFunction(payloadValue, expectedConversationValue) {
+export async function pagePrepareSubmitFunction(payloadValue, expectedConversationValue) {
   function normalizedComposerText(element) {
     const raw = typeof element.innerText === "string"
       ? element.innerText
@@ -82,26 +82,12 @@ export async function pageSubmitFunction(payloadValue, expectedConversationValue
     return null;
   }
 
-  async function waitForSubmitConfirmation(composer, expectedConversation, timeoutMs) {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() <= deadline) {
-      let routeMatches = false;
-      try {
-        routeMatches = conversationFromCurrentLocation() === expectedConversation;
-      } catch {
-        routeMatches = false;
-      }
-      if (routeMatches && normalizedComposerText(composer) === "") return true;
-      await sleep(25);
-    }
-    return false;
-  }
-
   const payload = String(payloadValue == null ? "" : payloadValue);
   const expectedConversation = String(expectedConversationValue == null ? "" : expectedConversationValue).trim();
 
   if (!payload.trim() || payload.length > 8000) {
     return {
+      ready_to_dispatch: false,
       dispatch_attempted: false,
       submit_confirmed: false,
       retryable: false,
@@ -114,6 +100,7 @@ export async function pageSubmitFunction(payloadValue, expectedConversationValue
     currentConversation = conversationFromCurrentLocation();
   } catch {
     return {
+      ready_to_dispatch: false,
       dispatch_attempted: false,
       submit_confirmed: false,
       retryable: false,
@@ -122,6 +109,7 @@ export async function pageSubmitFunction(payloadValue, expectedConversationValue
   }
   if (currentConversation !== expectedConversation) {
     return {
+      ready_to_dispatch: false,
       dispatch_attempted: false,
       submit_confirmed: false,
       retryable: false,
@@ -132,6 +120,7 @@ export async function pageSubmitFunction(payloadValue, expectedConversationValue
   const composer = document.querySelector('#prompt-textarea[contenteditable="true"]');
   if (!composer) {
     return {
+      ready_to_dispatch: false,
       dispatch_attempted: false,
       submit_confirmed: false,
       retryable: true,
@@ -140,6 +129,7 @@ export async function pageSubmitFunction(payloadValue, expectedConversationValue
   }
   if (normalizedComposerText(composer) !== "") {
     return {
+      ready_to_dispatch: false,
       dispatch_attempted: false,
       submit_confirmed: false,
       retryable: false,
@@ -153,6 +143,7 @@ export async function pageSubmitFunction(payloadValue, expectedConversationValue
   if (!sendButton) {
     const cleaned = clearOwnPayloadIfSafe(composer, payload);
     return {
+      ready_to_dispatch: false,
       dispatch_attempted: false,
       submit_confirmed: false,
       retryable: cleaned,
@@ -163,6 +154,7 @@ export async function pageSubmitFunction(payloadValue, expectedConversationValue
   if (conversationFromCurrentLocation() !== expectedConversation) {
     clearOwnPayloadIfSafe(composer, payload);
     return {
+      ready_to_dispatch: false,
       dispatch_attempted: false,
       submit_confirmed: false,
       retryable: false,
@@ -170,31 +162,118 @@ export async function pageSubmitFunction(payloadValue, expectedConversationValue
     };
   }
 
+  let rect;
   try {
-    sendButton.click();
+    rect = sendButton.getBoundingClientRect();
   } catch {
+    rect = null;
+  }
+  const x = Number(rect && (rect.left + rect.width / 2));
+  const y = Number(rect && (rect.top + rect.height / 2));
+  if (!rect || !Number.isFinite(x) || !Number.isFinite(y) ||
+      Number(rect.width) <= 0 || Number(rect.height) <= 0) {
+    const cleaned = clearOwnPayloadIfSafe(composer, payload);
     return {
-      dispatch_attempted: true,
+      ready_to_dispatch: false,
+      dispatch_attempted: false,
       submit_confirmed: false,
-      retryable: false,
-      status: "result_unknown"
+      retryable: cleaned,
+      status: cleaned ? "send_button_not_clickable" : "composer_changed_before_dispatch"
     };
   }
 
-  try {
-    const confirmed = await waitForSubmitConfirmation(composer, expectedConversation, 2500);
-    return {
-      dispatch_attempted: true,
-      submit_confirmed: Boolean(confirmed),
-      retryable: false,
-      status: confirmed ? "submit_confirmed" : "result_unknown"
-    };
-  } catch {
-    return {
-      dispatch_attempted: true,
-      submit_confirmed: false,
-      retryable: false,
-      status: "result_unknown"
-    };
+  return {
+    ready_to_dispatch: true,
+    dispatch_attempted: false,
+    submit_confirmed: false,
+    retryable: false,
+    status: "ready_to_dispatch",
+    click_point: { x: x, y: y }
+  };
+}
+
+export async function pageConfirmSubmitFunction(payloadValue, expectedConversationValue, timeoutMsValue) {
+  function normalizedText(value) {
+    return String(value == null ? "" : value).replace(/\r\n/g, "\n").trim();
   }
+
+  function normalizedComposerText(element) {
+    if (!element) return "";
+    const raw = typeof element.innerText === "string"
+      ? element.innerText
+      : String(element.textContent || "");
+    return normalizedText(raw);
+  }
+
+  function conversationFromCurrentLocation() {
+    const url = new URL(globalThis.location.href);
+    if (url.protocol !== "https:" || url.hostname !== "chatgpt.com") {
+      throw new Error("page is not secure chatgpt.com");
+    }
+    const parts = url.pathname.split("/").filter(Boolean);
+    const index = parts.lastIndexOf("c");
+    const conversation = index >= 0 ? parts[index + 1] : "";
+    if (!/^[0-9a-f-]{20,80}$/i.test(conversation)) {
+      throw new Error("page has no stable ChatGPT conversation route");
+    }
+    return conversation;
+  }
+
+  async function sleep(ms) {
+    await new Promise(function (resolve) {
+      setTimeout(resolve, ms);
+    });
+  }
+
+  function exactPayloadUserMessageExists(payload) {
+    const nodes = document.querySelectorAll('[data-message-author-role="user"]');
+    for (const node of nodes) {
+      const raw = typeof node.innerText === "string"
+        ? node.innerText
+        : String(node.textContent || "");
+      if (normalizedText(raw) === payload.trim()) return true;
+    }
+    return false;
+  }
+
+  const payload = String(payloadValue == null ? "" : payloadValue);
+  const expectedConversation = String(expectedConversationValue == null ? "" : expectedConversationValue).trim();
+  const timeoutMs = Number(timeoutMsValue == null ? 4000 : timeoutMsValue);
+  const boundedTimeout = Number.isFinite(timeoutMs) && timeoutMs >= 250 && timeoutMs <= 10000
+    ? Math.floor(timeoutMs)
+    : 4000;
+  const deadline = Date.now() + boundedTimeout;
+
+  while (Date.now() <= deadline) {
+    let routeMatches = false;
+    try {
+      routeMatches = conversationFromCurrentLocation() === expectedConversation;
+    } catch {
+      routeMatches = false;
+    }
+    if (routeMatches) {
+      const composer = document.querySelector('#prompt-textarea[contenteditable="true"]');
+      const composerEmpty = normalizedComposerText(composer) === "";
+      const messageExists = exactPayloadUserMessageExists(payload);
+      if (composerEmpty || messageExists) {
+        return {
+          dispatch_attempted: true,
+          submit_confirmed: true,
+          retryable: false,
+          status: "submit_confirmed"
+        };
+      }
+    }
+    await sleep(25);
+  }
+
+  const composer = document.querySelector('#prompt-textarea[contenteditable="true"]');
+  return {
+    dispatch_attempted: true,
+    submit_confirmed: false,
+    retryable: false,
+    status: "result_unknown",
+    composer_still_payload: normalizedComposerText(composer) === payload.trim(),
+    exact_user_message_present: exactPayloadUserMessageExists(payload)
+  };
 }

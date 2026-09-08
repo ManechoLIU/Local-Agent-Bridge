@@ -1,11 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { pageSubmitFunction } from "./extension/submit-page.js";
+import {
+  pagePrepareSubmitFunction,
+  pageConfirmSubmitFunction
+} from "./extension/submit-page.js";
 
 const CONVERSATION = "6a9e4158-cc8c-83ea-9763-05a7fd51f597";
 const OTHER = "6a9e41a2-266c-83ea-9104-e768ed4ad3f2";
 
-function withPage(t, options) {
+function withPage(t, options = {}) {
   const composer = {
     textContent: options.initialText || "",
     innerText: options.initialText || "",
@@ -13,25 +16,22 @@ function withPage(t, options) {
     focus() { this.focused = true; },
     dispatchEvent() {}
   };
+  let syntheticClicks = 0;
   const button = options.button === false ? null : {
     disabled: Boolean(options.disabled),
-    getAttribute() { return null; },
-    click() {
-      if (options.clickThrows) throw new Error("click failed");
-      if (options.routeAfterClick) {
-        globalThis.location.href = "https://chatgpt.com/g/g-p-local/c/" + options.routeAfterClick;
-        if (options.restoreRouteAfterMs != null) {
-          setTimeout(function () {
-            globalThis.location.href = "https://chatgpt.com/g/g-p-local/c/" + (options.conversation || CONVERSATION);
-          }, options.restoreRouteAfterMs);
-        }
-      }
-      if (options.clearOnClick !== false) {
-        composer.textContent = "";
-        composer.innerText = "";
-      }
-    }
+    getAttribute(name) {
+      if (name === "aria-disabled") return options.ariaDisabled ? "true" : null;
+      return null;
+    },
+    getBoundingClientRect() {
+      return options.rect || { left: 100, top: 200, width: 40, height: 20 };
+    },
+    click() { syntheticClicks += 1; }
   };
+  const userMessages = (options.userMessages || []).map(function (text) {
+    return { innerText: text, textContent: text };
+  });
+
   const oldDocument = globalThis.document;
   const oldLocation = globalThis.location;
   const oldInputEvent = globalThis.InputEvent;
@@ -47,6 +47,10 @@ function withPage(t, options) {
       if (selector === '#prompt-textarea[contenteditable="true"]') return composer;
       if (selector === 'button[data-testid="send-button"]') return button;
       return null;
+    },
+    querySelectorAll(selector) {
+      if (selector === '[data-message-author-role="user"]') return userMessages;
+      return [];
     },
     execCommand(command, _ui, text) {
       if (command !== "insertText") return false;
@@ -65,75 +69,88 @@ function withPage(t, options) {
     else globalThis.InputEvent = oldInputEvent;
   });
 
-  return { composer: composer };
+  return {
+    composer,
+    userMessages,
+    syntheticClicks: function () { return syntheticClicks; }
+  };
 }
 
-test("page submit refuses wrong conversation before touching composer", async function (t) {
+test("prepare refuses wrong conversation before touching composer", async function (t) {
   const page = withPage(t, { conversation: OTHER });
-  const result = await pageSubmitFunction("resume", CONVERSATION);
+  const result = await pagePrepareSubmitFunction("resume", CONVERSATION);
   assert.equal(result.status, "wrong_conversation");
-  assert.equal(result.dispatch_attempted, false);
+  assert.equal(result.ready_to_dispatch, false);
   assert.equal(page.composer.focused, false);
 });
 
-test("page submit never overwrites an existing user draft", async function (t) {
+test("prepare never overwrites an existing user draft", async function (t) {
   const page = withPage(t, { initialText: "user draft" });
-  const result = await pageSubmitFunction("resume", CONVERSATION);
+  const result = await pagePrepareSubmitFunction("resume", CONVERSATION);
   assert.equal(result.status, "composer_not_empty");
-  assert.equal(result.dispatch_attempted, false);
+  assert.equal(result.ready_to_dispatch, false);
   assert.equal(page.composer.innerText, "user draft");
 });
 
-test("page submit confirms only after click and composer clear", async function (t) {
-  withPage(t, {});
-  const result = await pageSubmitFunction("resume", CONVERSATION);
+test("prepare inserts payload and returns trusted click coordinates without synthetic click", async function (t) {
+  const page = withPage(t);
+  const result = await pagePrepareSubmitFunction("resume", CONVERSATION);
   assert.deepEqual(result, {
-    dispatch_attempted: true,
-    submit_confirmed: true,
+    ready_to_dispatch: true,
+    dispatch_attempted: false,
+    submit_confirmed: false,
     retryable: false,
-    status: "submit_confirmed"
+    status: "ready_to_dispatch",
+    click_point: { x: 120, y: 210 }
   });
+  assert.equal(page.composer.innerText, "resume");
+  assert.equal(page.syntheticClicks(), 0);
 });
 
-test("page submit tolerates transient SPA route change after confirmed click", async function (t) {
-  withPage(t, {
-    routeAfterClick: OTHER,
-    restoreRouteAfterMs: 50
-  });
-  const result = await pageSubmitFunction("resume", CONVERSATION);
-  assert.deepEqual(result, {
-    dispatch_attempted: true,
-    submit_confirmed: true,
-    retryable: false,
-    status: "submit_confirmed"
-  });
-});
-
-test("page submit remains result unknown when route never returns after click", async function (t) {
-  withPage(t, {
-    routeAfterClick: OTHER
-  });
-  const result = await pageSubmitFunction("resume", CONVERSATION);
-  assert.equal(result.dispatch_attempted, true);
-  assert.equal(result.submit_confirmed, false);
-  assert.equal(result.retryable, false);
-  assert.equal(result.status, "result_unknown");
-});
-
-test("page submit is result unknown after click without confirmation", async function (t) {
-  withPage(t, { clearOnClick: false });
-  const result = await pageSubmitFunction("resume", CONVERSATION);
-  assert.equal(result.dispatch_attempted, true);
-  assert.equal(result.submit_confirmed, false);
-  assert.equal(result.retryable, false);
-  assert.equal(result.status, "result_unknown");
-});
-
-test("missing send button is retryable only when own payload is removed", async function (t) {
+test("prepare clears its own payload when send button is unavailable", async function (t) {
   const page = withPage(t, { button: false });
-  const result = await pageSubmitFunction("resume", CONVERSATION);
-  assert.equal(result.dispatch_attempted, false);
+  const result = await pagePrepareSubmitFunction("resume", CONVERSATION);
+  assert.equal(result.ready_to_dispatch, false);
   assert.equal(result.retryable, true);
   assert.equal(result.status, "send_unavailable");
   assert.equal(page.composer.innerText, "");
+});
+
+test("prepare clears its own payload when send button has no clickable geometry", async function (t) {
+  const page = withPage(t, { rect: { left: 0, top: 0, width: 0, height: 0 } });
+  const result = await pagePrepareSubmitFunction("resume", CONVERSATION);
+  assert.equal(result.ready_to_dispatch, false);
+  assert.equal(result.retryable, true);
+  assert.equal(result.status, "send_button_not_clickable");
+  assert.equal(page.composer.innerText, "");
+});
+
+test("confirm succeeds after trusted dispatch clears composer", async function (t) {
+  const page = withPage(t, { initialText: "" });
+  const result = await pageConfirmSubmitFunction("resume", CONVERSATION, 250);
+  assert.deepEqual(result, {
+    dispatch_attempted: true,
+    submit_confirmed: true,
+    retryable: false,
+    status: "submit_confirmed"
+  });
+  assert.equal(page.syntheticClicks(), 0);
+});
+
+test("confirm succeeds when exact payload is visible as a user message", async function (t) {
+  withPage(t, { initialText: "resume", userMessages: ["older", "resume"] });
+  const result = await pageConfirmSubmitFunction("resume", CONVERSATION, 250);
+  assert.equal(result.submit_confirmed, true);
+  assert.equal(result.status, "submit_confirmed");
+});
+
+test("confirm remains result unknown when payload stays in composer", async function (t) {
+  withPage(t, { initialText: "resume" });
+  const result = await pageConfirmSubmitFunction("resume", CONVERSATION, 250);
+  assert.equal(result.dispatch_attempted, true);
+  assert.equal(result.submit_confirmed, false);
+  assert.equal(result.retryable, false);
+  assert.equal(result.status, "result_unknown");
+  assert.equal(result.composer_still_payload, true);
+  assert.equal(result.exact_user_message_present, false);
 });

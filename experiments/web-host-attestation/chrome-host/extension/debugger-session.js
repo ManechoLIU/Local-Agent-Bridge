@@ -78,7 +78,16 @@ export async function withDebuggerSession(options) {
       timeoutMs,
       "Page.getFrameTree timed out"
     );
-    return await callback(targetResult, frameTree);
+    const session = Object.freeze({
+      sendCommand: async function (method, params) {
+        return await withTimeout(
+          chromeApi.debugger.sendCommand(debuggee, method, params || {}),
+          timeoutMs,
+          String(method) + " timed out"
+        );
+      }
+    });
+    return await callback(targetResult, frameTree, session);
   } catch (error) {
     if (!attached) {
       attachPromise.then(function () {

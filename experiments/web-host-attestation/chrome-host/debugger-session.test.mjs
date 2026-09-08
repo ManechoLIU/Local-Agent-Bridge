@@ -80,3 +80,39 @@ test("default debugger operation timeout remains below the native Host boundary"
   assert.equal(DEBUGGER_OPERATION_TIMEOUT_MS, 3000);
   assert.ok(DEBUGGER_OPERATION_TIMEOUT_MS < 4000);
 });
+
+
+test("debugger callback can issue bounded trusted input commands before detach", async function () {
+  const calls = [];
+  const chromeApi = {
+    debugger: {
+      async attach(debuggee) { calls.push(["attach", debuggee.tabId]); },
+      async sendCommand(_debuggee, method, params) {
+        calls.push(["send", method, params]);
+        if (method === "Target.getTargetInfo") {
+          return { targetInfo: { targetId: "target-3", type: "page", url: "https://chatgpt.com/c/x" } };
+        }
+        if (method === "Page.getFrameTree") {
+          return { frameTree: { frame: { id: "target-3", loaderId: "loader", securityOrigin: "https://chatgpt.com", url: "https://chatgpt.com/c/x" } } };
+        }
+        if (method === "Input.dispatchMouseEvent") return {};
+        throw new Error("unexpected command");
+      },
+      async detach(debuggee) { calls.push(["detach", debuggee.tabId]); }
+    }
+  };
+
+  const result = await withDebuggerSession({
+    chromeApi,
+    target: { id: "target-3", tabId: 11 },
+    callback: async function (_targetInfo, _frameTree, session) {
+      await session.sendCommand("Input.dispatchMouseEvent", {
+        type: "mousePressed", x: 12, y: 34, button: "left"
+      });
+      return "ok";
+    }
+  });
+  assert.equal(result, "ok");
+  assert.ok(calls.some(call => call[0] === "send" && call[1] === "Input.dispatchMouseEvent"));
+  assert.deepEqual(calls.at(-1), ["detach", 11]);
+});

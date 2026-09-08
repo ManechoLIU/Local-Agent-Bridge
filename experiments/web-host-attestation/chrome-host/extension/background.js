@@ -46,7 +46,7 @@ async function withDebugger(target, callback) {
   return await withDebuggerSession({
     chromeApi: chrome,
     target: target,
-    callback: async function (targetResult, frameTree) {
+    callback: async function (targetResult, frameTree, debuggerSession) {
       const cdpInfo = targetResult && targetResult.targetInfo;
       const cdpTargetId = cdpInfo && (cdpInfo.targetId || cdpInfo.id);
       if (!cdpInfo || cdpTargetId !== target.id) {
@@ -58,7 +58,7 @@ async function withDebugger(target, callback) {
         type: cdpInfo.type,
         url: cdpInfo.url
       };
-      return await callback(normalizedTarget, frameTree);
+      return await callback(normalizedTarget, frameTree, debuggerSession);
     }
   });
 }
@@ -82,6 +82,46 @@ async function observeTarget(browserTargetId) {
       frameTree: frameTree,
       observedAtMs: Date.now()
     });
+  });
+}
+
+async function dispatchTrustedClick(browserTargetId, clickPoint) {
+  const target = selectExactTarget(await allTargets(), browserTargetId);
+  const x = Number(clickPoint && clickPoint.x);
+  const y = Number(clickPoint && clickPoint.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    throw new Error("trusted click coordinates are invalid");
+  }
+  return await withDebugger(target, async function (targetInfo, _frameTree, debuggerSession) {
+    if (!debuggerSession || typeof debuggerSession.sendCommand !== "function") {
+      throw new Error("debugger command session is unavailable");
+    }
+    if (targetInfo.id !== browserTargetId) {
+      throw new Error("trusted click target identity changed");
+    }
+    await debuggerSession.sendCommand("Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x: x,
+      y: y,
+      button: "none"
+    });
+    await debuggerSession.sendCommand("Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      x: x,
+      y: y,
+      button: "left",
+      buttons: 1,
+      clickCount: 1
+    });
+    await debuggerSession.sendCommand("Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      x: x,
+      y: y,
+      button: "left",
+      buttons: 0,
+      clickCount: 1
+    });
+    return { dispatched: true, browser_target_id: browserTargetId };
   });
 }
 
@@ -117,6 +157,7 @@ async function handleCommand(message) {
       chromeApi: chrome,
       getTargets: allTargets,
       observeTarget: observeTarget,
+      dispatchTrustedClick: dispatchTrustedClick,
       message: message
     });
   }
