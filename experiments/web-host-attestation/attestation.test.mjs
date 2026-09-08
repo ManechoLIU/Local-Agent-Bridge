@@ -169,6 +169,39 @@ function canonicalJsonForTest(value) {
   return JSON.stringify(value);
 }
 
+test("concurrent same-wake reentry admits only one submit", async () => {
+  const { verified, time } = verifiedFixture();
+  let releaseObserve;
+  const observeGate = new Promise((resolve) => {
+    releaseObserve = resolve;
+  });
+  const driver = new Driver(observation(time.now()));
+  driver.observeTarget = async function () {
+    await observeGate;
+    return this.current;
+  };
+  const adapter = new WebReentryAdapter(SECRET, driver, { clock: time.now });
+  const input = {
+    verified_target: verified,
+    wake_id: "wake-concurrent",
+    wake_nonce: "nonce-concurrent",
+    continuation_payload: "continue",
+    expected_target_generation: 4,
+    expected_ownership_generation: 8
+  };
+
+  const first = adapter.reenter(input);
+  const second = adapter.reenter(input);
+  releaseObserve();
+
+  const settled = await Promise.allSettled([first, second]);
+  assert.equal(settled.filter((item) => item.status === "fulfilled").length, 1);
+  assert.equal(settled.filter((item) => item.status === "rejected").length, 1);
+  const rejected = settled.find((item) => item.status === "rejected");
+  assert.match(String(rejected.reason && rejected.reason.message || rejected.reason), /wake_id replayed/);
+  assert.equal(driver.submitted.length, 1);
+});
+
 test("same-controller re-entry checks exact target before and after submit without foreground focus", async () => {
   const { verified, time } = verifiedFixture();
   const driver = new Driver(observation(time.now()));

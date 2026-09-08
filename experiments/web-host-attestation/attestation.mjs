@@ -324,11 +324,11 @@ export class WebReentryAdapter {
     const payload = nonEmpty(continuation_payload, "continuation_payload");
     const nonce = nonEmpty(wake_nonce, "wake_nonce");
 
-    const pre = validateMachineObservation(await this.driver.observeTarget(verified.browser_target_id));
-    if (!sameTarget(pre, verified)) throw new Error("Web target changed before re-entry");
-
     this.usedWakeIds.add(wakeId);
     this.#persist();
+
+    const pre = validateMachineObservation(await this.driver.observeTarget(verified.browser_target_id));
+    if (!sameTarget(pre, verified)) throw new Error("Web target changed before re-entry");
     let submit;
     try {
       submit = await this.driver.submitContinuation({
