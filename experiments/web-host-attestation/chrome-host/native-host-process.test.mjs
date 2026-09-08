@@ -93,24 +93,38 @@ test("real native Host process bridges Unix socket to Native Messaging and signs
         resolveHelloAck(command);
         continue;
       }
-      if (command.op !== "observe_conversation") continue;
-      const response = {
-        request_id: command.request_id,
-        ok: true,
-        result: {
-          observation: {
-            host_type: "chatgpt_web",
-            browser_target_id: "browser-target-process",
-            top_frame_id: "top-frame-process",
-            loader_id: "loader-process",
-            secure_origin: "https://chatgpt.com",
-            conversation_id: CONVERSATION,
-            observed_at_ms: Date.now(),
-            source: "browser_cdp_page_frame_tree_v1"
+      if (command.op === "observe_conversation") {
+        child.stdin.write(encodeNativeMessage({
+          request_id: command.request_id,
+          ok: true,
+          result: {
+            observation: {
+              host_type: "chatgpt_web",
+              browser_target_id: "browser-target-process",
+              top_frame_id: "top-frame-process",
+              loader_id: "loader-process",
+              secure_origin: "https://chatgpt.com",
+              conversation_id: CONVERSATION,
+              observed_at_ms: Date.now(),
+              source: "browser_cdp_page_frame_tree_v1"
+            }
           }
-        }
-      };
-      child.stdin.write(encodeNativeMessage(response));
+        }));
+        continue;
+      }
+      if (command.op === "submit_continuation") {
+        child.stdin.write(encodeNativeMessage({
+          request_id: command.request_id,
+          ok: true,
+          result: {
+            dispatch_attempted: true,
+            submit_confirmed: true,
+            retryable: false,
+            status: "submit_confirmed",
+            host_submit_receipt: "chrome_submit_process"
+          }
+        }));
+      }
     }
   });
 
@@ -161,6 +175,20 @@ test("real native Host process bridges Unix socket to Native Messaging and signs
   assert.equal(verified.browser_target_id, "browser-target-process");
   assert.equal(verified.top_frame_id, "top-frame-process");
   assert.equal(verified.loader_id, "loader-process");
+
+  const submit = await requestNativeHost(socketPath, {
+    op: "submit_continuation",
+    browser_target_id: "browser-target-process",
+    conversation_id: CONVERSATION,
+    payload: "resume",
+    wake_id: "wake-process",
+    wake_nonce: "nonce-process"
+  }, { timeoutMs: 3000 });
+  assert.equal(submit.submit_confirmed, true);
+
+  const health = await requestNativeHost(socketPath, { op: "health" }, { timeoutMs: 3000 });
+  assert.equal(health.submit_live_validated, true);
+  assert.equal(Number.isSafeInteger(health.submit_live_validated_at_ms), true);
   assert.equal(stderr, "");
 
   child.stdin.end();

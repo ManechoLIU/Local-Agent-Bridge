@@ -50,6 +50,8 @@ export function createNativeHostHandler(options) {
   const secret = options && options.secret;
   const sendBrowserCommand = options && options.sendBrowserCommand;
   const clock = options && options.clock || Date.now;
+  const getLiveValidation = options && options.getLiveValidation || function () { return null; };
+  const recordLiveValidation = options && options.recordLiveValidation || function () {};
   if (!secret || Buffer.byteLength(secret) < 32) {
     throw new Error("Host attestation key must be at least 32 bytes");
   }
@@ -73,7 +75,16 @@ export function createNativeHostHandler(options) {
     const op = requiredText(request.op, "op", 64);
 
     if (op === "health") {
-      return { status: "ready", interface_version: 1, submit_implemented: true, submit_live_validated: false };
+      const live = getLiveValidation() || {};
+      return {
+        status: "ready",
+        interface_version: 1,
+        submit_implemented: true,
+        submit_live_validated: live.submit_live_validated === true,
+        ...(live.submit_live_validated === true && Number.isSafeInteger(live.validated_at_ms)
+          ? { submit_live_validated_at_ms: live.validated_at_ms }
+          : {})
+      };
     }
 
     if (op === "attest") {
@@ -143,7 +154,7 @@ export function createNativeHostHandler(options) {
       if (result.submit_confirmed && !result.dispatch_attempted) {
         throw new Error("browser submit cannot be confirmed before dispatch");
       }
-      return {
+      const normalized = {
         dispatch_attempted: result.dispatch_attempted,
         submit_confirmed: result.submit_confirmed,
         retryable: Boolean(result.retryable),
@@ -152,6 +163,16 @@ export function createNativeHostHandler(options) {
           ? null
           : requiredText(result.host_submit_receipt, "host_submit_receipt", 512)
       };
+      if (normalized.submit_confirmed) {
+        recordLiveValidation({
+          submit_live_validated: true,
+          validated_at_ms: Number(clock()),
+          conversation_id: conversation,
+          browser_target_id: target,
+          host_submit_receipt: normalized.host_submit_receipt
+        });
+      }
+      return normalized;
     }
 
     throw new Error("unsupported runtime operation: " + op);

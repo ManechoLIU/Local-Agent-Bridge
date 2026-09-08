@@ -151,3 +151,61 @@ test("browser response request id mismatch fails closed", async function () {
     /request_id mismatch/
   );
 });
+
+test("health reports live-submit validation state", async function () {
+  const handle = createNativeHostHandler({
+    secret: SECRET,
+    getLiveValidation: function () {
+      return { submit_live_validated: true, validated_at_ms: 1800000000300 };
+    },
+    sendBrowserCommand: async function () {
+      throw new Error("browser must not be called for health");
+    }
+  });
+  assert.deepEqual(await handle({ op: "health" }), {
+    status: "ready",
+    interface_version: 1,
+    submit_implemented: true,
+    submit_live_validated: true,
+    submit_live_validated_at_ms: 1800000000300
+  });
+});
+
+test("confirmed live submit records validation but uncertain submit does not", async function () {
+  const records = [];
+  let confirmed = true;
+  const handle = createNativeHostHandler({
+    secret: SECRET,
+    recordLiveValidation: function (record) { records.push(record); },
+    sendBrowserCommand: async function (command) {
+      return {
+        request_id: command.request_id,
+        ok: true,
+        result: {
+          dispatch_attempted: true,
+          submit_confirmed: confirmed,
+          retryable: false,
+          status: confirmed ? "submit_confirmed" : "result_unknown",
+          host_submit_receipt: confirmed ? "chrome_submit_live" : null
+        }
+      };
+    }
+  });
+  const request = {
+    op: "submit_continuation",
+    browser_target_id: "browser-target-7",
+    conversation_id: CONVERSATION,
+    payload: "resume",
+    wake_id: "wake-live",
+    wake_nonce: "nonce-live"
+  };
+  await handle(request);
+  assert.equal(records.length, 1);
+  assert.equal(records[0].conversation_id, CONVERSATION);
+  assert.equal(records[0].browser_target_id, "browser-target-7");
+  assert.equal(records[0].host_submit_receipt, "chrome_submit_live");
+
+  confirmed = false;
+  await handle({ ...request, wake_id: "wake-unknown" });
+  assert.equal(records.length, 1);
+});

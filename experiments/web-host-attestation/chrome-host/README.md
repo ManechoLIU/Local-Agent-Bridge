@@ -52,7 +52,7 @@ Implemented:
 - exact target focus followed by fresh machine re-observation;
 - bounded Native Messaging and Runtime socket protocols.
 
-Implemented in code but not yet Live-validated:
+Implemented and Live-validated on the dedicated authenticated Personal Web profile:
 
 - provider-specific submit_continuation into the exact ChatGPT Web target.
 
@@ -62,9 +62,9 @@ the already-verified tab, and treats any post-click uncertainty as
 dispatch_attempted=true / submit_confirmed=false / retryable=false. DOM state is
 used only for delivery action and confirmation, never as Host identity evidence.
 
-Until the unpacked extension is installed and exercised against a real ChatGPT
-Web conversation, health reports submit_live_validated=false. This is not a
-Live-E2E PASS and must not close LAB-HOST-01 or unblock LAB-GOV-02.
+The native Host health surface starts conservatively with `submit_live_validated=false` after process start and flips to true only after that Host process observes a real `submit_confirmed=true` result. Result-unknown or pre-dispatch failure never upgrades health. A Host restart resets this runtime validation state to false, which is intentionally fail-closed.
+
+The dedicated authenticated Personal Web profile has now produced a real confirmed submit plus model response, but this still does not by itself close LAB-HOST-01 or unblock LAB-GOV-02: Runtime canonical ownership/generation must be reconciled and the final SAME-Controller continuation must run through the canonical Runtime lifecycle.
 
 AI-Bridge is not a product runtime dependency of this candidate.
 

@@ -141,9 +141,15 @@ process.stdin.on("end", function () {
   process.exit(0);
 });
 
+let liveValidationState = null;
+
 const handleRuntimeRequest = createNativeHostHandler({
   secret: secret,
-  sendBrowserCommand: sendBrowserCommand
+  sendBrowserCommand: sendBrowserCommand,
+  getLiveValidation: function () { return liveValidationState; },
+  recordLiveValidation: function (record) {
+    liveValidationState = Object.freeze({ ...record });
+  }
 });
 
 const server = net.createServer(function (socket) {
