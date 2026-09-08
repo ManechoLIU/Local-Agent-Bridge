@@ -18,6 +18,14 @@ function withPage(t, options) {
     getAttribute() { return null; },
     click() {
       if (options.clickThrows) throw new Error("click failed");
+      if (options.routeAfterClick) {
+        globalThis.location.href = "https://chatgpt.com/g/g-p-local/c/" + options.routeAfterClick;
+        if (options.restoreRouteAfterMs != null) {
+          setTimeout(function () {
+            globalThis.location.href = "https://chatgpt.com/g/g-p-local/c/" + (options.conversation || CONVERSATION);
+          }, options.restoreRouteAfterMs);
+        }
+      }
       if (options.clearOnClick !== false) {
         composer.textContent = "";
         composer.innerText = "";
@@ -85,6 +93,31 @@ test("page submit confirms only after click and composer clear", async function 
     retryable: false,
     status: "submit_confirmed"
   });
+});
+
+test("page submit tolerates transient SPA route change after confirmed click", async function (t) {
+  withPage(t, {
+    routeAfterClick: OTHER,
+    restoreRouteAfterMs: 50
+  });
+  const result = await pageSubmitFunction("resume", CONVERSATION);
+  assert.deepEqual(result, {
+    dispatch_attempted: true,
+    submit_confirmed: true,
+    retryable: false,
+    status: "submit_confirmed"
+  });
+});
+
+test("page submit remains result unknown when route never returns after click", async function (t) {
+  withPage(t, {
+    routeAfterClick: OTHER
+  });
+  const result = await pageSubmitFunction("resume", CONVERSATION);
+  assert.equal(result.dispatch_attempted, true);
+  assert.equal(result.submit_confirmed, false);
+  assert.equal(result.retryable, false);
+  assert.equal(result.status, "result_unknown");
 });
 
 test("page submit is result unknown after click without confirmation", async function (t) {

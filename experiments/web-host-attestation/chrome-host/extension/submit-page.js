@@ -82,10 +82,16 @@ export async function pageSubmitFunction(payloadValue, expectedConversationValue
     return null;
   }
 
-  async function waitForComposerClear(composer, timeoutMs) {
+  async function waitForSubmitConfirmation(composer, expectedConversation, timeoutMs) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() <= deadline) {
-      if (normalizedComposerText(composer) === "") return true;
+      let routeMatches = false;
+      try {
+        routeMatches = conversationFromCurrentLocation() === expectedConversation;
+      } catch {
+        routeMatches = false;
+      }
+      if (routeMatches && normalizedComposerText(composer) === "") return true;
       await sleep(25);
     }
     return false;
@@ -176,13 +182,12 @@ export async function pageSubmitFunction(payloadValue, expectedConversationValue
   }
 
   try {
-    const stillExpected = conversationFromCurrentLocation() === expectedConversation;
-    const cleared = stillExpected && await waitForComposerClear(composer, 2500);
+    const confirmed = await waitForSubmitConfirmation(composer, expectedConversation, 2500);
     return {
       dispatch_attempted: true,
-      submit_confirmed: Boolean(cleared),
+      submit_confirmed: Boolean(confirmed),
       retryable: false,
-      status: cleared ? "submit_confirmed" : "result_unknown"
+      status: confirmed ? "submit_confirmed" : "result_unknown"
     };
   } catch {
     return {
