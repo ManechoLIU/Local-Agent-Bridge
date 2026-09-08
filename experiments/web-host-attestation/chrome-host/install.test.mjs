@@ -9,9 +9,9 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { installChromeNativeHost } from "./install.mjs";
+import { DEFAULT_EXTENSION_ID, installChromeNativeHost } from "./install.mjs";
 
-const EXTENSION_ID = "abcdefghijklmnopabcdefghijklmnop";
+const EXTENSION_ID = "ikidefdlcddfomimpckflbajjccnmfna";
 const HOST_SCRIPT = fileURLToPath(new URL("./native-host.mjs", import.meta.url));
 
 test("installer creates private stable key and exact-origin macOS Chrome manifest", function (t) {
@@ -20,8 +20,8 @@ test("installer creates private stable key and exact-origin macOS Chrome manifes
     rmSync(home, { recursive: true, force: true });
   });
 
+  assert.equal(DEFAULT_EXTENSION_ID, EXTENSION_ID);
   const first = installChromeNativeHost({
-    extensionId: EXTENSION_ID,
     browser: "chrome",
     homeDir: home,
     hostScriptPath: HOST_SCRIPT
@@ -48,7 +48,7 @@ test("installer creates private stable key and exact-origin macOS Chrome manifes
   assert.deepEqual(readFileSync(second.key_path), before);
 });
 
-test("installer rejects wildcard-like or malformed extension ids", function () {
+test("installer rejects wildcard-like malformed or manifest-mismatched extension ids", function () {
   assert.throws(function () {
     installChromeNativeHost({
       extensionId: "*",
@@ -66,4 +66,13 @@ test("installer rejects wildcard-like or malformed extension ids", function () {
       hostScriptPath: HOST_SCRIPT
     });
   }, /extension id/);
+
+  assert.throws(function () {
+    installChromeNativeHost({
+      extensionId: "abcdefghijklmnopabcdefghijklmnop",
+      browser: "chrome",
+      homeDir: tmpdir(),
+      hostScriptPath: HOST_SCRIPT
+    });
+  }, /does not match the manifest public key/);
 });

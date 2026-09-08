@@ -12,9 +12,11 @@ import {
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { extensionIdFromManifestKey } from "./extension-id.mjs";
 
 const HOST_NAME = "com.local_agent_bridge.web_host";
 const EXTENSION_ID_RE = /^[a-p]{32}$/;
+const EXTENSION_MANIFEST_PATH = fileURLToPath(new URL("./extension/manifest.json", import.meta.url));
 
 const BROWSER_MANIFEST_ROOTS = Object.freeze({
   chrome: ["Library", "Application Support", "Google", "Chrome", "NativeMessagingHosts"],
@@ -57,14 +59,25 @@ function atomicJson(path, value) {
   chmodSync(path, 0o600);
 }
 
+function manifestExtensionId() {
+  const manifest = JSON.parse(readFileSync(EXTENSION_MANIFEST_PATH, "utf8"));
+  return extensionIdFromManifestKey(manifest.key);
+}
+
+export const DEFAULT_EXTENSION_ID = manifestExtensionId();
+
 export function installChromeNativeHost(options) {
-  const extensionId = String(options && options.extensionId || "").trim();
+  const requestedExtensionId = String(options && options.extensionId || "").trim();
+  const extensionId = requestedExtensionId || DEFAULT_EXTENSION_ID;
   const browser = String(options && options.browser || "chrome");
   const homeDir = options && options.homeDir || homedir();
   const hostScriptPath = options && options.hostScriptPath ||
     fileURLToPath(new URL("./native-host.mjs", import.meta.url));
 
   if (!EXTENSION_ID_RE.test(extensionId)) throw new Error("extension id must be 32 lowercase a-p characters");
+  if (extensionId !== DEFAULT_EXTENSION_ID) {
+    throw new Error("extension id does not match the manifest public key");
+  }
   if (!(browser in BROWSER_MANIFEST_ROOTS)) throw new Error("unsupported browser: " + browser);
   if (!isAbsolute(hostScriptPath)) throw new Error("native Host script path must be absolute");
   const hostStat = lstatSync(hostScriptPath);

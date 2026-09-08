@@ -3,10 +3,16 @@
   "name": "Local Agent Bridge Web Host",
   "version": "0.1.0",
   "description": "Machine-boundary ChatGPT Web target observation for Local Agent Bridge.",
-  "permissions": ["debugger", "nativeMessaging"],
-  "host_permissions": ["https://chatgpt.com/*"],
+  "permissions": [
+    "debugger",
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*"
+  ],
   "background": {
     "service_worker": "background.js",
     "type": "module"
-  }
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApgCDknfvQq6AgxqJjx7YMJaAPyvoCt/fdoqtGO7ziTiIZUgNzUIf4iLN+a4y5dOnd8XkmUshvcbR9CPuYLW/kNJShuWyA850JxeMeDtJvU4StGjCfBJXs0R7AKdl98e5/Tqo5OdWcGTkjwkKxvW3rveM2lzLZuL77TwZE4tG5t/+YWqaEkfkALz1vjN2grrBkY7q9lCMzHfpWjOTycV1LwJ2rX/pTWV47+VB030iXxL5hhde2zXNuxYnwWX5m8y7lZQH7/r/wre1Fkf+FBxOix4Or+fy4Nm/x+13EoIpayl7+bZyijEEOP/gPtVycElAOB8u679GcQBFV+2+v0azWQIDAQAB"
 }
