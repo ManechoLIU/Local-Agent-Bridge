@@ -123,6 +123,11 @@ process.stdin.on("data", function (chunk) {
   }
 });
 
+process.stdin.on("end", function () {
+  cleanup();
+  process.exit(0);
+});
+
 const handleRuntimeRequest = createNativeHostHandler({
   secret: secret,
   sendBrowserCommand: sendBrowserCommand

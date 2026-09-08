@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import {
   chmodSync,
+  existsSync,
   mkdtempSync,
   rmSync,
   writeFileSync
@@ -127,4 +129,9 @@ test("real native Host process bridges Unix socket to Native Messaging and signs
   assert.equal(verified.top_frame_id, "top-frame-process");
   assert.equal(verified.loader_id, "loader-process");
   assert.equal(stderr, "");
+
+  child.stdin.end();
+  const exit = await once(child, "exit");
+  assert.equal(exit[0], 0);
+  assert.equal(existsSync(socketPath), false);
 });
