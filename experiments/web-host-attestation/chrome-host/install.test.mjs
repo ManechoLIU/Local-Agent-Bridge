@@ -48,6 +48,34 @@ test("installer creates private stable key and exact-origin macOS Chrome manifes
   assert.deepEqual(readFileSync(second.key_path), before);
 });
 
+
+test("installer writes NativeMessagingHosts under an explicit custom user-data-dir", function (t) {
+  const home = mkdtempSync(join(tmpdir(), "lab-host-install-home-"));
+  const profile = mkdtempSync(join(tmpdir(), "lab-host-install-profile-"));
+  t.after(function () {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(profile, { recursive: true, force: true });
+  });
+
+  const result = installChromeNativeHost({
+    browser: "chrome-for-testing",
+    homeDir: home,
+    userDataDir: profile,
+    hostScriptPath: HOST_SCRIPT
+  });
+  assert.equal(result.manifest_scope, "custom_user_data_dir");
+  assert.equal(result.browser_user_data_dir, profile);
+  assert.equal(
+    result.manifest_path,
+    join(profile, "NativeMessagingHosts", "com.local_agent_bridge.web_host.json")
+  );
+  const manifest = JSON.parse(readFileSync(result.manifest_path, "utf8"));
+  assert.deepEqual(manifest.allowed_origins, [
+    "chrome-extension://" + EXTENSION_ID + "/"
+  ]);
+  assert.equal(statSync(join(profile, "NativeMessagingHosts")).mode & 0o777, 0o700);
+});
+
 test("installer rejects wildcard-like malformed or manifest-mismatched extension ids", function () {
   assert.throws(function () {
     installChromeNativeHost({

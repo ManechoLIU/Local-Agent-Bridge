@@ -71,6 +71,9 @@ export function installChromeNativeHost(options) {
   const extensionId = requestedExtensionId || DEFAULT_EXTENSION_ID;
   const browser = String(options && options.browser || "chrome");
   const homeDir = options && options.homeDir || homedir();
+  const userDataDir = options && options.userDataDir
+    ? String(options.userDataDir).trim()
+    : null;
   const hostScriptPath = options && options.hostScriptPath ||
     fileURLToPath(new URL("./native-host.mjs", import.meta.url));
 
@@ -79,6 +82,9 @@ export function installChromeNativeHost(options) {
     throw new Error("extension id does not match the manifest public key");
   }
   if (!(browser in BROWSER_MANIFEST_ROOTS)) throw new Error("unsupported browser: " + browser);
+  if (userDataDir && !isAbsolute(userDataDir)) {
+    throw new Error("browser user-data-dir must be absolute");
+  }
   if (!isAbsolute(hostScriptPath)) throw new Error("native Host script path must be absolute");
   const hostStat = lstatSync(hostScriptPath);
   if (!hostStat.isFile() || hostStat.isSymbolicLink()) throw new Error("native Host script must be a regular non-symlink file");
@@ -95,8 +101,18 @@ export function installChromeNativeHost(options) {
   }
   validatePrivateFile(keyPath, 32);
 
-  const manifestDir = join(homeDir, ...BROWSER_MANIFEST_ROOTS[browser]);
-  ensureDirectory(manifestDir, 0o755, false);
+  let manifestDir;
+  let manifestScope;
+  if (userDataDir) {
+    ensureDirectory(userDataDir, 0o700, true);
+    manifestDir = join(userDataDir, "NativeMessagingHosts");
+    ensureDirectory(manifestDir, 0o700, true);
+    manifestScope = "custom_user_data_dir";
+  } else {
+    manifestDir = join(homeDir, ...BROWSER_MANIFEST_ROOTS[browser]);
+    ensureDirectory(manifestDir, 0o755, false);
+    manifestScope = "default_user_path";
+  }
   const manifestPath = join(manifestDir, HOST_NAME + ".json");
   atomicJson(manifestPath, {
     name: HOST_NAME,
@@ -112,6 +128,8 @@ export function installChromeNativeHost(options) {
     browser: browser,
     extension_id: extensionId,
     manifest_path: manifestPath,
+    manifest_scope: manifestScope,
+    browser_user_data_dir: userDataDir,
     key_path: keyPath,
     socket_path: join(stateRoot, "host.sock"),
     key_created: keyCreated
@@ -127,6 +145,9 @@ function parseCli(argv) {
       index += 1;
     } else if (value === "--browser") {
       args.browser = argv[index + 1];
+      index += 1;
+    } else if (value === "--user-data-dir") {
+      args.userDataDir = argv[index + 1];
       index += 1;
     } else {
       throw new Error("unsupported installer argument: " + value);
