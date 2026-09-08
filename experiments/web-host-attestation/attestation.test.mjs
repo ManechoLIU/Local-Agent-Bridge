@@ -169,7 +169,7 @@ function canonicalJsonForTest(value) {
   return JSON.stringify(value);
 }
 
-test("same-controller re-entry checks exact target before focus, before submit and after submit", async () => {
+test("same-controller re-entry checks exact target before and after submit without foreground focus", async () => {
   const { verified, time } = verifiedFixture();
   const driver = new Driver(observation(time.now()));
   const adapter = new WebReentryAdapter(SECRET, driver, { clock: time.now });
@@ -209,14 +209,20 @@ test("wrong conversation or replaced document fails before submit", async () => 
   );
   assert.equal(wrongConversation.submitted.length, 0);
 
-  const replacedAfterFocus = new Driver(observation(time.now()));
-  replacedAfterFocus.mutateAfterFocus = observation(time.now(), { loader_id: "new-document-loader" });
-  const b = new WebReentryAdapter(SECRET, replacedAfterFocus, { clock: time.now });
-  await assert.rejects(
-    b.reenter({ verified_target: verified, wake_id: "wake-replaced", wake_nonce: "n", continuation_payload: "x", expected_target_generation: 4, expected_ownership_generation: 8 }),
-    /changed after focus/
-  );
-  assert.equal(replacedAfterFocus.submitted.length, 0);
+  const noFocusDriver = new Driver(observation(time.now()));
+  noFocusDriver.mutateAfterFocus = observation(time.now(), { loader_id: "new-document-loader" });
+  const b = new WebReentryAdapter(SECRET, noFocusDriver, { clock: time.now });
+  const receipt = await b.reenter({
+    verified_target: verified,
+    wake_id: "wake-no-focus",
+    wake_nonce: "n",
+    continuation_payload: "x",
+    expected_target_generation: 4,
+    expected_ownership_generation: 8
+  });
+  assert.equal(receipt.submit_confirmed, true);
+  assert.equal(noFocusDriver.focused.length, 0);
+  assert.equal(noFocusDriver.submitted.length, 1);
 });
 
 test("stale target and ownership generation fail before browser side effects", async () => {
@@ -309,11 +315,18 @@ test("stable host driver consumes machine-boundary frame observations and valida
   const observed = await driver.observeTarget("browser-target-7");
   assert.equal(observed.browser_target_id, "browser-target-7");
   assert.equal(observed.top_frame_id, "top");
-  await driver.focusTarget("browser-target-7");
-  assert.deepEqual(calls, [["focus", "browser-target-7"]]);
+  assert.deepEqual(calls, []);
   await assert.rejects(() => driver.observeTarget(""), /browser_target_id is required/);
-  await assert.rejects(() => driver.submitContinuation({ browser_target_id: "browser-target-7", conversation_id: CONVERSATION, payload: "", wake_id: "w", wake_nonce: "n" }), /payload is required/);
-  assert.throws(() => createHostDriver({ observeTarget() {} }), /focusTarget/);
+  await assert.rejects(() => driver.submitContinuation({
+    browser_target_id: "browser-target-7",
+    conversation_id: CONVERSATION,
+    payload: "",
+    wake_id: "w",
+    wake_nonce: "n",
+    target_generation: 4,
+    ownership_generation: 8
+  }), /payload is required/);
+  assert.throws(() => createHostDriver({ observeTarget() {} }), /submitContinuation/);
 });
 
 test("stable provider exposes receipts without owning Runtime lifecycle", async () => {
@@ -436,4 +449,79 @@ test("supervisor restart preserves consumed challenge and wake anti-replay state
     /wake_id replayed/
   );
   assert.equal(statSync(reentryState).mode & 0o777, 0o600);
+});
+
+test("signed re-entry receipt carries structured submit diagnostics without prompt body", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  driver.submitContinuation = async function (input) {
+    this.submitted.push(input);
+    return {
+      dispatch_attempted: true,
+      submit_confirmed: true,
+      retryable: false,
+      status: "submit_confirmed",
+      host_submit_receipt: "browser-submit-diag",
+      submit_diagnostics: {
+        schema_version: 1,
+        wake_id: input.wake_id,
+        browser_target_id: input.browser_target_id,
+        phase: "confirmed",
+        debugger_attach: { attempted: true, ok: true },
+        composer_preparation: {
+          attempted: true,
+          ok: true,
+          status: "prepared",
+          rollback_attempted: false,
+          rollback_succeeded: false
+        },
+        send_control_resolution: {
+          attempted: true,
+          ok: true,
+          selector_kind: "testid_send_button",
+          coordinates_changed_since_prepare: false
+        },
+        trusted_dispatch: {
+          attempted: true,
+          focus_emulation: true,
+          mouse_moved: true,
+          mouse_pressed: true,
+          mouse_released: true
+        },
+        confirmation: {
+          attempted: true,
+          ok: true,
+          composer_empty: true,
+          exact_new_user_message: true
+        },
+        foreground: {
+          mode: "background_focus_emulation",
+          activated_target: false,
+          restored_previous_active: false,
+          user_changed_focus: false
+        },
+        failure_stage: null,
+        dispatch_attempted: true,
+        submit_confirmed: true,
+        retryable: false
+      }
+    };
+  };
+  const receipt = await new WebReentryAdapter(SECRET, driver, { clock: time.now }).reenter({
+    verified_target: verified,
+    wake_id: "wake-diag",
+    wake_nonce: "nonce-diag",
+    continuation_payload: "sensitive continuation body",
+    expected_target_generation: 4,
+    expected_ownership_generation: 8
+  });
+  const verifiedReceipt = verifyReentryReceipt(SECRET, receipt, {
+    wake_id: "wake-diag",
+    conversation_id: CONVERSATION,
+    target_generation: 4,
+    ownership_generation: 8
+  });
+  assert.equal(verifiedReceipt.submit_diagnostics.debugger_attach.ok, true);
+  assert.equal(verifiedReceipt.submit_diagnostics.confirmation.exact_new_user_message, true);
+  assert.equal(JSON.stringify(verifiedReceipt.submit_diagnostics).includes("sensitive continuation body"), false);
 });

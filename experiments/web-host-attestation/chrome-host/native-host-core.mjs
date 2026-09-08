@@ -23,6 +23,85 @@ function positiveInteger(value, name) {
   return number;
 }
 
+
+
+function optionalText(value, name, max) {
+  if (value == null) return null;
+  return requiredText(value, name, max);
+}
+
+function normalizeSubmitDiagnostics(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const debuggerAttach = input.debugger_attach && typeof input.debugger_attach === "object"
+    ? input.debugger_attach
+    : {};
+  const composer = input.composer_preparation && typeof input.composer_preparation === "object"
+    ? input.composer_preparation
+    : {};
+  const sendControl = input.send_control_resolution && typeof input.send_control_resolution === "object"
+    ? input.send_control_resolution
+    : {};
+  const trusted = input.trusted_dispatch && typeof input.trusted_dispatch === "object"
+    ? input.trusted_dispatch
+    : {};
+  const confirmation = input.confirmation && typeof input.confirmation === "object"
+    ? input.confirmation
+    : {};
+  const foreground = input.foreground && typeof input.foreground === "object"
+    ? input.foreground
+    : {};
+  return Object.freeze({
+    schema_version: 1,
+    wake_id: optionalText(input.wake_id, "submit diagnostics wake_id", 256),
+    browser_target_id: optionalText(input.browser_target_id, "submit diagnostics browser_target_id", 256),
+    phase: optionalText(input.phase, "submit diagnostics phase", 128),
+    debugger_attach: Object.freeze({
+      attempted: debuggerAttach.attempted === true,
+      ok: debuggerAttach.ok === true
+    }),
+    composer_preparation: Object.freeze({
+      attempted: composer.attempted === true,
+      ok: composer.ok === true,
+      status: optionalText(composer.status, "submit diagnostics composer status", 128),
+      rollback_attempted: composer.rollback_attempted === true,
+      rollback_succeeded: composer.rollback_succeeded === true
+    }),
+    send_control_resolution: Object.freeze({
+      attempted: sendControl.attempted === true,
+      ok: sendControl.ok === true,
+      selector_kind: optionalText(sendControl.selector_kind, "submit diagnostics selector_kind", 128),
+      coordinates_changed_since_prepare: sendControl.coordinates_changed_since_prepare === true
+    }),
+    trusted_dispatch: Object.freeze({
+      attempted: trusted.attempted === true,
+      focus_emulation: trusted.focus_emulation === true,
+      mouse_moved: trusted.mouse_moved === true,
+      mouse_pressed: trusted.mouse_pressed === true,
+      mouse_released: trusted.mouse_released === true
+    }),
+    confirmation: Object.freeze({
+      attempted: confirmation.attempted === true,
+      ok: confirmation.ok === true,
+      composer_empty: typeof confirmation.composer_empty === "boolean"
+        ? confirmation.composer_empty
+        : null,
+      exact_new_user_message: typeof confirmation.exact_new_user_message === "boolean"
+        ? confirmation.exact_new_user_message
+        : null
+    }),
+    foreground: Object.freeze({
+      mode: optionalText(foreground.mode, "submit diagnostics foreground mode", 128),
+      activated_target: foreground.activated_target === true,
+      restored_previous_active: foreground.restored_previous_active === true,
+      user_changed_focus: foreground.user_changed_focus === true
+    }),
+    failure_stage: optionalText(input.failure_stage, "submit diagnostics failure_stage", 128),
+    dispatch_attempted: input.dispatch_attempted === true,
+    submit_confirmed: input.submit_confirmed === true,
+    retryable: input.retryable === true
+  });
+}
+
 export function validateChallenge(input) {
   return Object.freeze({
     schema_version: positiveInteger(input && input.schema_version || 1, "challenge.schema_version"),
@@ -119,33 +198,22 @@ export function createNativeHostHandler(options) {
       return { observation: observation };
     }
 
-    if (op === "focus_target") {
-      const target = requiredText(request.browser_target_id, "browser_target_id", 256);
-      const browserResult = await browser("focus_target", {
-        browser_target_id: target
-      });
-      const observation = validateMachineObservation(browserResult && browserResult.observation);
-      if (observation.browser_target_id !== target) {
-        throw new Error("browser machine focus returned wrong target");
-      }
-      return {
-        focused: browserResult && browserResult.focused === true,
-        observation: observation
-      };
-    }
-
     if (op === "submit_continuation") {
       const target = requiredText(request.browser_target_id, "browser_target_id", 256);
       const conversation = requiredText(request.conversation_id, "conversation_id", 128);
       const payload = requiredText(request.payload, "payload", MAX_CONTINUATION_CHARS);
       const wakeId = requiredText(request.wake_id, "wake_id", 256);
       const wakeNonce = requiredText(request.wake_nonce, "wake_nonce", 256);
+      const targetGeneration = positiveInteger(request.target_generation, "target_generation");
+      const ownershipGeneration = positiveInteger(request.ownership_generation, "ownership_generation");
       const result = await browser("submit_continuation", {
         browser_target_id: target,
         conversation_id: conversation,
         payload: payload,
         wake_id: wakeId,
-        wake_nonce: wakeNonce
+        wake_nonce: wakeNonce,
+        target_generation: targetGeneration,
+        ownership_generation: ownershipGeneration
       });
       if (typeof (result && result.dispatch_attempted) !== "boolean" ||
           typeof (result && result.submit_confirmed) !== "boolean") {
@@ -161,7 +229,8 @@ export function createNativeHostHandler(options) {
         status: result.status == null ? null : requiredText(result.status, "submit status", 128),
         host_submit_receipt: result.host_submit_receipt == null
           ? null
-          : requiredText(result.host_submit_receipt, "host_submit_receipt", 512)
+          : requiredText(result.host_submit_receipt, "host_submit_receipt", 512),
+        submit_diagnostics: normalizeSubmitDiagnostics(result.submit_diagnostics)
       };
       if (normalized.submit_confirmed) {
         recordLiveValidation({

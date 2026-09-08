@@ -94,7 +94,9 @@ test("oversized continuation is rejected before browser dispatch", async functio
       conversation_id: CONVERSATION,
       payload: "x".repeat(MAX_CONTINUATION_CHARS + 1),
       wake_id: "wake",
-      wake_nonce: "nonce"
+      wake_nonce: "nonce",
+      target_generation: 4,
+      ownership_generation: 8
     }),
     /payload exceeds limit/
   );
@@ -124,14 +126,17 @@ test("submit not implemented remains a confirmed pre-dispatch non-PASS result", 
     conversation_id: CONVERSATION,
     payload: "resume",
     wake_id: "wake",
-    wake_nonce: "nonce"
+    wake_nonce: "nonce",
+    target_generation: 4,
+    ownership_generation: 8
   });
   assert.deepEqual(result, {
     dispatch_attempted: false,
     submit_confirmed: false,
     retryable: false,
     status: "submit_not_implemented",
-    host_submit_receipt: null
+    host_submit_receipt: null,
+    submit_diagnostics: null
   });
 });
 
@@ -197,7 +202,9 @@ test("confirmed live submit records validation but uncertain submit does not", a
     conversation_id: CONVERSATION,
     payload: "resume",
     wake_id: "wake-live",
-    wake_nonce: "nonce-live"
+    wake_nonce: "nonce-live",
+    target_generation: 4,
+    ownership_generation: 8
   };
   await handle(request);
   assert.equal(records.length, 1);
@@ -208,4 +215,87 @@ test("confirmed live submit records validation but uncertain submit does not", a
   confirmed = false;
   await handle({ ...request, wake_id: "wake-unknown" });
   assert.equal(records.length, 1);
+});
+
+test("native Host submit diagnostics are structurally whitelisted and never carry prompt text", async function () {
+  const handle = createNativeHostHandler({
+    secret: SECRET,
+    sendBrowserCommand: async function (command) {
+      return {
+        request_id: command.request_id,
+        ok: true,
+        result: {
+          dispatch_attempted: true,
+          submit_confirmed: true,
+          retryable: false,
+          status: "submit_confirmed",
+          host_submit_receipt: "chrome_submit_diag",
+          submit_diagnostics: {
+            schema_version: 1,
+            wake_id: "wake-diag",
+            browser_target_id: "browser-target-7",
+            phase: "confirmed",
+            debugger_attach: { attempted: true, ok: true },
+            composer_preparation: {
+              attempted: true,
+              ok: true,
+              status: "prepared",
+              rollback_attempted: false,
+              rollback_succeeded: false
+            },
+            send_control_resolution: {
+              attempted: true,
+              ok: true,
+              selector_kind: "testid_send_button",
+              coordinates_changed_since_prepare: true
+            },
+            trusted_dispatch: {
+              attempted: true,
+              focus_emulation: true,
+              mouse_moved: true,
+              mouse_pressed: true,
+              mouse_released: true
+            },
+            confirmation: {
+              attempted: true,
+              ok: true,
+              composer_empty: true,
+              exact_new_user_message: true
+            },
+            foreground: {
+              mode: "background_focus_emulation",
+              activated_target: false,
+              restored_previous_active: false,
+              user_changed_focus: false
+            },
+            failure_stage: null,
+            dispatch_attempted: true,
+            submit_confirmed: true,
+            retryable: false,
+            payload: "MUST_NOT_ESCAPE",
+            continuation_payload: "MUST_NOT_ESCAPE",
+            text: "MUST_NOT_ESCAPE"
+          }
+        }
+      };
+    }
+  });
+
+  const result = await handle({
+    op: "submit_continuation",
+    browser_target_id: "browser-target-7",
+    conversation_id: CONVERSATION,
+    payload: "secret prompt body",
+    wake_id: "wake-diag",
+    wake_nonce: "nonce-diag",
+    target_generation: 4,
+    ownership_generation: 8
+  });
+  assert.equal(result.submit_diagnostics.wake_id, "wake-diag");
+  assert.equal(result.submit_diagnostics.debugger_attach.ok, true);
+  assert.equal(result.submit_diagnostics.send_control_resolution.coordinates_changed_since_prepare, true);
+  assert.equal(result.submit_diagnostics.confirmation.exact_new_user_message, true);
+  const serialized = JSON.stringify(result.submit_diagnostics);
+  assert.equal(serialized.includes("MUST_NOT_ESCAPE"), false);
+  assert.equal(serialized.includes("secret prompt body"), false);
 });

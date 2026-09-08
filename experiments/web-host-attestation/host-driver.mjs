@@ -31,7 +31,6 @@ function normalizeObservation(raw, requestedTargetId) {
  */
 export function createHostDriver(machineBoundary) {
   const observe = requiredMethod(machineBoundary, "observeTarget");
-  const focus = requiredMethod(machineBoundary, "focusTarget");
   const submit = requiredMethod(machineBoundary, "submitContinuation");
 
   return Object.freeze({
@@ -40,17 +39,15 @@ export function createHostDriver(machineBoundary) {
       const target = requiredText(browserTargetId, "browser_target_id");
       return normalizeObservation(await observe(target), target);
     },
-    async focusTarget(browserTargetId) {
-      const target = requiredText(browserTargetId, "browser_target_id");
-      await focus(target);
-    },
     async submitContinuation(input) {
       const request = {
         browser_target_id: requiredText(input?.browser_target_id, "browser_target_id"),
         conversation_id: requiredText(input?.conversation_id, "conversation_id"),
         payload: requiredText(input?.payload, "payload"),
         wake_id: requiredText(input?.wake_id, "wake_id"),
-        wake_nonce: requiredText(input?.wake_nonce, "wake_nonce")
+        wake_nonce: requiredText(input?.wake_nonce, "wake_nonce"),
+        target_generation: Number(input?.target_generation),
+        ownership_generation: Number(input?.ownership_generation)
       };
       const receipt = await submit(request);
       if (!receipt || typeof receipt !== "object") throw new Error("machine boundary submit receipt is required");
@@ -62,7 +59,10 @@ export function createHostDriver(machineBoundary) {
         submit_confirmed: receipt.submit_confirmed,
         retryable: Boolean(receipt.retryable),
         status: receipt.status == null ? null : requiredText(receipt.status, "submit receipt status"),
-        host_submit_receipt: receipt.host_submit_receipt == null ? null : requiredText(receipt.host_submit_receipt, "host_submit_receipt")
+        host_submit_receipt: receipt.host_submit_receipt == null ? null : requiredText(receipt.host_submit_receipt, "host_submit_receipt"),
+        submit_diagnostics: receipt.submit_diagnostics && typeof receipt.submit_diagnostics === "object"
+          ? receipt.submit_diagnostics
+          : null
       };
     }
   });

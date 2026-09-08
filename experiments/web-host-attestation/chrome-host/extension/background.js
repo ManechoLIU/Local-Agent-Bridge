@@ -5,14 +5,22 @@ import {
 } from "./observation.js";
 import { submitContinuationThroughChrome } from "./browser-submit.js";
 import { withDebuggerSession } from "./debugger-session.js";
+import {
+  createChromeSubmitJournal,
+  recoverPreparedSubmitJournals
+} from "./submit-journal.js";
+import { pageSubmitOperationFunction } from "./submit-page.js";
+import { createTrustedInputController } from "./trusted-input.js";
 
 const NATIVE_HOST = "com.local_agent_bridge.web_host";
+const submitJournal = createChromeSubmitJournal(chrome);
 
 function setNativeDiagnostic(state, error, details) {
   globalThis.__LAB_HOST_NATIVE_STATE = Object.freeze({
-    state: state,
+    state,
     error: error == null ? null : String(error),
     socket_path: details?.socket_path == null ? null : String(details.socket_path),
+    recovery: details?.recovery == null ? null : details.recovery,
     updated_at_ms: Date.now()
   });
 }
@@ -42,10 +50,23 @@ async function allTargets() {
   return await chrome.debugger.getTargets();
 }
 
+async function executePageOperation(tabId, operation, input) {
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "ISOLATED",
+    func: pageSubmitOperationFunction,
+    args: [operation, input]
+  });
+  if (!Array.isArray(results) || results.length !== 1) {
+    throw new Error(operation + " page result is unavailable");
+  }
+  return results[0] && results[0].result;
+}
+
 async function withDebugger(target, callback) {
   return await withDebuggerSession({
     chromeApi: chrome,
-    target: target,
+    target,
     callback: async function (targetResult, frameTree, debuggerSession) {
       const cdpInfo = targetResult && targetResult.targetInfo;
       const cdpTargetId = cdpInfo && (cdpInfo.targetId || cdpInfo.id);
@@ -67,8 +88,8 @@ async function observeConversation(conversationId) {
   const target = selectUniqueConversationTarget(await allTargets(), conversationId);
   return await withDebugger(target, async function (targetInfo, frameTree) {
     return observationFromDebugger({
-      targetInfo: targetInfo,
-      frameTree: frameTree,
+      targetInfo,
+      frameTree,
       observedAtMs: Date.now()
     });
   });
@@ -78,68 +99,37 @@ async function observeTarget(browserTargetId) {
   const target = selectExactTarget(await allTargets(), browserTargetId);
   return await withDebugger(target, async function (targetInfo, frameTree) {
     return observationFromDebugger({
-      targetInfo: targetInfo,
-      frameTree: frameTree,
+      targetInfo,
+      frameTree,
       observedAtMs: Date.now()
     });
   });
 }
 
-async function dispatchTrustedClick(browserTargetId, clickPoint) {
-  const target = selectExactTarget(await allTargets(), browserTargetId);
-  const x = Number(clickPoint && clickPoint.x);
-  const y = Number(clickPoint && clickPoint.y);
-  if (!Number.isFinite(x) || !Number.isFinite(y)) {
-    throw new Error("trusted click coordinates are invalid");
-  }
-  return await withDebugger(target, async function (targetInfo, _frameTree, debuggerSession) {
-    if (!debuggerSession || typeof debuggerSession.sendCommand !== "function") {
-      throw new Error("debugger command session is unavailable");
-    }
-    if (targetInfo.id !== browserTargetId) {
-      throw new Error("trusted click target identity changed");
-    }
-    await debuggerSession.sendCommand("Input.dispatchMouseEvent", {
-      type: "mouseMoved",
-      x: x,
-      y: y,
-      button: "none"
-    });
-    await debuggerSession.sendCommand("Input.dispatchMouseEvent", {
-      type: "mousePressed",
-      x: x,
-      y: y,
-      button: "left",
-      buttons: 1,
-      clickCount: 1
-    });
-    await debuggerSession.sendCommand("Input.dispatchMouseEvent", {
-      type: "mouseReleased",
-      x: x,
-      y: y,
-      button: "left",
-      buttons: 0,
-      clickCount: 1
-    });
-    return { dispatched: true, browser_target_id: browserTargetId };
+const trustedInput = createTrustedInputController({
+  allTargets,
+  withDebugger,
+  executePageOperation,
+  observationFromDebugger,
+  selectExactTarget
+});
+const dispatchTrustedClick = trustedInput.dispatchTrustedClick;
+const rollbackPreparedPayloadByHash = trustedInput.rollbackPreparedPayloadByHash;
+
+async function recoverStalePreparedSubmissions() {
+  return await recoverPreparedSubmitJournals({
+    journal: submitJournal,
+    rollbackPreparedByHash: rollbackPreparedPayloadByHash
   });
 }
 
-async function focusTarget(browserTargetId) {
-  const target = selectExactTarget(await allTargets(), browserTargetId);
-  if (!Number.isInteger(target.tabId)) throw new Error("target has no tabId");
-  await chrome.tabs.update(target.tabId, { active: true });
-  const tab = await chrome.tabs.get(target.tabId);
-  if (Number.isInteger(tab.windowId)) {
-    await chrome.windows.update(tab.windowId, { focused: true });
+recoverStalePreparedSubmissions().then(function (results) {
+  if (results.length > 0) {
+    setNativeDiagnostic("connected", null, { recovery: results });
   }
-  const observation = await observeTarget(browserTargetId);
-  return {
-    focused: true,
-    browser_target_id: browserTargetId,
-    observation: observation
-  };
-}
+}).catch(function (error) {
+  setNativeDiagnostic("recovery_degraded", error?.message || "submit_recovery_failed");
+});
 
 async function handleCommand(message) {
   const op = String(message && message.op || "");
@@ -149,16 +139,16 @@ async function handleCommand(message) {
   if (op === "observe_target") {
     return { observation: await observeTarget(message.browser_target_id) };
   }
-  if (op === "focus_target") {
-    return await focusTarget(message.browser_target_id);
-  }
   if (op === "submit_continuation") {
+    await recoverStalePreparedSubmissions();
     return await submitContinuationThroughChrome({
       chromeApi: chrome,
       getTargets: allTargets,
-      observeTarget: observeTarget,
-      dispatchTrustedClick: dispatchTrustedClick,
-      message: message
+      observeTarget,
+      dispatchTrustedClick,
+      rollbackPreparedByHash: rollbackPreparedPayloadByHash,
+      journal: submitJournal,
+      message
     });
   }
   throw new Error("unsupported browser command: " + op);
@@ -178,7 +168,7 @@ port.onMessage.addListener(function (message) {
     return;
   }
   handleCommand(message).then(function (result) {
-    port.postMessage({ request_id: requestId, ok: true, result: result });
+    port.postMessage({ request_id: requestId, ok: true, result });
   }).catch(function (error) {
     port.postMessage({
       request_id: requestId,

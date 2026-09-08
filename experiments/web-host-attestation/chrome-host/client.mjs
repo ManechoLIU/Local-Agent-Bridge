@@ -93,15 +93,6 @@ export function createChromeHostDriver(options) {
       return result.observation;
     },
 
-    async focusTarget(browserTargetId) {
-      const result = await requestNativeHost(socketPath, {
-        op: "focus_target",
-        browser_target_id: requiredText(browserTargetId, "browser_target_id", 256)
-      }, { timeoutMs: timeoutMs });
-      if (result.focused !== true) throw new Error("Host adapter did not confirm focus");
-      return result;
-    },
-
     async submitContinuation(input) {
       return await requestNativeHost(socketPath, {
         op: "submit_continuation",
@@ -109,7 +100,9 @@ export function createChromeHostDriver(options) {
         conversation_id: requiredText(input && input.conversation_id, "conversation_id", 128),
         payload: requiredText(input && input.payload, "payload", 8000),
         wake_id: requiredText(input && input.wake_id, "wake_id", 256),
-        wake_nonce: requiredText(input && input.wake_nonce, "wake_nonce", 256)
+        wake_nonce: requiredText(input && input.wake_nonce, "wake_nonce", 256),
+        target_generation: Number(input && input.target_generation),
+        ownership_generation: Number(input && input.ownership_generation)
       }, { timeoutMs: timeoutMs });
     }
   });

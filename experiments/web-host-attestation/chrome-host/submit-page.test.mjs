@@ -1,9 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {
-  pagePrepareSubmitFunction,
-  pageConfirmSubmitFunction
-} from "./extension/submit-page.js";
+import { webcrypto } from "node:crypto";
+import { TextEncoder } from "node:util";
+import { pageSubmitOperationFunction } from "./extension/submit-page.js";
 
 const CONVERSATION = "6a9e4158-cc8c-83ea-9763-05a7fd51f597";
 const OTHER = "6a9e41a2-266c-83ea-9104-e768ed4ad3f2";
@@ -16,25 +15,36 @@ function withPage(t, options = {}) {
     focus() { this.focused = true; },
     dispatchEvent() {}
   };
-  let syntheticClicks = 0;
-  const button = options.button === false ? null : {
-    disabled: Boolean(options.disabled),
+  const sendRect = options.sendRect || { left: 100, top: 200, width: 40, height: 20 };
+  const sendButton = options.sendButton === false ? null : {
+    disabled: Boolean(options.sendDisabled),
     getAttribute(name) {
-      if (name === "aria-disabled") return options.ariaDisabled ? "true" : null;
+      if (name === "data-testid") return "send-button";
+      if (name === "aria-disabled") return options.sendAriaDisabled ? "true" : null;
+      if (name === "aria-label") return "Send";
       return null;
     },
-    getBoundingClientRect() {
-      return options.rect || { left: 100, top: 200, width: 40, height: 20 };
-    },
-    click() { syntheticClicks += 1; }
+    getBoundingClientRect() { return { ...sendRect }; }
   };
-  const userMessages = (options.userMessages || []).map(function (text) {
-    return { innerText: text, textContent: text };
-  });
+  const stopButton = options.controllerActive ? {
+    disabled: false,
+    getAttribute(name) {
+      if (name === "data-testid") return "stop-button";
+      if (name === "aria-label") return "Stop answering";
+      return null;
+    }
+  } : null;
+  const userMessages = (options.userMessages || []).map(text => ({
+    innerText: text,
+    textContent: text
+  }));
 
-  const oldDocument = globalThis.document;
-  const oldLocation = globalThis.location;
-  const oldInputEvent = globalThis.InputEvent;
+  const old = {
+    document: globalThis.document,
+    location: globalThis.location,
+    InputEvent: globalThis.InputEvent,
+    Event: globalThis.Event
+  };
 
   globalThis.location = {
     href: "https://chatgpt.com/g/g-p-local/c/" + (options.conversation || CONVERSATION)
@@ -45,11 +55,16 @@ function withPage(t, options = {}) {
   globalThis.document = {
     querySelector(selector) {
       if (selector === '#prompt-textarea[contenteditable="true"]') return composer;
-      if (selector === 'button[data-testid="send-button"]') return button;
+      if (selector === 'button[data-testid="send-button"]') return sendButton;
+      if (selector === 'button[data-testid="stop-button"]') return stopButton;
       return null;
     },
     querySelectorAll(selector) {
       if (selector === '[data-message-author-role="user"]') return userMessages;
+      if (selector === "button,[role=button]") {
+        return [sendButton, stopButton].filter(Boolean);
+      }
+      if (selector === "button") return [sendButton, stopButton].filter(Boolean);
       return [];
     },
     execCommand(command, _ui, text) {
@@ -60,107 +75,116 @@ function withPage(t, options = {}) {
     }
   };
 
-  t.after(function () {
-    if (oldDocument === undefined) delete globalThis.document;
-    else globalThis.document = oldDocument;
-    if (oldLocation === undefined) delete globalThis.location;
-    else globalThis.location = oldLocation;
-    if (oldInputEvent === undefined) delete globalThis.InputEvent;
-    else globalThis.InputEvent = oldInputEvent;
+  t.after(() => {
+    for (const [key, value] of Object.entries(old)) {
+      if (value === undefined) delete globalThis[key];
+      else globalThis[key] = value;
+    }
   });
 
-  return {
-    composer,
-    userMessages,
-    syntheticClicks: function () { return syntheticClicks; }
-  };
+  return { composer, sendRect, userMessages };
 }
 
-test("prepare refuses wrong conversation before touching composer", async function (t) {
+function op(operation, input = {}) {
+  return pageSubmitOperationFunction(operation, {
+    expected_conversation_id: CONVERSATION,
+    ...input
+  });
+}
+
+test("prepare refuses wrong conversation before touching composer", async t => {
   const page = withPage(t, { conversation: OTHER });
-  const result = await pagePrepareSubmitFunction("resume", CONVERSATION);
+  const result = await op("prepare", { payload: "resume" });
   assert.equal(result.status, "wrong_conversation");
-  assert.equal(result.ready_to_dispatch, false);
+  assert.equal(result.prepared, false);
   assert.equal(page.composer.focused, false);
 });
 
-test("prepare never overwrites an existing user draft", async function (t) {
+test("prepare never overwrites an existing user draft", async t => {
   const page = withPage(t, { initialText: "user draft" });
-  const result = await pagePrepareSubmitFunction("resume", CONVERSATION);
+  const result = await op("prepare", { payload: "resume" });
   assert.equal(result.status, "composer_not_empty");
-  assert.equal(result.ready_to_dispatch, false);
+  assert.equal(result.prepared, false);
   assert.equal(page.composer.innerText, "user draft");
 });
 
-test("prepare inserts payload and returns trusted click coordinates without synthetic click", async function (t) {
-  const page = withPage(t);
-  const result = await pagePrepareSubmitFunction("resume", CONVERSATION);
-  assert.deepEqual(result, {
-    ready_to_dispatch: true,
-    dispatch_attempted: false,
-    submit_confirmed: false,
-    retryable: false,
-    status: "ready_to_dispatch",
-    click_point: { x: 120, y: 210 }
-  });
-  assert.equal(page.composer.innerText, "resume");
-  assert.equal(page.syntheticClicks(), 0);
-});
-
-test("prepare keeps its own payload while send is unavailable so retry can resume", async function (t) {
-  const page = withPage(t, { button: false });
-  const result = await pagePrepareSubmitFunction("resume", CONVERSATION);
-  assert.equal(result.ready_to_dispatch, false);
+test("controller active is detected before Host writes payload", async t => {
+  const page = withPage(t, { controllerActive: true });
+  const result = await op("prepare", { payload: "resume" });
+  assert.equal(result.status, "controller_active");
+  assert.equal(result.prepared, false);
   assert.equal(result.retryable, true);
-  assert.equal(result.status, "send_unavailable");
-  assert.equal(page.composer.innerText, "resume");
-});
-
-test("prepare reuses an identical Runtime-owned payload instead of treating it as a user draft", async function (t) {
-  const page = withPage(t, { initialText: "resume" });
-  const result = await pagePrepareSubmitFunction("resume", CONVERSATION);
-  assert.equal(result.ready_to_dispatch, true);
-  assert.equal(result.status, "ready_to_dispatch");
-  assert.deepEqual(result.click_point, { x: 120, y: 210 });
-  assert.equal(page.composer.innerText, "resume");
-  assert.equal(page.syntheticClicks(), 0);
-});
-
-test("prepare clears its own payload when send button has no clickable geometry", async function (t) {
-  const page = withPage(t, { rect: { left: 0, top: 0, width: 0, height: 0 } });
-  const result = await pagePrepareSubmitFunction("resume", CONVERSATION);
-  assert.equal(result.ready_to_dispatch, false);
-  assert.equal(result.retryable, true);
-  assert.equal(result.status, "send_button_not_clickable");
   assert.equal(page.composer.innerText, "");
 });
 
-test("confirm succeeds after trusted dispatch clears composer", async function (t) {
-  const page = withPage(t, { initialText: "" });
-  const result = await pageConfirmSubmitFunction("resume", CONVERSATION, 250);
-  assert.deepEqual(result, {
-    dispatch_attempted: true,
-    submit_confirmed: true,
-    retryable: false,
-    status: "submit_confirmed"
+test("prepare records baseline and initial send snapshot without dispatch", async t => {
+  const page = withPage(t, { userMessages: ["old"] });
+  const result = await op("prepare", { payload: "resume" });
+  assert.equal(result.prepared, true);
+  assert.equal(result.dispatch_attempted, false);
+  assert.equal(result.baseline_user_message_count, 1);
+  assert.equal(result.initial_send_control.selector_kind, "testid_send_button");
+  assert.deepEqual(
+    { x: result.initial_send_control.x, y: result.initial_send_control.y },
+    { x: 120, y: 210 }
+  );
+  assert.equal(page.composer.innerText, "resume");
+});
+
+test("resolve_send re-resolves current coordinates and rejects changed composer", async t => {
+  const page = withPage(t, { initialText: "resume", sendRect: { left: 300, top: 400, width: 20, height: 10 } });
+  const resolved = await op("resolve_send", { payload: "resume" });
+  assert.equal(resolved.resolved, true);
+  assert.deepEqual(
+    { x: resolved.send_control.x, y: resolved.send_control.y },
+    { x: 310, y: 405 }
+  );
+  page.composer.innerText = "user changed it";
+  page.composer.textContent = "user changed it";
+  const changed = await op("resolve_send", { payload: "resume" });
+  assert.equal(changed.resolved, false);
+  assert.equal(changed.status, "composer_changed_before_dispatch");
+});
+
+test("confirm requires exact new user message instead of composer-empty alone", async t => {
+  withPage(t, { initialText: "", userMessages: ["old"] });
+  const unknown = await op("confirm", {
+    payload: "resume",
+    baseline_user_message_count: 1,
+    timeout_ms: 250
   });
-  assert.equal(page.syntheticClicks(), 0);
+  assert.equal(unknown.submit_confirmed, false);
+  assert.equal(unknown.composer_empty, true);
+
+  const page = withPage(t, { initialText: "", userMessages: ["old", "resume"] });
+  const confirmed = await op("confirm", {
+    payload: "resume",
+    baseline_user_message_count: 1,
+    timeout_ms: 250
+  });
+  assert.equal(confirmed.submit_confirmed, true);
+  assert.equal(confirmed.exact_new_user_message, true);
+  assert.equal(page.userMessages.length, 2);
 });
 
-test("confirm succeeds when exact payload is visible as a user message", async function (t) {
-  withPage(t, { initialText: "resume", userMessages: ["older", "resume"] });
-  const result = await pageConfirmSubmitFunction("resume", CONVERSATION, 250);
-  assert.equal(result.submit_confirmed, true);
-  assert.equal(result.status, "submit_confirmed");
+test("prepare_rollback authorizes only exact SHA-256-owned payload", async t => {
+  const page = withPage(t, { initialText: "resume" });
+  const digest = Buffer.from(await webcrypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode("resume")
+  )).toString("hex");
+  const safe = await op("prepare_rollback", { expected_payload_sha256: digest });
+  assert.equal(safe.safe_to_clear, true);
+  assert.equal(page.composer.focused, true);
+
+  const mismatch = await op("prepare_rollback", { expected_payload_sha256: "0".repeat(64) });
+  assert.equal(mismatch.safe_to_clear, false);
+  assert.equal(mismatch.status, "composer_hash_mismatch");
 });
 
-test("confirm remains result unknown when payload stays in composer", async function (t) {
-  withPage(t, { initialText: "resume" });
-  const result = await pageConfirmSubmitFunction("resume", CONVERSATION, 250);
-  assert.equal(result.dispatch_attempted, true);
-  assert.equal(result.submit_confirmed, false);
-  assert.equal(result.retryable, false);
-  assert.equal(result.status, "result_unknown");
-  assert.equal(result.composer_still_payload, true);
-  assert.equal(result.exact_user_message_present, false);
+test("verify_empty does not mutate composer", async t => {
+  const page = withPage(t, { initialText: "user content" });
+  const result = await op("verify_empty");
+  assert.equal(result.composer_empty, false);
+  assert.equal(page.composer.innerText, "user content");
 });

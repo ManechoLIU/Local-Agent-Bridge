@@ -32,7 +32,9 @@ const RUNTIME_VERIFIER_BUNDLE_PATHS = Object.freeze([
   fileURLToPath(new URL("./extension/debugger-session.js", import.meta.url)),
   fileURLToPath(new URL("./extension/observation.js", import.meta.url)),
   fileURLToPath(new URL("./extension/browser-submit.js", import.meta.url)),
-  fileURLToPath(new URL("./extension/submit-page.js", import.meta.url))
+  fileURLToPath(new URL("./extension/submit-page.js", import.meta.url)),
+  fileURLToPath(new URL("./extension/submit-journal.js", import.meta.url)),
+  fileURLToPath(new URL("./extension/trusted-input.js", import.meta.url))
 ]);
 
 const BROWSER_MANIFEST_ROOTS = Object.freeze({

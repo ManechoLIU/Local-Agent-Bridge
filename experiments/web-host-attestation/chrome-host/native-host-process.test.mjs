@@ -182,7 +182,9 @@ test("real native Host process bridges Unix socket to Native Messaging and signs
     conversation_id: CONVERSATION,
     payload: "resume",
     wake_id: "wake-process",
-    wake_nonce: "nonce-process"
+    wake_nonce: "nonce-process",
+    target_generation: 4,
+    ownership_generation: 8
   }, { timeoutMs: 3000 });
   assert.equal(submit.submit_confirmed, true);
 
