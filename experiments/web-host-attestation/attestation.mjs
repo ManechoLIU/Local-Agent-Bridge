@@ -42,6 +42,104 @@ function hmac(secret, value) {
   return createHmac("sha256", secret).update(canonicalJson(value)).digest("hex");
 }
 
+function normalizedVerifiedTarget(input) {
+  const target = {
+    schema_version: Number(input?.schema_version),
+    verified_target_id: nonEmpty(input?.verified_target_id, "verified_target_id"),
+    host_type: nonEmpty(input?.host_type, "verified_target.host_type"),
+    conversation_id: nonEmpty(input?.conversation_id, "verified_target.conversation_id"),
+    browser_target_id: nonEmpty(input?.browser_target_id, "verified_target.browser_target_id"),
+    top_frame_id: nonEmpty(input?.top_frame_id, "verified_target.top_frame_id"),
+    loader_id: nonEmpty(input?.loader_id, "verified_target.loader_id"),
+    secure_origin: nonEmpty(input?.secure_origin, "verified_target.secure_origin"),
+    target_generation: positiveInteger(input?.target_generation, "verified_target.target_generation"),
+    ownership_generation: positiveInteger(input?.ownership_generation, "verified_target.ownership_generation"),
+    host_receipt_id: nonEmpty(input?.host_receipt_id, "verified_target.host_receipt_id"),
+    verified_at_ms: positiveInteger(input?.verified_at_ms, "verified_target.verified_at_ms"),
+    provenance: nonEmpty(input?.provenance, "verified_target.provenance")
+  };
+  if (target.schema_version !== 1) throw new Error("verified target schema_version is unsupported");
+  if (target.host_type !== "chatgpt_web") throw new Error("verified target host_type is unsupported");
+  if (target.secure_origin !== "https://chatgpt.com") throw new Error("verified target secure origin is invalid");
+  if (target.provenance !== VERIFIED_TARGET_PROVENANCE) throw new Error("re-entry requires a verified target from Runtime Host verifier");
+  return target;
+}
+
+function signVerifiedTarget(secret, input) {
+  const target = normalizedVerifiedTarget(input);
+  return { ...target, verifier_mac_sha256: hmac(secret, target) };
+}
+
+function authenticateVerifiedTarget(secret, input) {
+  const target = normalizedVerifiedTarget(input);
+  const rawMac = input?.verifier_mac_sha256;
+  if (typeof rawMac !== "string" || !rawMac.trim()) {
+    throw new Error("verified target authentication failed");
+  }
+  const mac = rawMac.trim();
+  if (!secureEqualHex(mac, hmac(secret, target))) throw new Error("verified target authentication failed");
+  return { ...target, verifier_mac_sha256: mac };
+}
+
+function optionalDiagnosticText(value) {
+  if (value == null) return null;
+  const text = String(value).trim();
+  return text ? text.slice(0, 256) : null;
+}
+
+function sanitizeSubmitDiagnostics(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const debuggerAttach = input.debugger_attach && typeof input.debugger_attach === "object" ? input.debugger_attach : {};
+  const composer = input.composer_preparation && typeof input.composer_preparation === "object" ? input.composer_preparation : {};
+  const sendControl = input.send_control_resolution && typeof input.send_control_resolution === "object" ? input.send_control_resolution : {};
+  const trusted = input.trusted_dispatch && typeof input.trusted_dispatch === "object" ? input.trusted_dispatch : {};
+  const confirmation = input.confirmation && typeof input.confirmation === "object" ? input.confirmation : {};
+  const foreground = input.foreground && typeof input.foreground === "object" ? input.foreground : {};
+  return {
+    schema_version: 1,
+    wake_id: optionalDiagnosticText(input.wake_id),
+    browser_target_id: optionalDiagnosticText(input.browser_target_id),
+    phase: optionalDiagnosticText(input.phase),
+    debugger_attach: { attempted: debuggerAttach.attempted === true, ok: debuggerAttach.ok === true },
+    composer_preparation: {
+      attempted: composer.attempted === true,
+      ok: composer.ok === true,
+      status: optionalDiagnosticText(composer.status),
+      rollback_attempted: composer.rollback_attempted === true,
+      rollback_succeeded: composer.rollback_succeeded === true
+    },
+    send_control_resolution: {
+      attempted: sendControl.attempted === true,
+      ok: sendControl.ok === true,
+      selector_kind: optionalDiagnosticText(sendControl.selector_kind),
+      coordinates_changed_since_prepare: sendControl.coordinates_changed_since_prepare === true
+    },
+    trusted_dispatch: {
+      attempted: trusted.attempted === true,
+      focus_emulation: trusted.focus_emulation === true,
+      mouse_moved: trusted.mouse_moved === true,
+      mouse_pressed: trusted.mouse_pressed === true,
+      mouse_released: trusted.mouse_released === true
+    },
+    confirmation: {
+      attempted: confirmation.attempted === true,
+      ok: confirmation.ok === true,
+      composer_empty: typeof confirmation.composer_empty === "boolean" ? confirmation.composer_empty : null,
+      exact_new_user_message: typeof confirmation.exact_new_user_message === "boolean" ? confirmation.exact_new_user_message : null
+    },
+    foreground: {
+      mode: optionalDiagnosticText(foreground.mode),
+      activated_target: foreground.activated_target === true,
+      restored_previous_active: foreground.restored_previous_active === true,
+      user_changed_focus: foreground.user_changed_focus === true
+    },
+    failure_stage: optionalDiagnosticText(input.failure_stage),
+    dispatch_attempted: input.dispatch_attempted === true,
+    submit_confirmed: input.submit_confirmed === true,
+    retryable: input.retryable === true
+  };
+}
+
 function secureEqualHex(left, right) {
   try {
     const a = Buffer.from(String(left), "hex");
@@ -214,7 +312,7 @@ export class RuntimeHostVerifier {
 
     challengeRecord.consumed = true;
     this.usedAttestationReceipts.add(attestation.host_receipt_id);
-    const verified = {
+    const verified = signVerifiedTarget(this.secret, {
       schema_version: 1,
       verified_target_id: `vt_${randomUUID()}`,
       host_type: attestation.host_type,
@@ -228,7 +326,7 @@ export class RuntimeHostVerifier {
       host_receipt_id: attestation.host_receipt_id,
       verified_at_ms: now,
       provenance: VERIFIED_TARGET_PROVENANCE
-    };
+    });
     this.verifiedTargets.set(attestation.host_receipt_id, verified);
     this.#persist();
     return verified;
@@ -236,8 +334,9 @@ export class RuntimeHostVerifier {
 
   consumeVerifiedTarget(hostReceiptId, expected = {}) {
     const receiptId = nonEmpty(hostReceiptId, "host_receipt_id");
-    const verified = this.verifiedTargets.get(receiptId);
-    if (!verified) throw new Error("verified Host target receipt is missing or already consumed");
+    const storedVerified = this.verifiedTargets.get(receiptId);
+    if (!storedVerified) throw new Error("verified Host target receipt is missing or already consumed");
+    const verified = authenticateVerifiedTarget(this.secret, storedVerified);
     const now = nowMs(this.clock);
     if (now - Number(verified.verified_at_ms) > this.verifiedTargetTtlMs) {
       this.verifiedTargets.delete(receiptId);
@@ -304,117 +403,335 @@ export class WebReentryAdapter {
     this.clock = clock;
     this.statePath = statePath;
     const persisted = loadPrivateState(statePath);
-    this.usedWakeIds = new Set(persisted?.used_wake_ids ?? []);
+    this.legacyUsedWakeIds = new Set(
+      persisted?.legacy_used_wake_ids ?? persisted?.used_wake_ids ?? []
+    );
+    this.wakeRecords = new Map(
+      Array.isArray(persisted?.wake_records) ? persisted.wake_records : []
+    );
+    this.activeWakeIds = new Set();
   }
 
   #persist() {
+    const terminalWakeIds = [...this.wakeRecords.entries()]
+      .filter(([, record]) => record?.phase === "terminal")
+      .map(([wakeId]) => wakeId);
     savePrivateState(this.statePath, {
-      schema_version: 1,
-      used_wake_ids: [...this.usedWakeIds]
+      schema_version: 2,
+      used_wake_ids: [...new Set([...this.legacyUsedWakeIds, ...terminalWakeIds])],
+      legacy_used_wake_ids: [...this.legacyUsedWakeIds],
+      wake_records: [...this.wakeRecords.entries()]
     });
   }
 
-  async reenter({ verified_target, wake_id, wake_nonce, continuation_payload, expected_target_generation, expected_ownership_generation }) {
-    const wakeId = nonEmpty(wake_id, "wake_id");
-    if (this.usedWakeIds.has(wakeId)) throw new Error("wake_id replayed");
-    const verified = verified_target;
-    if (verified?.provenance !== VERIFIED_TARGET_PROVENANCE) throw new Error("re-entry requires a verified target from Runtime Host verifier");
-    if (verified.target_generation !== positiveInteger(expected_target_generation, "expected_target_generation")) throw new Error("stale target generation before re-entry");
-    if (verified.ownership_generation !== positiveInteger(expected_ownership_generation, "expected_ownership_generation")) throw new Error("stale ownership generation before re-entry");
-    const payload = nonEmpty(continuation_payload, "continuation_payload");
-    const nonce = nonEmpty(wake_nonce, "wake_nonce");
+  #wakeBinding({ wakeId, nonce, payload, verified }) {
+    return {
+      wake_id: wakeId,
+      wake_nonce_sha256: sha256Text(nonce),
+      continuation_payload_sha256: sha256Text(payload),
+      conversation_id: verified.conversation_id,
+      browser_target_id: verified.browser_target_id,
+      target_generation: verified.target_generation,
+      ownership_generation: verified.ownership_generation
+    };
+  }
 
-    this.usedWakeIds.add(wakeId);
+  #assertWakeBinding(record, binding) {
+    for (const key of [
+      "wake_id",
+      "wake_nonce_sha256",
+      "continuation_payload_sha256",
+      "conversation_id",
+      "browser_target_id",
+      "target_generation",
+      "ownership_generation"
+    ]) {
+      if (record?.[key] !== binding[key]) throw new Error("wake_id replayed with mismatched binding");
+    }
+  }
+
+  #storeInFlight(binding, verified) {
+    this.wakeRecords.set(binding.wake_id, {
+      schema_version: 1,
+      ...binding,
+      verified_target: verified,
+      phase: "in_flight",
+      started_at_ms: nowMs(this.clock)
+    });
     this.#persist();
+  }
 
-    const pre = validateMachineObservation(await this.driver.observeTarget(verified.browser_target_id));
-    if (!sameTarget(pre, verified)) throw new Error("Web target changed before re-entry");
-    let submit;
-    try {
-      submit = await this.driver.submitContinuation({
-        browser_target_id: verified.browser_target_id,
-        conversation_id: verified.conversation_id,
-        payload,
-        wake_id: wakeId,
-        wake_nonce: nonce,
-        target_generation: verified.target_generation,
-        ownership_generation: verified.ownership_generation
-      });
-    } catch (error) {
-      const confirmedBeforeDispatch = error?.dispatch_attempted === false;
-      return this.#signedReceipt({
-        wakeId,
-        nonce,
-        verified,
-        payload,
-        dispatch_attempted: !confirmedBeforeDispatch,
-        submit_confirmed: false,
-        retryable: confirmedBeforeDispatch && Boolean(error?.retryable),
-        auto_retry_allowed: confirmedBeforeDispatch && Boolean(error?.retryable),
-        result_class: confirmedBeforeDispatch ? "CONFIRMED_FAILURE_BEFORE_DISPATCH" : "RESULT_UNKNOWN",
-        status: confirmedBeforeDispatch && error?.retryable ? "transient_unavailable" : confirmedBeforeDispatch ? "submit_failed_before_dispatch" : "result_unknown",
-        host_submit_receipt: null,
-        submit_diagnostics: error?.submit_diagnostics ?? null
-      });
-    }
+  #storeTerminal(wakeId, receipt) {
+    const current = this.wakeRecords.get(wakeId) ?? {};
+    this.wakeRecords.set(wakeId, {
+      ...current,
+      phase: "terminal",
+      receipt,
+      completed_at_ms: nowMs(this.clock)
+    });
+    this.#persist();
+    return receipt;
+  }
 
-    const after = validateMachineObservation(await this.driver.observeTarget(verified.browser_target_id));
-    if (!sameTarget(after, verified)) {
-      return this.#signedReceipt({
-        wakeId,
-        nonce,
-        verified,
-        payload,
-        dispatch_attempted: true,
-        submit_confirmed: false,
-        retryable: false,
-        auto_retry_allowed: false,
-        result_class: "RESULT_UNKNOWN",
-        status: "result_unknown",
-        host_submit_receipt: submit?.host_submit_receipt ?? null,
-        submit_diagnostics: submit?.submit_diagnostics ?? null
-      });
-    }
-    const dispatchAttempted = Boolean(submit?.dispatch_attempted);
-    const submitConfirmed = Boolean(submit?.submit_confirmed);
-    const resultUnknown = dispatchAttempted && !submitConfirmed;
+  #releaseWake(wakeId) {
+    this.wakeRecords.delete(wakeId);
+    this.#persist();
+  }
+
+  #recoverPersistedInFlight(record) {
+    const verified = authenticateVerifiedTarget(this.secret, record.verified_target);
+    const receipt = this.#signedReceipt({
+      wakeId: record.wake_id,
+      verified,
+      wake_nonce_sha256: record.wake_nonce_sha256,
+      continuation_payload_sha256: record.continuation_payload_sha256,
+      dispatch_attempted: true,
+      submit_confirmed: false,
+      retryable: false,
+      auto_retry_allowed: false,
+      result_class: "RESULT_UNKNOWN",
+      status: "result_unknown_after_restart",
+      host_submit_receipt: null,
+      submit_diagnostics: null
+    });
+    return this.#storeTerminal(record.wake_id, receipt);
+  }
+
+  #preDispatchReceipt({ wakeId, nonce, verified, payload, retryable, status, diagnostics = null }) {
     return this.#signedReceipt({
       wakeId,
       nonce,
       verified,
       payload,
-      dispatch_attempted: dispatchAttempted,
-      submit_confirmed: submitConfirmed,
-      retryable: resultUnknown ? false : Boolean(submit?.retryable),
-      auto_retry_allowed: resultUnknown ? false : !dispatchAttempted && Boolean(submit?.retryable),
-      result_class: submitConfirmed ? "SUBMIT_CONFIRMED" : resultUnknown ? "RESULT_UNKNOWN" : "CONFIRMED_FAILURE_BEFORE_DISPATCH",
-      status: submitConfirmed ? "submit_confirmed" : resultUnknown ? "result_unknown" : submit?.status || "submit_failed_before_dispatch",
-      host_submit_receipt: submit?.host_submit_receipt ?? null,
-      submit_diagnostics: submit?.submit_diagnostics ?? null
+      dispatch_attempted: false,
+      submit_confirmed: false,
+      retryable: retryable === true,
+      auto_retry_allowed: retryable === true,
+      result_class: "CONFIRMED_FAILURE_BEFORE_DISPATCH",
+      status,
+      host_submit_receipt: null,
+      submit_diagnostics: diagnostics
     });
   }
 
-  #signedReceipt({ wakeId, nonce, verified, payload, dispatch_attempted, submit_confirmed, retryable, auto_retry_allowed, result_class, status, host_submit_receipt, submit_diagnostics }) {
+  async reenter({ verified_target, wake_id, wake_nonce, continuation_payload, expected_target_generation, expected_ownership_generation }) {
+    const wakeId = nonEmpty(wake_id, "wake_id");
+    const verified = authenticateVerifiedTarget(this.secret, verified_target);
+    if (verified.target_generation !== positiveInteger(expected_target_generation, "expected_target_generation")) throw new Error("stale target generation before re-entry");
+    if (verified.ownership_generation !== positiveInteger(expected_ownership_generation, "expected_ownership_generation")) throw new Error("stale ownership generation before re-entry");
+    const payload = nonEmpty(continuation_payload, "continuation_payload");
+    const nonce = nonEmpty(wake_nonce, "wake_nonce");
+    const binding = this.#wakeBinding({ wakeId, nonce, payload, verified });
+
+    if (this.activeWakeIds.has(wakeId)) throw new Error("wake_id replayed");
+    if (this.legacyUsedWakeIds.has(wakeId)) throw new Error("wake_id replayed");
+    const existing = this.wakeRecords.get(wakeId);
+    if (existing) {
+      this.#assertWakeBinding(existing, binding);
+      if (existing.phase === "in_flight") return this.#recoverPersistedInFlight(existing);
+      throw new Error("wake_id replayed");
+    }
+
+    let pre;
+    try {
+      pre = validateMachineObservation(await this.driver.observeTarget(verified.browser_target_id));
+    } catch (error) {
+      return this.#preDispatchReceipt({
+        wakeId,
+        nonce,
+        verified,
+        payload,
+        retryable: error?.retryable === true,
+        status: error?.retryable === true ? "target_preflight_unavailable" : "target_preflight_failed"
+      });
+    }
+    if (!sameTarget(pre, verified)) {
+      return this.#preDispatchReceipt({
+        wakeId,
+        nonce,
+        verified,
+        payload,
+        retryable: false,
+        status: "target_changed_before_reentry"
+      });
+    }
+
+    // Claim after the asynchronous preflight, then re-check to close same-process races.
+    if (this.activeWakeIds.has(wakeId) || this.legacyUsedWakeIds.has(wakeId) || this.wakeRecords.has(wakeId)) {
+      throw new Error("wake_id replayed");
+    }
+    this.activeWakeIds.add(wakeId);
+    try {
+      this.#storeInFlight(binding, verified);
+    } catch (error) {
+      this.activeWakeIds.delete(wakeId);
+      this.wakeRecords.delete(wakeId);
+      throw error;
+    }
+
+    let receipt;
+    try {
+      let submit;
+      try {
+        submit = await this.driver.submitContinuation({
+          browser_target_id: verified.browser_target_id,
+          conversation_id: verified.conversation_id,
+          payload,
+          wake_id: wakeId,
+          wake_nonce: nonce,
+          target_generation: verified.target_generation,
+          ownership_generation: verified.ownership_generation
+        });
+      } catch (error) {
+        const confirmedBeforeDispatch = error?.dispatch_attempted === false;
+        if (confirmedBeforeDispatch) {
+          const retryable = error?.retryable === true;
+          receipt = this.#preDispatchReceipt({
+            wakeId,
+            nonce,
+            verified,
+            payload,
+            retryable,
+            status: retryable ? "transient_unavailable" : "submit_failed_before_dispatch",
+            diagnostics: error?.submit_diagnostics ?? null
+          });
+          if (retryable) this.#releaseWake(wakeId);
+          else this.#storeTerminal(wakeId, receipt);
+          return receipt;
+        }
+        receipt = this.#signedReceipt({
+          wakeId,
+          nonce,
+          verified,
+          payload,
+          dispatch_attempted: true,
+          submit_confirmed: false,
+          retryable: false,
+          auto_retry_allowed: false,
+          result_class: "RESULT_UNKNOWN",
+          status: "result_unknown",
+          host_submit_receipt: null,
+          submit_diagnostics: error?.submit_diagnostics ?? null
+        });
+        return this.#storeTerminal(wakeId, receipt);
+      }
+
+      const dispatchSignal = submit?.dispatch_attempted;
+      const confirmationSignal = submit?.submit_confirmed;
+      const explicitConfirmed = dispatchSignal === true && confirmationSignal === true;
+      const explicitPreDispatchFailure = dispatchSignal === false && confirmationSignal === false;
+
+      if (explicitPreDispatchFailure) {
+        const retryable = submit?.retryable === true;
+        receipt = this.#preDispatchReceipt({
+          wakeId,
+          nonce,
+          verified,
+          payload,
+          retryable,
+          status: submit?.status || "submit_failed_before_dispatch",
+          diagnostics: submit?.submit_diagnostics ?? null
+        });
+        if (retryable) this.#releaseWake(wakeId);
+        else this.#storeTerminal(wakeId, receipt);
+        return receipt;
+      }
+
+      if (!explicitConfirmed) {
+        receipt = this.#signedReceipt({
+          wakeId,
+          nonce,
+          verified,
+          payload,
+          dispatch_attempted: true,
+          submit_confirmed: false,
+          retryable: false,
+          auto_retry_allowed: false,
+          result_class: "RESULT_UNKNOWN",
+          status: "result_unknown",
+          host_submit_receipt: submit?.host_submit_receipt ?? null,
+          submit_diagnostics: submit?.submit_diagnostics ?? null
+        });
+        return this.#storeTerminal(wakeId, receipt);
+      }
+
+      let after;
+      try {
+        after = validateMachineObservation(await this.driver.observeTarget(verified.browser_target_id));
+      } catch {
+        receipt = this.#signedReceipt({
+          wakeId,
+          nonce,
+          verified,
+          payload,
+          dispatch_attempted: true,
+          submit_confirmed: false,
+          retryable: false,
+          auto_retry_allowed: false,
+          result_class: "RESULT_UNKNOWN",
+          status: "result_unknown",
+          host_submit_receipt: submit?.host_submit_receipt ?? null,
+          submit_diagnostics: submit?.submit_diagnostics ?? null
+        });
+        return this.#storeTerminal(wakeId, receipt);
+      }
+      if (!sameTarget(after, verified)) {
+        receipt = this.#signedReceipt({
+          wakeId,
+          nonce,
+          verified,
+          payload,
+          dispatch_attempted: true,
+          submit_confirmed: false,
+          retryable: false,
+          auto_retry_allowed: false,
+          result_class: "RESULT_UNKNOWN",
+          status: "result_unknown",
+          host_submit_receipt: submit?.host_submit_receipt ?? null,
+          submit_diagnostics: submit?.submit_diagnostics ?? null
+        });
+        return this.#storeTerminal(wakeId, receipt);
+      }
+
+      receipt = this.#signedReceipt({
+        wakeId,
+        nonce,
+        verified,
+        payload,
+        dispatch_attempted: true,
+        submit_confirmed: true,
+        retryable: false,
+        auto_retry_allowed: false,
+        result_class: "SUBMIT_CONFIRMED",
+        status: "submit_confirmed",
+        host_submit_receipt: submit?.host_submit_receipt ?? null,
+        submit_diagnostics: submit?.submit_diagnostics ?? null
+      });
+      return this.#storeTerminal(wakeId, receipt);
+    } finally {
+      this.activeWakeIds.delete(wakeId);
+    }
+  }
+
+  #signedReceipt({ wakeId, nonce, wake_nonce_sha256, verified, payload, continuation_payload_sha256, dispatch_attempted, submit_confirmed, retryable, auto_retry_allowed, result_class, status, host_submit_receipt, submit_diagnostics }) {
     const receipt = {
       schema_version: 1,
       receipt_id: `wr_${randomUUID()}`,
       wake_id: wakeId,
-      wake_nonce_sha256: sha256Text(nonce),
+      wake_nonce_sha256: wake_nonce_sha256 ?? sha256Text(nonEmpty(nonce, "wake_nonce")),
       conversation_id: verified.conversation_id,
       browser_target_id: verified.browser_target_id,
       target_generation: verified.target_generation,
       ownership_generation: verified.ownership_generation,
-      continuation_payload_sha256: sha256Text(payload),
-      dispatch_attempted,
-      submit_confirmed,
-      retryable,
-      auto_retry_allowed,
-      result_class,
-      status,
-      host_submit_receipt,
-      submit_diagnostics: submit_diagnostics && typeof submit_diagnostics === "object"
-        ? submit_diagnostics
-        : null,
+      continuation_payload_sha256: continuation_payload_sha256 ?? sha256Text(nonEmpty(payload, "continuation_payload")),
+      dispatch_attempted: dispatch_attempted === true,
+      submit_confirmed: submit_confirmed === true,
+      retryable: retryable === true,
+      auto_retry_allowed: auto_retry_allowed === true,
+      result_class: nonEmpty(result_class, "result_class"),
+      status: nonEmpty(status, "status"),
+      host_submit_receipt: host_submit_receipt == null ? null : String(host_submit_receipt),
+      submit_diagnostics: sanitizeSubmitDiagnostics(submit_diagnostics),
       observed_at_ms: nowMs(this.clock),
       provenance: REENTRY_RECEIPT_PROVENANCE
     };
@@ -422,16 +739,40 @@ export class WebReentryAdapter {
   }
 }
 
-export function verifyReentryReceipt(secret, receipt, { wake_id, conversation_id, target_generation, ownership_generation }) {
+export function verifyReentryReceipt(secret, receipt, {
+  wake_id,
+  wake_nonce,
+  continuation_payload,
+  conversation_id,
+  browser_target_id,
+  target_generation,
+  ownership_generation
+}) {
+  if (Number(receipt?.schema_version) !== 1 || receipt?.schema_version !== 1) {
+    throw new Error("re-entry receipt schema_version is unsupported");
+  }
   const unsigned = { ...receipt };
   const mac = nonEmpty(unsigned.host_mac_sha256, "receipt.host_mac_sha256");
   delete unsigned.host_mac_sha256;
   if (!secureEqualHex(mac, hmac(secret, unsigned))) throw new Error("re-entry receipt authentication failed");
   if (receipt.provenance !== REENTRY_RECEIPT_PROVENANCE) throw new Error("untrusted re-entry receipt provenance");
-  if (receipt.wake_id !== wake_id) throw new Error("wrong wake receipt");
-  if (receipt.conversation_id !== conversation_id) throw new Error("wrong Web conversation receipt");
-  if (receipt.target_generation !== target_generation) throw new Error("stale target generation receipt");
-  if (receipt.ownership_generation !== ownership_generation) throw new Error("stale ownership generation receipt");
+  if (receipt.wake_id !== nonEmpty(wake_id, "expected wake_id")) throw new Error("wrong wake receipt");
+  if (receipt.conversation_id !== nonEmpty(conversation_id, "expected conversation_id")) throw new Error("wrong Web conversation receipt");
+  if (receipt.browser_target_id !== nonEmpty(browser_target_id, "expected browser_target_id")) throw new Error("wrong browser target receipt");
+  const expectedTargetGeneration = positiveInteger(target_generation, "expected target_generation");
+  const expectedOwnershipGeneration = positiveInteger(ownership_generation, "expected ownership_generation");
+  if (receipt.target_generation !== expectedTargetGeneration) throw new Error("stale target generation receipt");
+  if (receipt.ownership_generation !== expectedOwnershipGeneration) throw new Error("stale ownership generation receipt");
+  positiveInteger(receipt.target_generation, "receipt.target_generation");
+  positiveInteger(receipt.ownership_generation, "receipt.ownership_generation");
+  if (receipt.wake_nonce_sha256 !== sha256Text(nonEmpty(wake_nonce, "expected wake_nonce"))) {
+    throw new Error("wake nonce hash mismatch");
+  }
+  if (receipt.continuation_payload_sha256 !== sha256Text(nonEmpty(continuation_payload, "expected continuation_payload"))) {
+    throw new Error("continuation payload hash mismatch");
+  }
+  nonEmpty(receipt.receipt_id, "receipt.receipt_id");
+  positiveInteger(receipt.observed_at_ms, "receipt.observed_at_ms");
 
   const dispatchAttempted = receipt.dispatch_attempted;
   const submitConfirmed = receipt.submit_confirmed;
@@ -447,18 +788,20 @@ export function verifyReentryReceipt(secret, receipt, { wake_id, conversation_id
     if (!diagnostics || typeof diagnostics !== "object" || Array.isArray(diagnostics)) {
       throw new Error("re-entry receipt submit diagnostics are invalid");
     }
+    const sanitized = sanitizeSubmitDiagnostics(diagnostics);
+    if (canonicalJson(sanitized) !== canonicalJson(diagnostics)) {
+      throw new Error("re-entry receipt submit diagnostics contain unsupported fields");
+    }
     if (diagnostics.wake_id != null && diagnostics.wake_id !== receipt.wake_id) {
       throw new Error("re-entry receipt submit diagnostics wake mismatch");
     }
     if (diagnostics.browser_target_id != null && diagnostics.browser_target_id !== receipt.browser_target_id) {
       throw new Error("re-entry receipt submit diagnostics target mismatch");
     }
-    if (typeof diagnostics.dispatch_attempted === "boolean" &&
-        diagnostics.dispatch_attempted !== dispatchAttempted) {
+    if (typeof diagnostics.dispatch_attempted === "boolean" && diagnostics.dispatch_attempted !== dispatchAttempted) {
       throw new Error("re-entry receipt submit diagnostics dispatch mismatch");
     }
-    if (typeof diagnostics.submit_confirmed === "boolean" &&
-        diagnostics.submit_confirmed !== submitConfirmed) {
+    if (typeof diagnostics.submit_confirmed === "boolean" && diagnostics.submit_confirmed !== submitConfirmed) {
       throw new Error("re-entry receipt submit diagnostics confirmation mismatch");
     }
   }

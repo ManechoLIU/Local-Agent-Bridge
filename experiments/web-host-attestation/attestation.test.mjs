@@ -202,6 +202,100 @@ test("concurrent same-wake reentry admits only one submit", async () => {
   assert.equal(driver.submitted.length, 1);
 });
 
+test("forged verified target provenance string cannot authorize re-entry", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  const adapter = new WebReentryAdapter(SECRET, driver, { clock: time.now });
+  const forged = {
+    ...verified,
+    verified_target_id: "vt_forged",
+    target_generation: 4,
+    ownership_generation: 8
+  };
+  delete forged.verifier_mac_sha256;
+  await assert.rejects(
+    adapter.reenter({
+      verified_target: forged,
+      wake_id: "wake-forged-target",
+      wake_nonce: "nonce",
+      continuation_payload: "resume",
+      expected_target_generation: 4,
+      expected_ownership_generation: 8
+    }),
+    /verified target authentication failed/
+  );
+  assert.equal(driver.submitted.length, 0);
+});
+
+test("pre-dispatch target observation failure does not consume the wake", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now(), { loader_id: "wrong-loader" }));
+  const adapter = new WebReentryAdapter(SECRET, driver, { clock: time.now });
+  const input = {
+    verified_target: verified,
+    wake_id: "wake-precheck-retry",
+    wake_nonce: "nonce",
+    continuation_payload: "resume",
+    expected_target_generation: 4,
+    expected_ownership_generation: 8
+  };
+  const first = await adapter.reenter(input);
+  assert.equal(first.result_class, "CONFIRMED_FAILURE_BEFORE_DISPATCH");
+  assert.equal(first.dispatch_attempted, false);
+  driver.current = observation(time.now());
+  const second = await adapter.reenter(input);
+  assert.equal(second.result_class, "SUBMIT_CONFIRMED");
+  assert.equal(driver.submitted.length, 1);
+});
+
+test("post-submit observation exception becomes signed RESULT_UNKNOWN", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  let observes = 0;
+  driver.observeTarget = async function () {
+    observes += 1;
+    if (observes > 1) throw new Error("post-submit observation unavailable");
+    return this.current;
+  };
+  const receipt = await new WebReentryAdapter(SECRET, driver, { clock: time.now }).reenter({
+    verified_target: verified,
+    wake_id: "wake-post-observe-throw",
+    wake_nonce: "nonce",
+    continuation_payload: "resume",
+    expected_target_generation: 4,
+    expected_ownership_generation: 8
+  });
+  assert.equal(receipt.result_class, "RESULT_UNKNOWN");
+  assert.equal(receipt.dispatch_attempted, true);
+  assert.equal(receipt.auto_retry_allowed, false);
+});
+
+test("resolved submit with missing or contradictory dispatch flags is RESULT_UNKNOWN", async () => {
+  const { verified, time } = verifiedFixture();
+  for (const [name, submitResult] of [
+    ["missing", {}],
+    ["confirmed_without_dispatch", { dispatch_attempted: false, submit_confirmed: true }]
+  ]) {
+    const driver = new Driver(observation(time.now()));
+    driver.submitContinuation = async function (input) {
+      this.submitted.push(input);
+      return submitResult;
+    };
+    const receipt = await new WebReentryAdapter(SECRET, driver, { clock: time.now }).reenter({
+      verified_target: verified,
+      wake_id: "wake-invalid-flags-" + name,
+      wake_nonce: "nonce",
+      continuation_payload: "resume",
+      expected_target_generation: 4,
+      expected_ownership_generation: 8
+    });
+    assert.equal(receipt.result_class, "RESULT_UNKNOWN");
+    assert.equal(receipt.dispatch_attempted, true);
+    assert.equal(receipt.submit_confirmed, false);
+    assert.equal(receipt.auto_retry_allowed, false);
+  }
+});
+
 test("same-controller re-entry checks exact target before and after submit without foreground focus", async () => {
   const { verified, time } = verifiedFixture();
   const driver = new Driver(observation(time.now()));
@@ -218,7 +312,15 @@ test("same-controller re-entry checks exact target before and after submit witho
   assert.equal(receipt.submit_confirmed, true);
   assert.equal(receipt.status, "submit_confirmed");
   assert.equal(driver.submitted.length, 1);
-  verifyReentryReceipt(SECRET, receipt, { wake_id: "wake-1", conversation_id: CONVERSATION, target_generation: 4, ownership_generation: 8 });
+  verifyReentryReceipt(SECRET, receipt, {
+    wake_id: "wake-1",
+    wake_nonce: "runtime-wake-nonce-1",
+    continuation_payload: "continue canonical control cycle",
+    conversation_id: CONVERSATION,
+    browser_target_id: "browser-target-7",
+    target_generation: 4,
+    ownership_generation: 8
+  });
   await assert.rejects(
     adapter.reenter({
       verified_target: verified,
@@ -236,10 +338,18 @@ test("wrong conversation or replaced document fails before submit", async () => 
   const { verified, time } = verifiedFixture();
   const wrongConversation = new Driver(observation(time.now(), { conversation_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" }));
   const a = new WebReentryAdapter(SECRET, wrongConversation, { clock: time.now });
-  await assert.rejects(
-    a.reenter({ verified_target: verified, wake_id: "wake-wrong", wake_nonce: "n", continuation_payload: "x", expected_target_generation: 4, expected_ownership_generation: 8 }),
-    /target changed before re-entry/
-  );
+  const wrongReceipt = await a.reenter({
+    verified_target: verified,
+    wake_id: "wake-wrong",
+    wake_nonce: "n",
+    continuation_payload: "x",
+    expected_target_generation: 4,
+    expected_ownership_generation: 8
+  });
+  assert.equal(wrongReceipt.result_class, "CONFIRMED_FAILURE_BEFORE_DISPATCH");
+  assert.equal(wrongReceipt.status, "target_changed_before_reentry");
+  assert.equal(wrongReceipt.dispatch_attempted, false);
+  assert.equal(wrongReceipt.auto_retry_allowed, false);
   assert.equal(wrongConversation.submitted.length, 0);
 
   const noFocusDriver = new Driver(observation(time.now()));
@@ -296,7 +406,15 @@ test("transient Host submit failure returns machine receipt distinct from confir
   assert.equal(receipt.status, "transient_unavailable");
   assert.equal(receipt.result_class, "CONFIRMED_FAILURE_BEFORE_DISPATCH");
   assert.equal(receipt.auto_retry_allowed, true);
-  verifyReentryReceipt(SECRET, receipt, { wake_id: "wake-transient", conversation_id: CONVERSATION, target_generation: 4, ownership_generation: 8 });
+  verifyReentryReceipt(SECRET, receipt, {
+    wake_id: "wake-transient",
+    wake_nonce: "n",
+    continuation_payload: "x",
+    conversation_id: CONVERSATION,
+    browser_target_id: "browser-target-7",
+    target_generation: 4,
+    ownership_generation: 8
+  });
 });
 
 test("submit uncertainty and post-submit target verification failure are RESULT_UNKNOWN and never auto-retry", async () => {
@@ -451,6 +569,44 @@ test("stable provider exposes receipts without owning Runtime lifecycle", async 
   assert.equal(receipt.result_class, "SUBMIT_CONFIRMED");
 });
 
+test("receipt verifier binds browser target nonce payload schema and typed generations", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  const receipt = await new WebReentryAdapter(SECRET, driver, { clock: time.now }).reenter({
+    verified_target: verified,
+    wake_id: "wake-full-binding",
+    wake_nonce: "nonce-full-binding",
+    continuation_payload: "resume-full-binding",
+    expected_target_generation: 4,
+    expected_ownership_generation: 8
+  });
+  const expected = {
+    wake_id: "wake-full-binding",
+    wake_nonce: "nonce-full-binding",
+    continuation_payload: "resume-full-binding",
+    conversation_id: CONVERSATION,
+    browser_target_id: "browser-target-7",
+    target_generation: 4,
+    ownership_generation: 8
+  };
+  verifyReentryReceipt(SECRET, receipt, expected);
+  assert.throws(() => verifyReentryReceipt(SECRET, receipt, { ...expected, browser_target_id: "other-target" }), /wrong browser target receipt/);
+  assert.throws(() => verifyReentryReceipt(SECRET, receipt, { ...expected, wake_nonce: "other-nonce" }), /wake nonce hash mismatch/);
+  assert.throws(() => verifyReentryReceipt(SECRET, receipt, { ...expected, continuation_payload: "other-payload" }), /continuation payload hash mismatch/);
+
+  for (const mutation of [
+    { schema_version: 2 },
+    { target_generation: 0 },
+    { ownership_generation: 0 },
+    { result_class: "UNKNOWN_NEW_CLASS" }
+  ]) {
+    const unsigned = { ...receipt, ...mutation };
+    delete unsigned.host_mac_sha256;
+    const resigned = signHostAttestationForTest(unsigned);
+    assert.throws(() => verifyReentryReceipt(SECRET, resigned, expected));
+  }
+});
+
 test("receipt verifier rejects authenticated contradictory result state", async () => {
   const { verified, time } = verifiedFixture();
   const driver = new Driver(observation(time.now()));
@@ -468,7 +624,10 @@ test("receipt verifier rejects authenticated contradictory result state", async 
   assert.throws(
     () => verifyReentryReceipt(SECRET, resigned, {
       wake_id: "wake-contradiction",
+      wake_nonce: "n",
+      continuation_payload: "resume",
       conversation_id: CONVERSATION,
+      browser_target_id: "browser-target-7",
       target_generation: 4,
       ownership_generation: 8
     }),
@@ -515,6 +674,43 @@ test("verified Host target receipt persists across verifier process restart and 
     }),
     /missing or already consumed/
   );
+});
+
+test("restart converts persisted in-flight wake into RESULT_UNKNOWN without a second submit", async () => {
+  const root = mkdtempSync(join(tmpdir(), "lab-host-inflight-restart-"));
+  const reentryState = join(root, "reentry.json");
+  const { verified, time } = verifiedFixture();
+  let releaseSubmit;
+  const submitGate = new Promise((resolve) => { releaseSubmit = resolve; });
+  const firstDriver = new Driver(observation(time.now()));
+  firstDriver.submitContinuation = async function (input) {
+    this.submitted.push(input);
+    await submitGate;
+    const error = new Error("simulated old process termination");
+    error.dispatch_attempted = true;
+    throw error;
+  };
+  const input = {
+    verified_target: verified,
+    wake_id: "wake-inflight-restart",
+    wake_nonce: "nonce-inflight",
+    continuation_payload: "resume",
+    expected_target_generation: 4,
+    expected_ownership_generation: 8
+  };
+  const first = new WebReentryAdapter(SECRET, firstDriver, { clock: time.now, statePath: reentryState }).reenter(input);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const restartedDriver = new Driver(observation(time.now()));
+  const restarted = new WebReentryAdapter(SECRET, restartedDriver, { clock: time.now, statePath: reentryState });
+  const recovered = await restarted.reenter(input);
+  assert.equal(recovered.result_class, "RESULT_UNKNOWN");
+  assert.equal(recovered.dispatch_attempted, true);
+  assert.equal(recovered.auto_retry_allowed, false);
+  assert.equal(restartedDriver.submitted.length, 0);
+
+  releaseSubmit();
+  await first;
 });
 
 test("supervisor restart preserves consumed challenge and wake anti-replay state", async () => {
@@ -624,7 +820,10 @@ test("signed re-entry receipt carries structured submit diagnostics without prom
   });
   const verifiedReceipt = verifyReentryReceipt(SECRET, receipt, {
     wake_id: "wake-diag",
+    wake_nonce: "nonce-diag",
+    continuation_payload: "sensitive continuation body",
     conversation_id: CONVERSATION,
+    browser_target_id: "browser-target-7",
     target_generation: 4,
     ownership_generation: 8
   });
