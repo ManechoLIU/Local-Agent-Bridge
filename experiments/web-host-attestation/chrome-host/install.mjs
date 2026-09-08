@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -17,6 +17,14 @@ import { extensionIdFromManifestKey } from "./extension-id.mjs";
 const HOST_NAME = "com.local_agent_bridge.web_host";
 const EXTENSION_ID_RE = /^[a-p]{32}$/;
 const EXTENSION_MANIFEST_PATH = fileURLToPath(new URL("./extension/manifest.json", import.meta.url));
+const RUNTIME_VERIFIER_PATH = fileURLToPath(new URL("./runtime-verifier-cli.mjs", import.meta.url));
+const RUNTIME_VERIFIER_BUNDLE_PATHS = Object.freeze([
+  RUNTIME_VERIFIER_PATH,
+  fileURLToPath(new URL("./integration.mjs", import.meta.url)),
+  fileURLToPath(new URL("./client.mjs", import.meta.url)),
+  fileURLToPath(new URL("../provider.mjs", import.meta.url)),
+  fileURLToPath(new URL("../attestation.mjs", import.meta.url))
+]);
 
 const BROWSER_MANIFEST_ROOTS = Object.freeze({
   chrome: ["Library", "Application Support", "Google", "Chrome", "NativeMessagingHosts"],
@@ -59,6 +67,50 @@ function atomicJson(path, value) {
   chmodSync(path, 0o600);
 }
 
+function sha256File(path) {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function validateOwnedRegularFile(path, executable) {
+  if (!isAbsolute(path)) throw new Error("Runtime verifier bundle path must be absolute");
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Runtime verifier bundle member must be a regular non-symlink file");
+  const uid = currentUid();
+  if (uid != null && stat.uid !== uid) throw new Error("Runtime verifier bundle member owner mismatch");
+  if (executable && (stat.mode & 0o111) === 0) throw new Error("Runtime verifier executable must be executable");
+}
+
+function installRuntimeVerifierRegistration(homeDir, verifierPath, bundlePaths) {
+  const executable = String(verifierPath || RUNTIME_VERIFIER_PATH);
+  const members = Array.from(new Set((bundlePaths || RUNTIME_VERIFIER_BUNDLE_PATHS).map(String)));
+  if (!members.includes(executable)) throw new Error("Runtime verifier bundle must include executable");
+  if (members.length > 64) throw new Error("Runtime verifier bundle is too large");
+  const bundle = {};
+  for (const member of members) {
+    validateOwnedRegularFile(member, member === executable);
+    bundle[member] = sha256File(member);
+  }
+  const configDir = join(homeDir, ".codex");
+  ensureDirectory(configDir, 0o700, true);
+  const configPath = join(configDir, "adaptive-delivery-host-attestation-verifiers.json");
+  let config = { schema_version: 1, verifiers: {} };
+  if (existsSync(configPath)) {
+    validatePrivateFile(configPath, 2);
+    config = JSON.parse(readFileSync(configPath, "utf8"));
+    if (!config || config.schema_version !== 1 || typeof config.verifiers !== "object" || Array.isArray(config.verifiers)) {
+      throw new Error("existing Runtime Host verifier config is invalid");
+    }
+  }
+  config.verifiers.web = {
+    protocol: "runtime_host_verifier_cli_v1",
+    executable: executable,
+    sha256: bundle[executable],
+    bundle_sha256: bundle
+  };
+  atomicJson(configPath, config);
+  return configPath;
+}
+
 function manifestExtensionId() {
   const manifest = JSON.parse(readFileSync(EXTENSION_MANIFEST_PATH, "utf8"));
   return extensionIdFromManifestKey(manifest.key);
@@ -76,6 +128,9 @@ export function installChromeNativeHost(options) {
     : null;
   const hostScriptPath = options && options.hostScriptPath ||
     fileURLToPath(new URL("./native-host.mjs", import.meta.url));
+  const registerRuntimeVerifier = options && options.registerRuntimeVerifier === true;
+  const runtimeVerifierPath = options && options.runtimeVerifierPath || RUNTIME_VERIFIER_PATH;
+  const runtimeVerifierBundlePaths = options && options.runtimeVerifierBundlePaths || RUNTIME_VERIFIER_BUNDLE_PATHS;
 
   if (!EXTENSION_ID_RE.test(extensionId)) throw new Error("extension id must be 32 lowercase a-p characters");
   if (extensionId !== DEFAULT_EXTENSION_ID) {
@@ -124,6 +179,10 @@ export function installChromeNativeHost(options) {
     ]
   });
 
+  const runtimeVerifierConfigPath = registerRuntimeVerifier
+    ? installRuntimeVerifierRegistration(homeDir, runtimeVerifierPath, runtimeVerifierBundlePaths)
+    : null;
+
   return Object.freeze({
     browser: browser,
     extension_id: extensionId,
@@ -132,6 +191,7 @@ export function installChromeNativeHost(options) {
     browser_user_data_dir: userDataDir,
     key_path: keyPath,
     socket_path: join(stateRoot, "host.sock"),
+    runtime_verifier_config_path: runtimeVerifierConfigPath,
     key_created: keyCreated
   });
 }
@@ -149,6 +209,8 @@ function parseCli(argv) {
     } else if (value === "--user-data-dir") {
       args.userDataDir = argv[index + 1];
       index += 1;
+    } else if (value === "--register-runtime-verifier") {
+      args.registerRuntimeVerifier = true;
     } else {
       throw new Error("unsupported installer argument: " + value);
     }

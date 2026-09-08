@@ -104,3 +104,23 @@ test("installer rejects wildcard-like malformed or manifest-mismatched extension
     });
   }, /does not match the manifest public key/);
 });
+
+
+test("installer optionally registers a pinned complete Runtime verifier bundle", function (t) {
+  const home = mkdtempSync(join(tmpdir(), "lab-host-runtime-verifier-"));
+  t.after(function () { rmSync(home, { recursive: true, force: true }); });
+  const result = installChromeNativeHost({
+    browser: "chrome", homeDir: home, hostScriptPath: HOST_SCRIPT, registerRuntimeVerifier: true
+  });
+  const configPath = join(home, ".codex", "adaptive-delivery-host-attestation-verifiers.json");
+  assert.equal(result.runtime_verifier_config_path, configPath);
+  assert.equal(statSync(configPath).mode & 0o777, 0o600);
+  assert.equal(statSync(join(home, ".codex")).mode & 0o777, 0o700);
+  const config = JSON.parse(readFileSync(configPath, "utf8"));
+  const record = config.verifiers.web;
+  assert.equal(record.protocol, "runtime_host_verifier_cli_v1");
+  assert.equal(record.executable.endsWith("/runtime-verifier-cli.mjs"), true);
+  assert.equal(record.sha256, record.bundle_sha256[record.executable]);
+  assert.equal(Object.keys(record.bundle_sha256).length, 5);
+  for (const digest of Object.values(record.bundle_sha256)) assert.match(digest, /^[0-9a-f]{64}$/);
+});
