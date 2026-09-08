@@ -83,7 +83,9 @@ test("Runtime-facing Chrome integration issues challenge obtains Host attestatio
     "requestAttestation",
     "verifyAttestation",
     "attestAndVerify",
-    "submitReentry"
+    "consumeVerifiedTarget",
+    "submitReentry",
+    "submitAndVerifyReentry"
   ]);
 
   const issued = integration.issueChallenge({
@@ -161,6 +163,84 @@ test("Runtime verifier command boundary returns only machine-verifiable attestat
       ownership_generation: 13
     }
   });
+});
+
+test("Runtime verifier command boundary submits only by one-time Host receipt reference", async function () {
+  const module = await import("./integration.mjs");
+  const calls = [];
+  const result = await module.executeRuntimeVerifierCommand({
+    operation: "submit_reentry",
+    conversation_id: CONVERSATION,
+    host_receipt_id: "hr_runtime_submit",
+    expected_target_generation: 14,
+    expected_ownership_generation: 15,
+    wake_id: "wake-runtime-submit",
+    wake_nonce: "nonce-runtime-submit",
+    continuation_payload: "continue the existing controller"
+  }, {
+    integration: {
+      async submitAndVerifyReentry(input) {
+        calls.push(input);
+        return {
+          provenance: "browser_host_reentry_receipt_v1",
+          wake_id: input.wake_id,
+          conversation_id: CONVERSATION,
+          target_generation: 14,
+          ownership_generation: 15,
+          dispatch_attempted: true,
+          submit_confirmed: true,
+          retryable: false,
+          auto_retry_allowed: false,
+          result_class: "SUBMIT_CONFIRMED",
+          status: "submit_confirmed",
+          receipt_id: "wr_runtime_submit"
+        };
+      }
+    }
+  });
+  assert.deepEqual(calls, [{
+    host_receipt_id: "hr_runtime_submit",
+    conversation_id: CONVERSATION,
+    wake_id: "wake-runtime-submit",
+    wake_nonce: "nonce-runtime-submit",
+    continuation_payload: "continue the existing controller",
+    expected_target_generation: 14,
+    expected_ownership_generation: 15
+  }]);
+  assert.equal(result.ok, true);
+  assert.equal(result.operation, "submit_reentry");
+  assert.equal(result.reentry_receipt.result_class, "SUBMIT_CONFIRMED");
+});
+
+test("Runtime verifier command boundary rejects caller-supplied verified target shortcut", async function () {
+  const module = await import("./integration.mjs");
+  let called = false;
+  await assert.rejects(
+    module.executeRuntimeVerifierCommand({
+      operation: "submit_reentry",
+      conversation_id: CONVERSATION,
+      verified_target: {
+        provenance: "runtime_host_verifier_v1",
+        conversation_id: CONVERSATION,
+        target_generation: 14,
+        ownership_generation: 15
+      },
+      expected_target_generation: 14,
+      expected_ownership_generation: 15,
+      wake_id: "wake-stale",
+      wake_nonce: "nonce-stale",
+      continuation_payload: "continue"
+    }, {
+      integration: {
+        async submitAndVerifyReentry() {
+          called = true;
+          return {};
+        }
+      }
+    }),
+    /host_receipt_id is required/
+  );
+  assert.equal(called, false);
 });
 
 test("Runtime verifier command boundary rejects caller-supplied attestation shortcuts", async function () {

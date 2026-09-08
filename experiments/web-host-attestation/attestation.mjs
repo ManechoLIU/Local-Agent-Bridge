@@ -125,12 +125,13 @@ function loadPrivateState(path) {
 }
 
 export class RuntimeHostVerifier {
-  constructor(secret, { clock = Date.now, challengeTtlMs = 30_000, attestationSkewMs = 5_000, statePath = null } = {}) {
+  constructor(secret, { clock = Date.now, challengeTtlMs = 30_000, attestationSkewMs = 5_000, verifiedTargetTtlMs = 30_000, statePath = null } = {}) {
     if (!secret || Buffer.byteLength(secret) < 32) throw new Error("verifier secret must be at least 32 bytes");
     this.secret = secret;
     this.clock = clock;
     this.challengeTtlMs = challengeTtlMs;
     this.attestationSkewMs = attestationSkewMs;
+    this.verifiedTargetTtlMs = verifiedTargetTtlMs;
     this.statePath = statePath;
     const persisted = loadPrivateState(statePath);
     this.challenges = new Map(
@@ -139,13 +140,17 @@ export class RuntimeHostVerifier {
         : []
     );
     this.usedAttestationReceipts = new Set(persisted?.used_attestation_receipts ?? []);
+    this.verifiedTargets = new Map(
+      Array.isArray(persisted?.verified_targets) ? persisted.verified_targets : []
+    );
   }
 
   #persist() {
     savePrivateState(this.statePath, {
       schema_version: 1,
       challenges: [...this.challenges.entries()],
-      used_attestation_receipts: [...this.usedAttestationReceipts]
+      used_attestation_receipts: [...this.usedAttestationReceipts],
+      verified_targets: [...this.verifiedTargets.entries()]
     });
   }
 
@@ -209,7 +214,6 @@ export class RuntimeHostVerifier {
 
     challengeRecord.consumed = true;
     this.usedAttestationReceipts.add(attestation.host_receipt_id);
-    this.#persist();
     const verified = {
       schema_version: 1,
       verified_target_id: `vt_${randomUUID()}`,
@@ -225,7 +229,33 @@ export class RuntimeHostVerifier {
       verified_at_ms: now,
       provenance: VERIFIED_TARGET_PROVENANCE
     };
+    this.verifiedTargets.set(attestation.host_receipt_id, verified);
+    this.#persist();
     return verified;
+  }
+
+  consumeVerifiedTarget(hostReceiptId, expected = {}) {
+    const receiptId = nonEmpty(hostReceiptId, "host_receipt_id");
+    const verified = this.verifiedTargets.get(receiptId);
+    if (!verified) throw new Error("verified Host target receipt is missing or already consumed");
+    const now = nowMs(this.clock);
+    if (now - Number(verified.verified_at_ms) > this.verifiedTargetTtlMs) {
+      this.verifiedTargets.delete(receiptId);
+      this.#persist();
+      throw new Error("verified Host target receipt expired");
+    }
+    if (expected.conversation_id && verified.conversation_id !== expected.conversation_id) {
+      throw new Error("verified Host target conversation mismatch");
+    }
+    if (expected.target_generation && verified.target_generation !== expected.target_generation) {
+      throw new Error("verified Host target generation mismatch");
+    }
+    if (expected.ownership_generation && verified.ownership_generation !== expected.ownership_generation) {
+      throw new Error("verified Host target ownership generation mismatch");
+    }
+    this.verifiedTargets.delete(receiptId);
+    this.#persist();
+    return structuredClone(verified);
   }
 }
 

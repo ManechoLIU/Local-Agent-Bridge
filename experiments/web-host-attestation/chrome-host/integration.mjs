@@ -1,4 +1,5 @@
 import { createRuntimeHostProvider } from "../provider.mjs";
+import { verifyReentryReceipt } from "../attestation.mjs";
 import { createChromeHostDriver } from "./client.mjs";
 
 export function createChromeRuntimeHostIntegration(options) {
@@ -29,7 +30,9 @@ export function createChromeRuntimeHostIntegration(options) {
       "requestAttestation",
       "verifyAttestation",
       "attestAndVerify",
-      "submitReentry"
+      "consumeVerifiedTarget",
+      "submitReentry",
+      "submitAndVerifyReentry"
     ]),
 
     issueChallenge(input) {
@@ -55,8 +58,34 @@ export function createChromeRuntimeHostIntegration(options) {
       });
     },
 
+    consumeVerifiedTarget(hostReceiptId, expected) {
+      return provider.consumeVerifiedTarget(hostReceiptId, expected);
+    },
+
     async submitReentry(input) {
       return await provider.submitReentry(input);
+    },
+
+    async submitAndVerifyReentry(input) {
+      const verifiedTarget = provider.consumeVerifiedTarget(input && input.host_receipt_id, {
+        conversation_id: input && input.conversation_id,
+        target_generation: input && input.expected_target_generation,
+        ownership_generation: input && input.expected_ownership_generation
+      });
+      const receipt = await provider.submitReentry({
+        verified_target: verifiedTarget,
+        wake_id: input && input.wake_id,
+        wake_nonce: input && input.wake_nonce,
+        continuation_payload: input && input.continuation_payload,
+        expected_target_generation: input && input.expected_target_generation,
+        expected_ownership_generation: input && input.expected_ownership_generation
+      });
+      return verifyReentryReceipt(secret, receipt, {
+        wake_id: input && input.wake_id,
+        conversation_id: input && input.conversation_id,
+        target_generation: input && input.expected_target_generation,
+        ownership_generation: input && input.expected_ownership_generation
+      });
     }
   });
 }
@@ -76,33 +105,71 @@ function requiredRuntimeGeneration(value, name) {
 
 export async function executeRuntimeVerifierCommand(input, options) {
   const operation = requiredRuntimeText(input && input.operation, "operation", 64);
-  if (operation !== "attest_and_verify") {
+  if (operation !== "attest_and_verify" && operation !== "submit_reentry") {
     throw new Error("unsupported Runtime Host operation: " + operation);
   }
   const integration = options && options.integration;
-  if (!integration || typeof integration.attestAndVerify !== "function") {
+  if (!integration) {
     throw new Error("Runtime Host integration is required");
   }
-  const request = {
-    conversation_id: requiredRuntimeText(input && input.conversation_id, "conversation_id", 128),
-    target_generation: requiredRuntimeGeneration(input && input.target_generation, "target_generation"),
-    ownership_generation: requiredRuntimeGeneration(input && input.ownership_generation, "ownership_generation")
-  };
-  const result = await integration.attestAndVerify(request);
-  const verified = result && result.verified_target;
-  if (!verified || verified.provenance !== "runtime_host_verifier_v1") {
-    throw new Error("Runtime Host verifier did not return a trusted verified target");
+
+  if (operation === "attest_and_verify") {
+    if (typeof integration.attestAndVerify !== "function") {
+      throw new Error("Runtime Host attestation integration is required");
+    }
+    const request = {
+      conversation_id: requiredRuntimeText(input && input.conversation_id, "conversation_id", 128),
+      target_generation: requiredRuntimeGeneration(input && input.target_generation, "target_generation"),
+      ownership_generation: requiredRuntimeGeneration(input && input.ownership_generation, "ownership_generation")
+    };
+    const result = await integration.attestAndVerify(request);
+    const verified = result && result.verified_target;
+    if (!verified || verified.provenance !== "runtime_host_verifier_v1") {
+      throw new Error("Runtime Host verifier did not return a trusted verified target");
+    }
+    if (verified.conversation_id !== request.conversation_id ||
+        verified.target_generation !== request.target_generation ||
+        verified.ownership_generation !== request.ownership_generation) {
+      throw new Error("Runtime Host verified target does not match requested ownership fence");
+    }
+    return Object.freeze({
+      ok: true,
+      operation: operation,
+      challenge_id: requiredRuntimeText(result.challenge_id, "challenge_id", 256),
+      host_receipt_id: requiredRuntimeText(result.host_receipt_id, "host_receipt_id", 256),
+      verified_target: verified
+    });
   }
-  if (verified.conversation_id !== request.conversation_id ||
-      verified.target_generation !== request.target_generation ||
-      verified.ownership_generation !== request.ownership_generation) {
-    throw new Error("Runtime Host verified target does not match requested ownership fence");
+
+  if (operation === "submit_reentry") {
+    if (typeof integration.submitAndVerifyReentry !== "function") {
+      throw new Error("Runtime Host re-entry integration is required");
+    }
+    const expectedTargetGeneration = requiredRuntimeGeneration(
+      input && input.expected_target_generation, "expected_target_generation"
+    );
+    const expectedOwnershipGeneration = requiredRuntimeGeneration(
+      input && input.expected_ownership_generation, "expected_ownership_generation"
+    );
+    const conversationId = requiredRuntimeText(
+      input && input.conversation_id, "conversation_id", 128
+    );
+    const request = {
+      host_receipt_id: requiredRuntimeText(input && input.host_receipt_id, "host_receipt_id", 256),
+      conversation_id: conversationId,
+      wake_id: requiredRuntimeText(input && input.wake_id, "wake_id", 256),
+      wake_nonce: requiredRuntimeText(input && input.wake_nonce, "wake_nonce", 256),
+      continuation_payload: requiredRuntimeText(
+        input && input.continuation_payload, "continuation_payload", 8000
+      ),
+      expected_target_generation: expectedTargetGeneration,
+      expected_ownership_generation: expectedOwnershipGeneration
+    };
+    const receipt = await integration.submitAndVerifyReentry(request);
+    return Object.freeze({
+      ok: true,
+      operation: operation,
+      reentry_receipt: receipt
+    });
   }
-  return Object.freeze({
-    ok: true,
-    operation: operation,
-    challenge_id: requiredRuntimeText(result.challenge_id, "challenge_id", 256),
-    host_receipt_id: requiredRuntimeText(result.host_receipt_id, "host_receipt_id", 256),
-    verified_target: verified
-  });
 }

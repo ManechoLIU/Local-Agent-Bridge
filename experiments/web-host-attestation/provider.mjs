@@ -15,6 +15,9 @@ export function createRuntimeHostProvider({ secret, driver, clock = Date.now, ve
     verifyAttestation(attestation, expected) {
       return verifier.verifyAndConsume(attestation, expected);
     },
+    consumeVerifiedTarget(hostReceiptId, expected) {
+      return verifier.consumeVerifiedTarget(hostReceiptId, expected);
+    },
     async submitReentry(input) {
       return reentry.reenter(input);
     }

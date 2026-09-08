@@ -356,6 +356,47 @@ test("receipt verifier rejects authenticated contradictory result state", async 
   );
 });
 
+test("verified Host target receipt persists across verifier process restart and is one-shot", () => {
+  const root = mkdtempSync(join(tmpdir(), "lab-host-verified-target-"));
+  const verifierState = join(root, "verifier.json");
+  const time = clock();
+  const verifier = new RuntimeHostVerifier(SECRET, { clock: time.now, statePath: verifierState });
+  const challenge = verifier.issueChallenge({
+    conversation_id: CONVERSATION,
+    target_generation: 5,
+    ownership_generation: 9
+  });
+  time.add(100);
+  const attestation = signHostAttestation({
+    secret: SECRET,
+    challenge,
+    observation: observation(time.now()),
+    clock: time.now
+  });
+  const verified = verifier.verifyAndConsume(attestation, {
+    conversation_id: CONVERSATION,
+    target_generation: 5,
+    ownership_generation: 9
+  });
+  const restarted = new RuntimeHostVerifier(SECRET, { clock: time.now, statePath: verifierState });
+  assert.deepEqual(
+    restarted.consumeVerifiedTarget(attestation.host_receipt_id, {
+      conversation_id: CONVERSATION,
+      target_generation: 5,
+      ownership_generation: 9
+    }),
+    verified
+  );
+  assert.throws(
+    () => restarted.consumeVerifiedTarget(attestation.host_receipt_id, {
+      conversation_id: CONVERSATION,
+      target_generation: 5,
+      ownership_generation: 9
+    }),
+    /missing or already consumed/
+  );
+});
+
 test("supervisor restart preserves consumed challenge and wake anti-replay state", async () => {
   const root = mkdtempSync(join(tmpdir(), "lab-host-attestation-"));
   const verifierState = join(root, "verifier.json");

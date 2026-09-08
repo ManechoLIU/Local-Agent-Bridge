@@ -30,14 +30,17 @@ async function readOneJsonLine() {
 
 async function main() {
   const input = await readOneJsonLine();
+  const operation = String(input?.operation || "").trim();
   let integration = null;
-  if (String(input?.operation || "").trim() === "attest_and_verify") {
+  if (operation === "attest_and_verify" || operation === "submit_reentry") {
     const root = join(homedir(), ".local-agent-bridge", "web-host");
     const keyPath = process.env.LAB_HOST_ATTESTATION_KEY_FILE || join(root, "attestation.key");
     const socketPath = process.env.LAB_HOST_ADAPTER_SOCKET || join(root, "host.sock");
     integration = createChromeRuntimeHostIntegration({
       secret: readPrivateKey(keyPath),
-      socketPath
+      socketPath,
+      verifierStatePath: process.env.LAB_HOST_VERIFIER_STATE_FILE || join(root, "runtime-verifier-state.json"),
+      reentryStatePath: process.env.LAB_HOST_REENTRY_STATE_FILE || join(root, "runtime-reentry-state.json")
     });
   }
   return await executeRuntimeVerifierCommand(input, { integration });
