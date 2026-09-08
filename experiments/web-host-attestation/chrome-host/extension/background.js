@@ -4,9 +4,9 @@ import {
   selectUniqueConversationTarget
 } from "./observation.js";
 import { submitContinuationThroughChrome } from "./browser-submit.js";
+import { withDebuggerSession } from "./debugger-session.js";
 
 const NATIVE_HOST = "com.local_agent_bridge.web_host";
-const CDP_VERSION = "1.3";
 
 function setNativeDiagnostic(state, error, details) {
   globalThis.__LAB_HOST_NATIVE_STATE = Object.freeze({
@@ -43,30 +43,24 @@ async function allTargets() {
 }
 
 async function withDebugger(target, callback) {
-  if (!Number.isInteger(target.tabId)) throw new Error("debugger target has no tabId");
-  const debuggee = { tabId: target.tabId };
-  await chrome.debugger.attach(debuggee, CDP_VERSION);
-  try {
-    const targetResult = await chrome.debugger.sendCommand(debuggee, "Target.getTargetInfo", {});
-    const frameTree = await chrome.debugger.sendCommand(debuggee, "Page.getFrameTree", {});
-    const cdpInfo = targetResult && targetResult.targetInfo;
-    const cdpTargetId = cdpInfo && (cdpInfo.targetId || cdpInfo.id);
-    if (!cdpInfo || cdpTargetId !== target.id) {
-      throw new Error("attached debugger target identity changed");
+  return await withDebuggerSession({
+    chromeApi: chrome,
+    target: target,
+    callback: async function (targetResult, frameTree) {
+      const cdpInfo = targetResult && targetResult.targetInfo;
+      const cdpTargetId = cdpInfo && (cdpInfo.targetId || cdpInfo.id);
+      if (!cdpInfo || cdpTargetId !== target.id) {
+        throw new Error("attached debugger target identity changed");
+      }
+      const normalizedTarget = {
+        id: target.id,
+        tabId: target.tabId,
+        type: cdpInfo.type,
+        url: cdpInfo.url
+      };
+      return await callback(normalizedTarget, frameTree);
     }
-    const normalizedTarget = {
-      id: target.id,
-      tabId: target.tabId,
-      type: cdpInfo.type,
-      url: cdpInfo.url
-    };
-    return await callback(normalizedTarget, frameTree);
-  } finally {
-    try {
-      await chrome.debugger.detach(debuggee);
-    } catch {
-    }
-  }
+  });
 }
 
 async function observeConversation(conversationId) {

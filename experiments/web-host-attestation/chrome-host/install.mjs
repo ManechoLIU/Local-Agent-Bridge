@@ -23,7 +23,16 @@ const RUNTIME_VERIFIER_BUNDLE_PATHS = Object.freeze([
   fileURLToPath(new URL("./integration.mjs", import.meta.url)),
   fileURLToPath(new URL("./client.mjs", import.meta.url)),
   fileURLToPath(new URL("../provider.mjs", import.meta.url)),
-  fileURLToPath(new URL("../attestation.mjs", import.meta.url))
+  fileURLToPath(new URL("../attestation.mjs", import.meta.url)),
+  fileURLToPath(new URL("./native-host.mjs", import.meta.url)),
+  fileURLToPath(new URL("./native-host-core.mjs", import.meta.url)),
+  fileURLToPath(new URL("./native-framing.mjs", import.meta.url)),
+  fileURLToPath(new URL("./extension/manifest.json", import.meta.url)),
+  fileURLToPath(new URL("./extension/background.js", import.meta.url)),
+  fileURLToPath(new URL("./extension/debugger-session.js", import.meta.url)),
+  fileURLToPath(new URL("./extension/observation.js", import.meta.url)),
+  fileURLToPath(new URL("./extension/browser-submit.js", import.meta.url)),
+  fileURLToPath(new URL("./extension/submit-page.js", import.meta.url))
 ]);
 
 const BROWSER_MANIFEST_ROOTS = Object.freeze({

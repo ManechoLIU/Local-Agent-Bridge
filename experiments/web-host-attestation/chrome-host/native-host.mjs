@@ -81,7 +81,7 @@ function sendBrowserCommand(message) {
     const timeout = setTimeout(function () {
       pendingBrowser.delete(requestId);
       reject(new Error("browser machine command timed out"));
-    }, 5000);
+    }, 4000);
     pendingBrowser.set(requestId, {
       resolve: resolve,
       reject: reject,
