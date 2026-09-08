@@ -73,7 +73,7 @@ export function createNativeHostHandler(options) {
     const op = requiredText(request.op, "op", 64);
 
     if (op === "health") {
-      return { status: "ready", interface_version: 1, submit_implemented: false };
+      return { status: "ready", interface_version: 1, submit_implemented: true, submit_live_validated: false };
     }
 
     if (op === "attest") {

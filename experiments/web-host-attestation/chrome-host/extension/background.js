@@ -3,6 +3,7 @@ import {
   selectExactTarget,
   selectUniqueConversationTarget
 } from "./observation.js";
+import { submitContinuationThroughChrome } from "./browser-submit.js";
 
 const NATIVE_HOST = "com.local_agent_bridge.web_host";
 const CDP_VERSION = "1.3";
@@ -89,13 +90,12 @@ async function handleCommand(message) {
     return await focusTarget(message.browser_target_id);
   }
   if (op === "submit_continuation") {
-    return {
-      dispatch_attempted: false,
-      submit_confirmed: false,
-      retryable: false,
-      status: "submit_not_implemented",
-      host_submit_receipt: null
-    };
+    return await submitContinuationThroughChrome({
+      chromeApi: chrome,
+      getTargets: allTargets,
+      observeTarget: observeTarget,
+      message: message
+    });
   }
   throw new Error("unsupported browser command: " + op);
 }

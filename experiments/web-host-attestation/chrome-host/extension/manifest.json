@@ -5,7 +5,8 @@
   "description": "Machine-boundary ChatGPT Web target observation for Local Agent Bridge.",
   "permissions": [
     "debugger",
-    "nativeMessaging"
+    "nativeMessaging",
+    "scripting"
   ],
   "host_permissions": [
     "https://chatgpt.com/*"

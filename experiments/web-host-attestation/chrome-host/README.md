@@ -52,13 +52,19 @@ Implemented:
 - exact target focus followed by fresh machine re-observation;
 - bounded Native Messaging and Runtime socket protocols.
 
-Not yet implemented:
+Implemented in code but not yet Live-validated:
 
-- real submit_continuation into ChatGPT Web.
+- provider-specific submit_continuation into the exact ChatGPT Web target.
 
-The extension deliberately returns dispatch_attempted=false,
-submit_confirmed=false, status=submit_not_implemented. This is not a Live-E2E
-PASS and must not close LAB-HOST-01 or unblock LAB-GOV-02.
+The submit path rechecks the exact CDP target/conversation immediately before
+page action, refuses to overwrite a non-empty user composer, injects only into
+the already-verified tab, and treats any post-click uncertainty as
+dispatch_attempted=true / submit_confirmed=false / retryable=false. DOM state is
+used only for delivery action and confirmation, never as Host identity evidence.
+
+Until the unpacked extension is installed and exercised against a real ChatGPT
+Web conversation, health reports submit_live_validated=false. This is not a
+Live-E2E PASS and must not close LAB-HOST-01 or unblock LAB-GOV-02.
 
 AI-Bridge is not a product runtime dependency of this candidate.
 
