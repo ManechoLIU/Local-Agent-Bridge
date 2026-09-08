@@ -20,7 +20,7 @@ import {
   encodeNativeMessage,
   MAX_NATIVE_FRAME_BYTES
 } from "./native-framing.mjs";
-import { BROWSER_MACHINE_COMMAND_TIMEOUT_MS } from "./timeout-budget.mjs";
+import { BROWSER_MACHINE_COMMAND_TIMEOUT_MS } from "./extension/timeout-budget.js";
 
 const defaultRoot = join(homedir(), ".local-agent-bridge", "web-host");
 const socketPath = process.env.LAB_HOST_ADAPTER_SOCKET || join(defaultRoot, "host.sock");

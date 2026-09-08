@@ -1,6 +1,6 @@
 import net from "node:net";
 import { randomUUID } from "node:crypto";
-import { RUNTIME_HOST_REQUEST_TIMEOUT_MS } from "./timeout-budget.mjs";
+import { RUNTIME_HOST_REQUEST_TIMEOUT_MS } from "./extension/timeout-budget.js";
 
 const MAX_RESPONSE_BYTES = 128 * 1024;
 

@@ -4,7 +4,7 @@ import {
   SUBMIT_CONFIRM_TIMEOUT_MS,
   BROWSER_MACHINE_COMMAND_TIMEOUT_MS,
   RUNTIME_HOST_REQUEST_TIMEOUT_MS
-} from "./timeout-budget.mjs";
+} from "./extension/timeout-budget.js";
 
 test("Host timeout budget leaves bounded headroom around Web submit confirmation", function () {
   assert.equal(SUBMIT_CONFIRM_TIMEOUT_MS, 5000);

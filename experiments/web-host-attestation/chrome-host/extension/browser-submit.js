@@ -1,6 +1,6 @@
 import { conversationIdFromChatgptUrl, selectExactTarget } from "./observation.js";
 import { pageSubmitOperationFunction } from "./submit-page.js";
-import { SUBMIT_CONFIRM_TIMEOUT_MS } from "../timeout-budget.mjs";
+import { SUBMIT_CONFIRM_TIMEOUT_MS } from "./timeout-budget.js";
 
 function requiredText(value, name, max) {
   const limit = max == null ? 8192 : max;

@@ -1,7 +1,7 @@
 import { createRuntimeHostProvider } from "../provider.mjs";
 import { verifyReentryReceipt } from "../attestation.mjs";
 import { createChromeHostDriver } from "./client.mjs";
-import { RUNTIME_HOST_REQUEST_TIMEOUT_MS } from "./timeout-budget.mjs";
+import { RUNTIME_HOST_REQUEST_TIMEOUT_MS } from "./extension/timeout-budget.js";
 
 export function createChromeRuntimeHostIntegration(options) {
   const secret = options && options.secret;
