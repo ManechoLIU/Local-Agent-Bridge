@@ -121,7 +121,7 @@ test("installer optionally registers a pinned complete Runtime verifier bundle",
   assert.equal(record.protocol, "runtime_host_verifier_cli_v1");
   assert.equal(record.executable.endsWith("/runtime-verifier-cli.mjs"), true);
   assert.equal(record.sha256, record.bundle_sha256[record.executable]);
-  assert.equal(Object.keys(record.bundle_sha256).length, 16);
+  assert.equal(Object.keys(record.bundle_sha256).length, 17);
   for (const digest of Object.values(record.bundle_sha256)) assert.match(digest, /^[0-9a-f]{64}$/);
   const pinnedPaths = Object.keys(record.bundle_sha256);
   for (const suffix of [
@@ -135,7 +135,8 @@ test("installer optionally registers a pinned complete Runtime verifier bundle",
     "/extension/browser-submit.js",
     "/extension/submit-page.js",
     "/extension/submit-journal.js",
-    "/extension/trusted-input.js"
+    "/extension/trusted-input.js",
+    "/extension/submit-transaction-queue.js"
   ]) {
     assert.equal(pinnedPaths.some(function (path) { return path.endsWith(suffix); }), true, suffix);
   }

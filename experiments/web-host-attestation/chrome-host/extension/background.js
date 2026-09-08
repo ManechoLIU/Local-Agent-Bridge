@@ -11,9 +11,11 @@ import {
 } from "./submit-journal.js";
 import { pageSubmitOperationFunction } from "./submit-page.js";
 import { createTrustedInputController } from "./trusted-input.js";
+import { createSubmitTransactionQueue } from "./submit-transaction-queue.js";
 
 const NATIVE_HOST = "com.local_agent_bridge.web_host";
 const submitJournal = createChromeSubmitJournal(chrome);
+const submitTransactions = createSubmitTransactionQueue();
 
 function setNativeDiagnostic(state, error, details) {
   globalThis.__LAB_HOST_NATIVE_STATE = Object.freeze({
@@ -123,7 +125,10 @@ async function recoverStalePreparedSubmissions() {
   });
 }
 
-recoverStalePreparedSubmissions().then(function (results) {
+const startupRecovery = submitTransactions.run(async function () {
+  return await recoverStalePreparedSubmissions();
+});
+startupRecovery.then(function (results) {
   if (results.length > 0) {
     setNativeDiagnostic("connected", null, { recovery: results });
   }
@@ -140,15 +145,17 @@ async function handleCommand(message) {
     return { observation: await observeTarget(message.browser_target_id) };
   }
   if (op === "submit_continuation") {
-    await recoverStalePreparedSubmissions();
-    return await submitContinuationThroughChrome({
-      chromeApi: chrome,
-      getTargets: allTargets,
-      observeTarget,
-      dispatchTrustedClick,
-      rollbackPreparedByHash: rollbackPreparedPayloadByHash,
-      journal: submitJournal,
-      message
+    return await submitTransactions.run(async function () {
+      await recoverStalePreparedSubmissions();
+      return await submitContinuationThroughChrome({
+        chromeApi: chrome,
+        getTargets: allTargets,
+        observeTarget,
+        dispatchTrustedClick,
+        rollbackPreparedByHash: rollbackPreparedPayloadByHash,
+        journal: submitJournal,
+        message
+      });
     });
   }
   throw new Error("unsupported browser command: " + op);
