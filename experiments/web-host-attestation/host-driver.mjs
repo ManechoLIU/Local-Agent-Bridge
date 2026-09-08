@@ -11,6 +11,75 @@ function requiredMethod(boundary, name) {
   return boundary[name].bind(boundary);
 }
 
+function optionalText(value, name) {
+  if (value == null) return null;
+  return requiredText(value, name);
+}
+
+function normalizeSubmitDiagnostics(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const debuggerAttach = input.debugger_attach && typeof input.debugger_attach === "object"
+    ? input.debugger_attach : {};
+  const composer = input.composer_preparation && typeof input.composer_preparation === "object"
+    ? input.composer_preparation : {};
+  const sendControl = input.send_control_resolution && typeof input.send_control_resolution === "object"
+    ? input.send_control_resolution : {};
+  const trusted = input.trusted_dispatch && typeof input.trusted_dispatch === "object"
+    ? input.trusted_dispatch : {};
+  const confirmation = input.confirmation && typeof input.confirmation === "object"
+    ? input.confirmation : {};
+  const foreground = input.foreground && typeof input.foreground === "object"
+    ? input.foreground : {};
+  return Object.freeze({
+    schema_version: 1,
+    wake_id: optionalText(input.wake_id, "submit diagnostics wake_id"),
+    browser_target_id: optionalText(input.browser_target_id, "submit diagnostics browser_target_id"),
+    phase: optionalText(input.phase, "submit diagnostics phase"),
+    debugger_attach: Object.freeze({
+      attempted: debuggerAttach.attempted === true,
+      ok: debuggerAttach.ok === true
+    }),
+    composer_preparation: Object.freeze({
+      attempted: composer.attempted === true,
+      ok: composer.ok === true,
+      status: optionalText(composer.status, "submit diagnostics composer status"),
+      rollback_attempted: composer.rollback_attempted === true,
+      rollback_succeeded: composer.rollback_succeeded === true
+    }),
+    send_control_resolution: Object.freeze({
+      attempted: sendControl.attempted === true,
+      ok: sendControl.ok === true,
+      selector_kind: optionalText(sendControl.selector_kind, "submit diagnostics selector_kind"),
+      coordinates_changed_since_prepare: sendControl.coordinates_changed_since_prepare === true
+    }),
+    trusted_dispatch: Object.freeze({
+      attempted: trusted.attempted === true,
+      focus_emulation: trusted.focus_emulation === true,
+      mouse_moved: trusted.mouse_moved === true,
+      mouse_pressed: trusted.mouse_pressed === true,
+      mouse_released: trusted.mouse_released === true
+    }),
+    confirmation: Object.freeze({
+      attempted: confirmation.attempted === true,
+      ok: confirmation.ok === true,
+      composer_empty: typeof confirmation.composer_empty === "boolean"
+        ? confirmation.composer_empty : null,
+      exact_new_user_message: typeof confirmation.exact_new_user_message === "boolean"
+        ? confirmation.exact_new_user_message : null
+    }),
+    foreground: Object.freeze({
+      mode: optionalText(foreground.mode, "submit diagnostics foreground mode"),
+      activated_target: foreground.activated_target === true,
+      restored_previous_active: foreground.restored_previous_active === true,
+      user_changed_focus: foreground.user_changed_focus === true
+    }),
+    failure_stage: optionalText(input.failure_stage, "submit diagnostics failure_stage"),
+    dispatch_attempted: input.dispatch_attempted === true,
+    submit_confirmed: input.submit_confirmed === true,
+    retryable: input.retryable === true
+  });
+}
+
 function normalizeObservation(raw, requestedTargetId) {
   const observation = raw?.frameTree
     ? machineObservationFromFrameTree({
@@ -60,9 +129,7 @@ export function createHostDriver(machineBoundary) {
         retryable: Boolean(receipt.retryable),
         status: receipt.status == null ? null : requiredText(receipt.status, "submit receipt status"),
         host_submit_receipt: receipt.host_submit_receipt == null ? null : requiredText(receipt.host_submit_receipt, "host_submit_receipt"),
-        submit_diagnostics: receipt.submit_diagnostics && typeof receipt.submit_diagnostics === "object"
-          ? receipt.submit_diagnostics
-          : null
+        submit_diagnostics: normalizeSubmitDiagnostics(receipt.submit_diagnostics)
       };
     }
   });

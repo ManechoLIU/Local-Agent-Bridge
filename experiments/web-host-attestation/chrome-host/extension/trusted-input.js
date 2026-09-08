@@ -76,6 +76,7 @@ export function createTrustedInputController(options) {
           frameTree,
           observedAtMs: Date.now()
         });
+        const initialObservation = observation;
         if (observation.browser_target_id !== browserTargetId ||
             observation.conversation_id !== conversationId) {
           throw trustedDispatchError("trusted click target changed after debugger attach", {
@@ -203,13 +204,94 @@ export function createTrustedInputController(options) {
             }
           }
 
+          let finalDispatchPoint = finalPoint;
+          try {
+            const freshTargetResult = await debuggerSession.sendCommand("Target.getTargetInfo", {});
+            const freshFrameTree = await debuggerSession.sendCommand("Page.getFrameTree", {});
+            const freshTargetInfo = freshTargetResult && freshTargetResult.targetInfo;
+            const freshTargetId = freshTargetInfo && (freshTargetInfo.targetId || freshTargetInfo.id);
+            if (!freshTargetInfo || freshTargetId !== browserTargetId) {
+              throw trustedDispatchError("machine target changed after dispatch journal arm", {
+                dispatch_attempted: false,
+                retryable: false,
+                status: "target_changed_after_dispatch_arm",
+                failure_stage: "dispatch_arm_target_validation",
+                diagnostics
+              });
+            }
+            const freshObservation = observationFromDebugger({
+              targetInfo: {
+                id: browserTargetId,
+                tabId: target.tabId,
+                type: freshTargetInfo.type,
+                url: freshTargetInfo.url
+              },
+              frameTree: freshFrameTree,
+              observedAtMs: Date.now()
+            });
+            if (freshObservation.browser_target_id !== initialObservation.browser_target_id ||
+                freshObservation.conversation_id !== initialObservation.conversation_id ||
+                freshObservation.top_frame_id !== initialObservation.top_frame_id ||
+                freshObservation.loader_id !== initialObservation.loader_id) {
+              throw trustedDispatchError("machine frame changed after dispatch journal arm", {
+                dispatch_attempted: false,
+                retryable: false,
+                status: "target_frame_changed_after_dispatch_arm",
+                failure_stage: "dispatch_arm_target_validation",
+                diagnostics
+              });
+            }
+
+            const finalResolve = await executePageOperation(target.tabId, "resolve_send", {
+              payload,
+              expected_conversation_id: conversationId
+            });
+            if (!finalResolve || finalResolve.resolved !== true || !finalResolve.send_control) {
+              throw trustedDispatchError("send control changed after dispatch journal arm", {
+                dispatch_attempted: false,
+                retryable: false,
+                status: finalResolve && finalResolve.status || "send_control_changed_after_dispatch_arm",
+                failure_stage: "dispatch_arm_send_revalidation",
+                diagnostics
+              });
+            }
+            diagnostics.send_control_resolved = true;
+            diagnostics.coordinates_changed_since_prepare = pointChanged(
+              initialSendControl,
+              finalResolve.send_control
+            );
+            diagnostics.selector_kind = finalResolve.send_control.selector_kind || diagnostics.selector_kind;
+            finalDispatchPoint = {
+              x: Number(finalResolve.send_control.x),
+              y: Number(finalResolve.send_control.y)
+            };
+            if (Math.abs(finalDispatchPoint.x - finalPoint.x) > 0.5 ||
+                Math.abs(finalDispatchPoint.y - finalPoint.y) > 0.5) {
+              await debuggerSession.sendCommand("Input.dispatchMouseEvent", {
+                type: "mouseMoved",
+                x: finalDispatchPoint.x,
+                y: finalDispatchPoint.y,
+                button: "none"
+              });
+            }
+          } catch (error) {
+            if (typeof error?.dispatch_attempted === "boolean") throw error;
+            throw trustedDispatchError("final dispatch revalidation failed", {
+              dispatch_attempted: false,
+              retryable: false,
+              status: "final_dispatch_revalidation_failed",
+              failure_stage: "dispatch_arm_revalidation",
+              diagnostics
+            });
+          }
+
           let dispatchStarted = false;
           try {
             dispatchStarted = true;
             await debuggerSession.sendCommand("Input.dispatchMouseEvent", {
               type: "mousePressed",
-              x: finalPoint.x,
-              y: finalPoint.y,
+              x: finalDispatchPoint.x,
+              y: finalDispatchPoint.y,
               button: "left",
               buttons: 1,
               clickCount: 1
@@ -217,8 +299,8 @@ export function createTrustedInputController(options) {
             diagnostics.mouse_pressed = true;
             await debuggerSession.sendCommand("Input.dispatchMouseEvent", {
               type: "mouseReleased",
-              x: finalPoint.x,
-              y: finalPoint.y,
+              x: finalDispatchPoint.x,
+              y: finalDispatchPoint.y,
               button: "left",
               buttons: 0,
               clickCount: 1

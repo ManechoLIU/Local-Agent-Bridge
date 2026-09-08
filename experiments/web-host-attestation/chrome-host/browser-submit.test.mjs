@@ -194,7 +194,6 @@ test("existing user composer content is never overwritten or deleted", async () 
   assert.equal(f.calls.some(call => call[0] === "rollback"), false);
   assert.equal(f.journal.records.size, 0);
 });
-
 test("trusted click pre-dispatch error rolls back exact Host payload and stays dispatch_attempted=false", async () => {
   const f = fixture({ trustedClickError: preDispatchError() });
   const result = await submitContinuationThroughChrome(f.options);
@@ -223,6 +222,52 @@ test("pre-dispatch error with unprovable rollback becomes non-retryable and reta
   assert.equal(f.journal.records.get("wake-1").phase, "rollback_unconfirmed");
 });
 
+test("partial composer preparation performs exact rollback before returning", async () => {
+  const f = fixture({
+    prepareResult: {
+      prepared: false,
+      ready_to_dispatch: false,
+      dispatch_attempted: false,
+      submit_confirmed: false,
+      retryable: false,
+      status: "composer_preparation_unconfirmed",
+      baseline_user_message_count: 2,
+      initial_send_control: null
+    }
+  });
+  const result = await submitContinuationThroughChrome(f.options);
+  assert.equal(result.status, "composer_preparation_unconfirmed");
+  assert.equal(result.dispatch_attempted, false);
+  assert.equal(result.retryable, false);
+  assert.equal(f.calls.filter(call => call[0] === "rollback").length, 1);
+  assert.equal(f.journal.records.size, 0);
+});
+
+test("partial composer preparation with unprovable ownership retains journal and never retries", async () => {
+  const f = fixture({
+    prepareResult: {
+      prepared: false,
+      ready_to_dispatch: false,
+      dispatch_attempted: false,
+      submit_confirmed: false,
+      retryable: false,
+      status: "composer_preparation_unconfirmed",
+      baseline_user_message_count: 2,
+      initial_send_control: null
+    },
+    rollbackResult: {
+      cleared: false,
+      already_absent: false,
+      status: "composer_hash_mismatch"
+    }
+  });
+  const result = await submitContinuationThroughChrome(f.options);
+  assert.equal(result.status, "rollback_unconfirmed");
+  assert.equal(result.dispatch_attempted, false);
+  assert.equal(result.retryable, false);
+  assert.equal(f.journal.records.get("wake-1").phase, "rollback_unconfirmed");
+});
+
 test("possible dispatch with unknown result never rolls back and remains RESULT_UNKNOWN", async () => {
   const f = fixture({ trustedClickError: uncertainDispatchError() });
   const result = await submitContinuationThroughChrome(f.options);
@@ -245,7 +290,7 @@ test("lost confirmation after trusted dispatch is result unknown and never rolls
   assert.equal(f.calls.some(call => call[0] === "rollback"), false);
 });
 
-test("submit confirmed requires exact new user-message evidence and clears crash journal", async () => {
+test("submit confirmed requires exact new user-message evidence and retains a replay tombstone", async () => {
   const f = fixture();
   const result = await submitContinuationThroughChrome(f.options);
   assert.equal(result.dispatch_attempted, true);
@@ -255,7 +300,9 @@ test("submit confirmed requires exact new user-message evidence and clears crash
   assert.equal(result.submit_diagnostics.confirmation.composer_empty, true);
   assert.equal(result.submit_diagnostics.foreground.mode, "background_focus_emulation");
   assert.equal(result.submit_diagnostics.foreground.activated_target, false);
-  assert.equal(f.journal.records.size, 0);
+  assert.equal(f.journal.records.size, 1);
+  assert.equal(f.journal.records.get("wake-1").phase, "submit_confirmed");
+  assert.equal(f.journal.records.get("wake-1").dispatch_attempted, true);
 });
 
 test("structured Host diagnostics records stages without prompt body", async () => {

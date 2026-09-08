@@ -55,6 +55,25 @@ test("composer write survives Host crash and a restarted journal recovers only b
   assert.equal((await restartedJournal.list()).length, 0);
 });
 
+test("dispatch_armed crash is promoted to RESULT_UNKNOWN without rollback or replay", async () => {
+  const f = storageFixture();
+  const journal = createChromeSubmitJournal(f.chromeApi);
+  await journal.put({ ...RECORD, phase: "dispatch_armed", dispatch_attempted: false });
+  let rollbackCalls = 0;
+  const result = await recoverPreparedSubmitJournals({
+    journal,
+    rollbackPreparedByHash: async () => {
+      rollbackCalls += 1;
+      return { cleared: true };
+    }
+  });
+  assert.equal(rollbackCalls, 0);
+  assert.equal(result[0].reason, "dispatch_armed_crash_result_unknown");
+  const [kept] = await journal.list();
+  assert.equal(kept.phase, "result_unknown");
+  assert.equal(kept.dispatch_attempted, true);
+});
+
 test("journal with possible dispatch is retained and never rolled back", async () => {
   const f = storageFixture();
   const journal = createChromeSubmitJournal(f.chromeApi);

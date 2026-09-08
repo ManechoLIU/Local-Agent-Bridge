@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createTrustedInputController } from "./extension/trusted-input.js";
+import { observationFromDebugger as realObservationFromDebugger } from "./extension/observation.js";
 
 const CONVERSATION = "6a9e4158-cc8c-83ea-9763-05a7fd51f597";
 
@@ -44,6 +45,28 @@ function fixture(overrides = {}) {
           overrides.failCommand(method, params, commands.length)) {
         throw new Error("command failed");
       }
+      if (method === "Target.getTargetInfo") {
+        return {
+          targetInfo: {
+            targetId: overrides.freshTargetId || "target-1",
+            type: "page",
+            url: "https://chatgpt.com/g/g-p-local/c/" +
+              (overrides.freshConversation || CONVERSATION)
+          }
+        };
+      }
+      if (method === "Page.getFrameTree") {
+        return {
+          frameTree: {
+            frame: {
+              id: "frame-1",
+              loaderId: overrides.freshLoaderId || "loader-1",
+              url: "https://chatgpt.com/g/g-p-local/c/" + CONVERSATION,
+              securityOrigin: "https://chatgpt.com"
+            }
+          }
+        };
+      }
       return {};
     }
   };
@@ -56,10 +79,15 @@ function fixture(overrides = {}) {
       if (!found) throw new Error("missing");
       return found;
     },
-    observationFromDebugger: () => ({
-      browser_target_id: overrides.observedTargetId || "target-1",
-      conversation_id: overrides.observedConversation || CONVERSATION
-    }),
+    observationFromDebugger: input => {
+      const observed = realObservationFromDebugger(input);
+      return {
+        ...observed,
+        browser_target_id: overrides.observedTargetId || observed.browser_target_id,
+        conversation_id: overrides.observedConversation || observed.conversation_id,
+        top_frame_id: overrides.freshTopFrameId || observed.top_frame_id
+      };
+    },
     executePageOperation: async (_tabId, operation, input) => {
       pageOps.push([operation, input]);
       if (operation === "resolve_send") {
@@ -88,7 +116,16 @@ function fixture(overrides = {}) {
           type: "page",
           url: "https://chatgpt.com/g/g-p-local/c/" + CONVERSATION
         },
-        { frameTree: { frame: {} } },
+        {
+          frameTree: {
+            frame: {
+              id: "frame-1",
+              loaderId: "loader-1",
+              url: "https://chatgpt.com/g/g-p-local/c/" + CONVERSATION,
+              securityOrigin: "https://chatgpt.com"
+            }
+          }
+        },
         debuggerSession
       );
     }
@@ -135,6 +172,16 @@ test("send control coordinates are re-resolved and old prepare coordinates are n
           x: 160,
           y: 260
         }
+      },
+      {
+        resolved: true,
+        status: "send_control_resolved",
+        send_control: {
+          resolved: true,
+          selector_kind: "testid_send_button",
+          x: 190,
+          y: 290
+        }
       }
     ]
   });
@@ -144,8 +191,8 @@ test("send control coordinates are re-resolved and old prepare coordinates are n
   const pressed = f.commands.find(([method, params]) =>
     method === "Input.dispatchMouseEvent" && params.type === "mousePressed"
   );
-  assert.equal(pressed[1].x, 160);
-  assert.equal(pressed[1].y, 260);
+  assert.equal(pressed[1].x, 190);
+  assert.equal(pressed[1].y, 290);
   assert.equal(
     f.commands.some(([method, params]) =>
       method === "Input.dispatchMouseEvent" &&
@@ -164,6 +211,26 @@ test("target drift after debugger attach fails closed before dispatch", async ()
     error => {
       assert.equal(error.dispatch_attempted, false);
       assert.equal(error.failure_stage, "debugger_target_validation");
+      return true;
+    }
+  );
+  assert.equal(
+    f.commands.some(([method, params]) =>
+      method === "Input.dispatchMouseEvent" && params.type === "mousePressed"
+    ),
+    false
+  );
+});
+
+test("machine frame drift after WAL arm fails closed before mousePressed", async () => {
+  const f = fixture({
+    freshLoaderId: "loader-2"
+  });
+  await assert.rejects(
+    f.controller.dispatchTrustedClick(dispatchInput()),
+    error => {
+      assert.equal(error.dispatch_attempted, false);
+      assert.equal(error.failure_stage, "dispatch_arm_target_validation");
       return true;
     }
   );

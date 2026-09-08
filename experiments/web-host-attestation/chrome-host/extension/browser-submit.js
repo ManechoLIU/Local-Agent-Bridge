@@ -310,10 +310,43 @@ export async function submitContinuationThroughChrome(options) {
   trace.composer_preparation.ok = prepared.prepared === true;
   trace.composer_preparation.status = String(prepared.status || "");
   if (!prepared.prepared) {
-    await journal.remove(wakeId);
+    const prepareStatus = requiredText(prepared.status, "page prepare status", 128);
     trace.failure_stage = "composer_preflight";
+    if (prepareStatus === "composer_preparation_unconfirmed") {
+      const rollback = await safeRollback({
+        rollbackPreparedByHash,
+        diagnostics: trace,
+        browserTargetId,
+        conversationId,
+        payloadSha256
+      });
+      if (rollback.succeeded) {
+        await journal.remove(wakeId);
+      } else {
+        await journal.put({
+          wake_id: wakeId,
+          browser_target_id: browserTargetId,
+          conversation_id: conversationId,
+          target_generation: targetGeneration,
+          ownership_generation: ownershipGeneration,
+          payload_sha256: payloadSha256,
+          phase: "rollback_unconfirmed",
+          dispatch_attempted: false,
+          updated_at_ms: Date.now()
+        });
+      }
+      return browserReceipt({
+        status: rollback.succeeded ? prepareStatus : "rollback_unconfirmed",
+        retryable: false,
+        dispatchAttempted: false,
+        submitConfirmed: false,
+        receiptFactory,
+        diagnostics: trace
+      });
+    }
+    await journal.remove(wakeId);
     return browserReceipt({
-      status: requiredText(prepared.status, "page prepare status", 128),
+      status: prepareStatus,
       retryable: Boolean(prepared.retryable),
       dispatchAttempted: false,
       submitConfirmed: false,
@@ -386,8 +419,8 @@ export async function submitContinuationThroughChrome(options) {
         trace.trusted_dispatch.focus_emulation = Boolean(
           dispatchDiagnostics && dispatchDiagnostics.focus_emulation
         );
-        trace.trusted_dispatch.attempted = true;
-        trace.dispatch_attempted = true;
+        trace.trusted_dispatch.attempted = false;
+        trace.dispatch_attempted = false;
         await journal.put({
           wake_id: wakeId,
           browser_target_id: browserTargetId,
@@ -395,8 +428,8 @@ export async function submitContinuationThroughChrome(options) {
           target_generation: targetGeneration,
           ownership_generation: ownershipGeneration,
           payload_sha256: payloadSha256,
-          phase: "dispatch_started",
-          dispatch_attempted: true,
+          phase: "dispatch_armed",
+          dispatch_attempted: false,
           updated_at_ms: Date.now()
         });
       }
@@ -549,7 +582,17 @@ export async function submitContinuationThroughChrome(options) {
 
   if (confirmed) {
     trace.submit_confirmed = true;
-    await journal.remove(wakeId);
+    await journal.put({
+      wake_id: wakeId,
+      browser_target_id: browserTargetId,
+      conversation_id: conversationId,
+      target_generation: targetGeneration,
+      ownership_generation: ownershipGeneration,
+      payload_sha256: payloadSha256,
+      phase: "submit_confirmed",
+      dispatch_attempted: true,
+      updated_at_ms: Date.now()
+    });
     return browserReceipt({
       status: "submit_confirmed",
       retryable: false,

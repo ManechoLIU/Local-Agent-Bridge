@@ -78,6 +78,21 @@ export async function recoverPreparedSubmitJournals(options) {
 
   const results = [];
   for (const record of await journal.list()) {
+    if (record.phase === "dispatch_armed" && record.dispatch_attempted !== true) {
+      await journal.put({
+        ...record,
+        phase: "result_unknown",
+        dispatch_attempted: true,
+        updated_at_ms: Date.now()
+      });
+      results.push(Object.freeze({
+        wake_id: record.wake_id,
+        recovered: false,
+        retained: true,
+        reason: "dispatch_armed_crash_result_unknown"
+      }));
+      continue;
+    }
     if (record.dispatch_attempted) {
       results.push(Object.freeze({
         wake_id: record.wake_id,

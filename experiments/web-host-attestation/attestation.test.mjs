@@ -329,6 +329,80 @@ test("stable host driver consumes machine-boundary frame observations and valida
   assert.throws(() => createHostDriver({ observeTarget() {} }), /submitContinuation/);
 });
 
+test("stable host driver strips sensitive submit diagnostics before signed receipt", async () => {
+  const driver = createHostDriver({
+    observeTarget: async targetId => observation(1_800_000_000_100, {
+      browser_target_id: targetId
+    }),
+    submitContinuation: async input => ({
+      dispatch_attempted: true,
+      submit_confirmed: true,
+      retryable: false,
+      status: "submit_confirmed",
+      host_submit_receipt: "receipt:" + input.wake_id,
+      submit_diagnostics: {
+        schema_version: 1,
+        wake_id: input.wake_id,
+        browser_target_id: input.browser_target_id,
+        phase: "confirmed",
+        debugger_attach: { attempted: true, ok: true },
+        composer_preparation: {
+          attempted: true,
+          ok: true,
+          status: "prepared",
+          rollback_attempted: false,
+          rollback_succeeded: false
+        },
+        send_control_resolution: {
+          attempted: true,
+          ok: true,
+          selector_kind: "testid_send_button",
+          coordinates_changed_since_prepare: false
+        },
+        trusted_dispatch: {
+          attempted: true,
+          focus_emulation: true,
+          mouse_moved: true,
+          mouse_pressed: true,
+          mouse_released: true
+        },
+        confirmation: {
+          attempted: true,
+          ok: true,
+          composer_empty: true,
+          exact_new_user_message: true
+        },
+        foreground: {
+          mode: "background_focus_emulation",
+          activated_target: false,
+          restored_previous_active: false,
+          user_changed_focus: false
+        },
+        failure_stage: null,
+        dispatch_attempted: true,
+        submit_confirmed: true,
+        retryable: false,
+        payload: "MUST_NOT_ESCAPE",
+        continuation_payload: "MUST_NOT_ESCAPE",
+        text: "MUST_NOT_ESCAPE"
+      }
+    })
+  });
+  const receipt = await driver.submitContinuation({
+    browser_target_id: "browser-target-7",
+    conversation_id: CONVERSATION,
+    payload: "sensitive body",
+    wake_id: "wake-driver-diag",
+    wake_nonce: "nonce-driver-diag",
+    target_generation: 4,
+    ownership_generation: 8
+  });
+  assert.equal(receipt.submit_diagnostics.debugger_attach.ok, true);
+  const serialized = JSON.stringify(receipt.submit_diagnostics);
+  assert.equal(serialized.includes("MUST_NOT_ESCAPE"), false);
+  assert.equal(serialized.includes("sensitive body"), false);
+});
+
 test("stable provider exposes receipts without owning Runtime lifecycle", async () => {
   const time = clock();
   const rawDriver = new Driver(observation(time.now()));
