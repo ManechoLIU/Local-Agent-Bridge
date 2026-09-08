@@ -202,7 +202,9 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
         initial_send_control: null
       };
     }
-    if (normalizedComposerText(composer) !== "") {
+    const existingComposerText = normalizedComposerText(composer);
+    const ownsPreparedPayload = existingComposerText === payload.trim();
+    if (existingComposerText !== "" && !ownsPreparedPayload) {
       return {
         prepared: false,
         ready_to_dispatch: false,
@@ -228,7 +230,9 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
     }
 
     const baseline = currentUserMessageCount();
-    insertPayload(composer, payload);
+    if (!ownsPreparedPayload) {
+      insertPayload(composer, payload);
+    }
     if (normalizedComposerText(composer) !== payload.trim()) {
       return {
         prepared: false,

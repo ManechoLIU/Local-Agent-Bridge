@@ -117,6 +117,26 @@ test("controller active is detected before Host writes payload", async t => {
   assert.equal(page.composer.innerText, "");
 });
 
+test("prepare safely reuses the exact already-prepared Runtime payload", async t => {
+  const page = withPage(t, { initialText: "resume", userMessages: ["old"] });
+  const result = await op("prepare", { payload: "resume" });
+  assert.equal(result.prepared, true);
+  assert.equal(result.dispatch_attempted, false);
+  assert.equal(result.status, "prepared");
+  assert.equal(result.baseline_user_message_count, 1);
+  assert.equal(result.initial_send_control.selector_kind, "testid_send_button");
+  assert.equal(page.composer.innerText, "resume");
+});
+
+test("exact prepared Runtime payload remains retryable while controller is active", async t => {
+  const page = withPage(t, { initialText: "resume", controllerActive: true });
+  const result = await op("prepare", { payload: "resume" });
+  assert.equal(result.status, "controller_active");
+  assert.equal(result.prepared, false);
+  assert.equal(result.retryable, true);
+  assert.equal(page.composer.innerText, "resume");
+});
+
 test("prepare records baseline and initial send snapshot without dispatch", async t => {
   const page = withPage(t, { userMessages: ["old"] });
   const result = await op("prepare", { payload: "resume" });
