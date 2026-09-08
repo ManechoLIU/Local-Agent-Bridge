@@ -1,6 +1,7 @@
 import { createRuntimeHostProvider } from "../provider.mjs";
 import { verifyReentryReceipt } from "../attestation.mjs";
 import { createChromeHostDriver } from "./client.mjs";
+import { RUNTIME_HOST_REQUEST_TIMEOUT_MS } from "./timeout-budget.mjs";
 
 export function createChromeRuntimeHostIntegration(options) {
   const secret = options && options.secret;
@@ -8,7 +9,7 @@ export function createChromeRuntimeHostIntegration(options) {
   const clock = options && options.clock || Date.now;
   const verifierStatePath = options && options.verifierStatePath || null;
   const reentryStatePath = options && options.reentryStatePath || null;
-  const timeoutMs = options && options.timeoutMs || 5000;
+  const timeoutMs = options && options.timeoutMs || RUNTIME_HOST_REQUEST_TIMEOUT_MS;
 
   const driver = createChromeHostDriver({
     socketPath: socketPath,

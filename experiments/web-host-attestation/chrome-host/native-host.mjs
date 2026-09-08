@@ -20,6 +20,7 @@ import {
   encodeNativeMessage,
   MAX_NATIVE_FRAME_BYTES
 } from "./native-framing.mjs";
+import { BROWSER_MACHINE_COMMAND_TIMEOUT_MS } from "./timeout-budget.mjs";
 
 const defaultRoot = join(homedir(), ".local-agent-bridge", "web-host");
 const socketPath = process.env.LAB_HOST_ADAPTER_SOCKET || join(defaultRoot, "host.sock");
@@ -81,7 +82,7 @@ function sendBrowserCommand(message) {
     const timeout = setTimeout(function () {
       pendingBrowser.delete(requestId);
       reject(new Error("browser machine command timed out"));
-    }, 4000);
+    }, BROWSER_MACHINE_COMMAND_TIMEOUT_MS);
     pendingBrowser.set(requestId, {
       resolve: resolve,
       reject: reject,

@@ -1,5 +1,6 @@
 import net from "node:net";
 import { randomUUID } from "node:crypto";
+import { RUNTIME_HOST_REQUEST_TIMEOUT_MS } from "./timeout-budget.mjs";
 
 const MAX_RESPONSE_BYTES = 128 * 1024;
 
@@ -13,7 +14,7 @@ function requiredText(value, name, max) {
 
 export async function requestNativeHost(socketPath, request, options) {
   const path = requiredText(socketPath, "socketPath", 4096);
-  const timeoutMs = options && options.timeoutMs || 5000;
+  const timeoutMs = options && options.timeoutMs || RUNTIME_HOST_REQUEST_TIMEOUT_MS;
   const requestId = "hr_" + randomUUID();
   return await new Promise(function (resolve, reject) {
     const socket = net.createConnection({ path: path });
@@ -73,7 +74,7 @@ export async function requestNativeHost(socketPath, request, options) {
 
 export function createChromeHostDriver(options) {
   const socketPath = options && options.socketPath;
-  const timeoutMs = options && options.timeoutMs || 5000;
+  const timeoutMs = options && options.timeoutMs || RUNTIME_HOST_REQUEST_TIMEOUT_MS;
   return Object.freeze({
     interface_version: 1,
 

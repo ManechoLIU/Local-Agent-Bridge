@@ -1,5 +1,6 @@
 import { conversationIdFromChatgptUrl, selectExactTarget } from "./observation.js";
 import { pageSubmitOperationFunction } from "./submit-page.js";
+import { SUBMIT_CONFIRM_TIMEOUT_MS } from "../timeout-budget.mjs";
 
 function requiredText(value, name, max) {
   const limit = max == null ? 8192 : max;
@@ -586,7 +587,7 @@ export async function submitContinuationThroughChrome(options) {
       payload,
       expected_conversation_id: conversationId,
       baseline_user_message_count: prepared.baseline_user_message_count,
-      timeout_ms: 5000
+      timeout_ms: SUBMIT_CONFIRM_TIMEOUT_MS
     });
   } catch (error) {
     trace.failure_stage = "confirmation";
