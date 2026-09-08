@@ -18,18 +18,29 @@ mod macos {
 
         let windows = provider.list_windows().unwrap();
         assert!(windows.is_array());
-        let _active = provider.active_window().unwrap();
+        let active = provider.active_window().unwrap();
 
-        if let Some(window) = windows.as_array().and_then(|items| items.first()) {
+        if !active.is_null() {
             let identity = WindowIdentity {
-                window_id: window["window_id"].as_str().unwrap().to_string(),
-                pid: i32::try_from(window["pid"].as_i64().unwrap()).unwrap(),
+                window_id: active["window_id"].as_str().unwrap().to_string(),
+                pid: i32::try_from(active["pid"].as_i64().unwrap()).unwrap(),
             };
-            let shot = provider.screenshot(&identity, 640, 480).unwrap();
-            assert_eq!(shot["mime_type"], "image/png");
-            assert!(shot["data_base64"].as_str().unwrap().len() > 32);
-            assert_eq!(shot["window_id"], identity.window_id);
-            assert_eq!(shot["pid"], identity.pid);
+            if permissions["screen_recording"].as_bool() == Some(true) {
+                let shot = provider.screenshot(&identity, 640, 480).unwrap();
+                assert_eq!(shot["mime_type"], "image/png");
+                assert!(shot["data_base64"].as_str().unwrap().len() > 32);
+                assert_eq!(shot["window_id"], identity.window_id);
+                assert_eq!(shot["pid"], identity.pid);
+                assert!(shot["width"].as_u64().unwrap() <= 640);
+                assert!(shot["height"].as_u64().unwrap() <= 480);
+            } else {
+                assert!(provider.screenshot(&identity, 640, 480).is_err());
+            }
+
+            if permissions["accessibility"].as_bool() == Some(false) {
+                let error = provider.find(&identity, "test", 1).unwrap_err();
+                assert!(error.contains("accessibility permission is required"));
+            }
         }
     }
 }

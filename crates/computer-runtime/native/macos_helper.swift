@@ -272,8 +272,11 @@ func findElements(target: WindowRecord, query: String, maxResults: Int) -> [[Str
         let role = axString(element, kAXRoleAttribute as CFString)
         let title = axString(element, kAXTitleAttribute as CFString)
         let description = axString(element, kAXDescriptionAttribute as CFString)
-        let value = axString(element, kAXValueAttribute as CFString)
-        let haystack = normalizedText([role, title, description, value].joined(separator: " "))
+        let safeValueRoles = ["AXStaticText", "AXButton", "AXLink", "AXMenuItem", "AXCheckBox", "AXRadioButton"]
+        let safeValue = safeValueRoles.contains(role)
+            ? axString(element, kAXValueAttribute as CFString)
+            : ""
+        let haystack = normalizedText([role, title, description, safeValue].joined(separator: " "))
         if !path.isEmpty && haystack.contains(needle) {
             results.append(elementRecord(element, path: path, target: target))
             if results.count >= maxResults { return }
@@ -427,7 +430,9 @@ case "list_windows":
     emit(["ok": true, "result": listWindows()])
 case "active_window":
     let windows = windowRecords()
-    if let first = windows.first(where: { $0.frontmost }) {
+        .filter { $0.frontmost }
+        .sorted { ($0.bounds.width * $0.bounds.height) > ($1.bounds.width * $1.bounds.height) }
+    if let first = windows.first {
         emit(["ok": true, "result": windowDictionary(first)])
     }
     emit(["ok": true, "result": NSNull()])

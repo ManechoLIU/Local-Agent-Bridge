@@ -40,7 +40,7 @@ fn read_private_key(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
         return Err("Computer Runtime key permissions are too broad; require 0600".into());
     }
     let value = std::fs::read_to_string(path)?.trim().to_string();
-    if value.as_bytes().len() < 32 {
+    if value.len() < 32 {
         return Err("Computer Runtime key must contain at least 32 bytes".into());
     }
     Ok(value)

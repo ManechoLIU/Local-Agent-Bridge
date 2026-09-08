@@ -554,7 +554,6 @@ async fn call_tool<P: ComputerProvider>(
                     "target app was not present in the referenced session observation".into(),
                 ));
             }
-            drop(sessions);
             runtime
                 .inner
                 .provider
@@ -573,8 +572,8 @@ async fn call_tool<P: ComputerProvider>(
                 window_id: string_arg(arguments, "window_id")?.into(),
                 pid: i32_arg(arguments, "pid")?,
             };
+            let mut sessions = runtime.inner.sessions.lock().await;
             {
-                let sessions = runtime.inner.sessions.lock().await;
                 let session = ensure_session_owner(&sessions, session_id, generation, binding)?;
                 let observed =
                     fresh_observation(session, observation_id, runtime.inner.observation_ttl)?;
@@ -587,59 +586,55 @@ async fn call_tool<P: ComputerProvider>(
             }
             match name {
                 "computer_screenshot" => {
+                    let max_width = bounded_u32(arguments, "max_width", 1, 4096)?;
+                    let max_height = bounded_u32(arguments, "max_height", 1, 4096)?;
                     require_provider_permission(runtime, "screen_recording")?;
                     runtime
                         .inner
                         .provider
-                        .screenshot(
-                            &window,
-                            bounded_u32(arguments, "max_width", 1, 4096)?,
-                            bounded_u32(arguments, "max_height", 1, 4096)?,
-                        )
+                        .screenshot(&window, max_width, max_height)
                         .map_err(ToolError::Provider)
                 }
                 "computer_find" => {
-                    require_provider_permission(runtime, "accessibility")?;
                     let query = bounded_text(arguments, "query", 256)?;
+                    let max_results = bounded_u32(arguments, "max_results", 1, 100)?;
+                    require_provider_permission(runtime, "accessibility")?;
                     let found = runtime
                         .inner
                         .provider
-                        .find(
-                            &window,
-                            query,
-                            bounded_u32(arguments, "max_results", 1, 100)?,
-                        )
+                        .find(&window, query, max_results)
                         .map_err(ToolError::Provider)?;
                     let elements = element_identities(&found, &window)?;
                     let new_id = format!("obs_{}", Uuid::new_v4());
-                    store_observation(
-                        runtime,
-                        session_id,
-                        generation,
-                        binding,
+                    let session = sessions.get_mut(session_id).ok_or_else(|| {
+                        ToolError::Forbidden("unknown or closed Computer session".into())
+                    })?;
+                    push_observation(
+                        session,
+                        runtime.inner.max_observations,
                         Observation {
                             id: new_id.clone(),
                             created: Instant::now(),
                             apps: vec![],
-                            windows: vec![window],
+                            windows: vec![window.clone()],
                             elements,
                         },
-                    )
-                    .await?;
+                    );
                     Ok(json!({"session_id":session_id,"observation_id":new_id,"elements":found}))
                 }
                 "computer_type" => {
+                    let text = bounded_text(arguments, "text", 4096)?;
                     require_provider_permission(runtime, "accessibility")?;
                     runtime
                         .inner
                         .provider
-                        .type_text(&window, bounded_text(arguments, "text", 4096)?)
+                        .type_text(&window, text)
                         .map_err(ToolError::Provider)
                 }
                 "computer_key" => {
-                    require_provider_permission(runtime, "accessibility")?;
                     let key = allowed_key(arguments)?;
                     let mods = allowed_modifiers(arguments)?;
+                    require_provider_permission(runtime, "accessibility")?;
                     runtime
                         .inner
                         .provider
@@ -647,15 +642,13 @@ async fn call_tool<P: ComputerProvider>(
                         .map_err(ToolError::Provider)
                 }
                 _ => {
+                    let delta_x = bounded_i32(arguments, "delta_x", -2000, 2000)?;
+                    let delta_y = bounded_i32(arguments, "delta_y", -2000, 2000)?;
                     require_provider_permission(runtime, "accessibility")?;
                     runtime
                         .inner
                         .provider
-                        .scroll(
-                            &window,
-                            bounded_i32(arguments, "delta_x", -2000, 2000)?,
-                            bounded_i32(arguments, "delta_y", -2000, 2000)?,
-                        )
+                        .scroll(&window, delta_x, delta_y)
                         .map_err(ToolError::Provider)
                 }
             }
@@ -669,8 +662,8 @@ async fn call_tool<P: ComputerProvider>(
                 window_id: string_arg(arguments, "window_id")?.into(),
                 pid: i32_arg(arguments, "pid")?,
             };
+            let sessions = runtime.inner.sessions.lock().await;
             {
-                let sessions = runtime.inner.sessions.lock().await;
                 let session = ensure_session_owner(&sessions, session_id, generation, binding)?;
                 let observed =
                     fresh_observation(session, observation_id, runtime.inner.observation_ttl)?;
@@ -909,6 +902,17 @@ fn fresh_observation<'a>(
     }
     Ok(o)
 }
+fn push_observation(
+    session: &mut ComputerSession,
+    max_observations: usize,
+    observation: Observation,
+) {
+    while session.observations.len() >= max_observations {
+        session.observations.pop_front();
+    }
+    session.observations.push_back(observation);
+}
+
 async fn store_observation<P: ComputerProvider>(
     runtime: &ComputerRuntime<P>,
     sid: &str,
@@ -917,13 +921,11 @@ async fn store_observation<P: ComputerProvider>(
     observation: Observation,
 ) -> Result<(), ToolError> {
     let mut sessions = runtime.inner.sessions.lock().await;
-    let session = ensure_session_owner(&sessions, sid, generation, binding)?;
-    let mut updated = session.clone();
-    while updated.observations.len() >= runtime.inner.max_observations {
-        updated.observations.pop_front();
-    }
-    updated.observations.push_back(observation);
-    sessions.insert(sid.into(), updated);
+    ensure_session_owner(&sessions, sid, generation, binding)?;
+    let session = sessions
+        .get_mut(sid)
+        .ok_or_else(|| ToolError::Forbidden("unknown or closed Computer session".into()))?;
+    push_observation(session, runtime.inner.max_observations, observation);
     Ok(())
 }
 

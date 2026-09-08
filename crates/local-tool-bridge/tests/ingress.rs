@@ -355,9 +355,24 @@ async fn json_backend(
     let id = parsed.get("id").cloned().unwrap_or(serde_json::Value::Null);
     if method == "tools/list" {
         let tools = if kind == "computer" {
-            vec![
-                serde_json::json!({"name":"computer_session_open","inputSchema":{"type":"object"}}),
+            [
+                "computer_session_open",
+                "computer_session_close",
+                "computer_permissions",
+                "computer_list_apps",
+                "computer_list_windows",
+                "computer_active_window",
+                "computer_activate_app",
+                "computer_screenshot",
+                "computer_find",
+                "computer_click",
+                "computer_type",
+                "computer_key",
+                "computer_scroll",
             ]
+            .into_iter()
+            .map(|name| serde_json::json!({"name":name,"inputSchema":{"type":"object"}}))
+            .collect()
         } else {
             vec![serde_json::json!({"name":"read","inputSchema":{"type":"object"}})]
         };
@@ -420,7 +435,20 @@ async fn computer_tools_are_capability_gated_routed_and_merged_into_tools_list()
         .filter_map(|tool| tool["name"].as_str())
         .collect();
     assert!(names.contains(&"read"));
-    assert!(names.contains(&"computer_session_open"));
+    for expected in [
+        "computer_session_open",
+        "computer_screenshot",
+        "computer_find",
+        "computer_click",
+        "computer_type",
+        "computer_key",
+        "computer_scroll",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "merged tools/list missing {expected}"
+        );
+    }
 
     let computer_body = r#"{"jsonrpc":"2.0","id":"computer","method":"tools/call","params":{"name":"computer_session_open","arguments":{}}}"#;
     let computer_request = Request::builder()

@@ -138,6 +138,7 @@ mod macos {
         );
 
         let active = app
+            .clone()
             .oneshot(request(
                 "active",
                 "computer_active_window",
@@ -146,5 +147,73 @@ mod macos {
             .await
             .unwrap();
         assert_eq!(active.status(), StatusCode::OK);
+        let active = response_json(active).await;
+        let observation = active["result"]["structuredContent"]["observation_id"]
+            .as_str()
+            .unwrap();
+        let window = &active["result"]["structuredContent"]["window"];
+        assert!(!window.is_null(), "expected a real active macOS window");
+        let window_id = window["window_id"].as_str().unwrap();
+        let pid = window["pid"].as_i64().unwrap();
+
+        let permissions = app
+            .clone()
+            .oneshot(request(
+                "permissions",
+                "computer_permissions",
+                json!({"session_id":session,"expected_session_generation":1}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(permissions.status(), StatusCode::OK);
+        let permissions = response_json(permissions).await;
+        let screen_recording = permissions["result"]["structuredContent"]["screen_recording"]
+            .as_bool()
+            .unwrap_or(false);
+
+        let screenshot = app
+            .oneshot(request(
+                "shot",
+                "computer_screenshot",
+                json!({
+                    "session_id":session,
+                    "expected_session_generation":1,
+                    "observation_id":observation,
+                    "window_id":window_id,
+                    "pid":pid,
+                    "max_width":640,
+                    "max_height":480
+                }),
+            ))
+            .await
+            .unwrap();
+        if screen_recording {
+            assert_eq!(screenshot.status(), StatusCode::OK);
+            let screenshot = response_json(screenshot).await;
+            assert_eq!(
+                screenshot["result"]["structuredContent"]["mime_type"],
+                "image/png"
+            );
+            assert!(
+                screenshot["result"]["structuredContent"]["bytes"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+            assert!(
+                screenshot["result"]["structuredContent"]["width"]
+                    .as_u64()
+                    .unwrap()
+                    <= 640
+            );
+            assert!(
+                screenshot["result"]["structuredContent"]["height"]
+                    .as_u64()
+                    .unwrap()
+                    <= 480
+            );
+        } else {
+            assert_eq!(screenshot.status(), StatusCode::FORBIDDEN);
+        }
     }
 }
