@@ -60,3 +60,49 @@ export function createChromeRuntimeHostIntegration(options) {
     }
   });
 }
+
+function requiredRuntimeText(value, name, max) {
+  const text = String(value == null ? "" : value).trim();
+  if (!text) throw new Error(name + " is required");
+  if (text.length > (max || 256)) throw new Error(name + " exceeds limit");
+  return text;
+}
+
+function requiredRuntimeGeneration(value, name) {
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 1) throw new Error(name + " must be a positive integer");
+  return number;
+}
+
+export async function executeRuntimeVerifierCommand(input, options) {
+  const operation = requiredRuntimeText(input && input.operation, "operation", 64);
+  if (operation !== "attest_and_verify") {
+    throw new Error("unsupported Runtime Host operation: " + operation);
+  }
+  const integration = options && options.integration;
+  if (!integration || typeof integration.attestAndVerify !== "function") {
+    throw new Error("Runtime Host integration is required");
+  }
+  const request = {
+    conversation_id: requiredRuntimeText(input && input.conversation_id, "conversation_id", 128),
+    target_generation: requiredRuntimeGeneration(input && input.target_generation, "target_generation"),
+    ownership_generation: requiredRuntimeGeneration(input && input.ownership_generation, "ownership_generation")
+  };
+  const result = await integration.attestAndVerify(request);
+  const verified = result && result.verified_target;
+  if (!verified || verified.provenance !== "runtime_host_verifier_v1") {
+    throw new Error("Runtime Host verifier did not return a trusted verified target");
+  }
+  if (verified.conversation_id !== request.conversation_id ||
+      verified.target_generation !== request.target_generation ||
+      verified.ownership_generation !== request.ownership_generation) {
+    throw new Error("Runtime Host verified target does not match requested ownership fence");
+  }
+  return Object.freeze({
+    ok: true,
+    operation: operation,
+    challenge_id: requiredRuntimeText(result.challenge_id, "challenge_id", 256),
+    host_receipt_id: requiredRuntimeText(result.host_receipt_id, "host_receipt_id", 256),
+    verified_target: verified
+  });
+}
