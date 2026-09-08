@@ -9,7 +9,7 @@
 - 当前活动项：LAB-COMP-01 / LAB-HOST-01
 - 当前阻塞：Computer Runtime read-only + screenshot 无 blocker；真实 macOS find/click/type/key/scroll Live-E2E 当前由 native helper `accessibility=false` 阻塞，代码与 mock/fencing contract 可继续验证。LAB-GOV-02 / LAB-WEX-02 的强身份阻塞继续由 LAB-HOST-01 承接；Host adapter 机器验证通过前 manual/ui-observed/deferred 均不得标 PASS。
 - 规则版本：Adaptive Agent Runtime `65d381d9715087610a8d715681f53c185b7b6212`；installed manifest sha256=`78902f7010d27990f33f8cdbe3a8ffb6595c07a16c3c3221ea5ad331f07140c7`；`web_agent_execution=status:host_limited, configured:false`，不得把 browser automation 或手工聊天冒充 production Web dispatch
-- Web ownership fresh fact：Runtime registry 当前唯一 Controller `a697051d-402b-4062-a883-a29ba8b395e9` 的 active_host=web，execution_target_session_id=`6a9e41a2-266c-83ea-9104-e768ed4ad3f2`，generation=1，provenance=manual_user_authorized，host_attested=false。canonical identity projection 因 HOST_SESSION_ID_UNAVAILABLE 为 DEGRADED；本次人工 wake 不是 strong Host attestation。
+- Web ownership fresh fact（2026-09-08）：Runtime registry 仍只有 logical Controller `a697051d-402b-4062-a883-a29ba8b395e9`，但 canonical ownership 当前投影为 active_host=web、execution_target_session_id=`6a9e4037-0a00-83ea-bb8e-1301c5f6b979`、generation=2、provenance=manual_user_authorized、host_attested=false；这与 AGENTS.md 中用户显式 bootstrap target `6a9e41a2-...` 不一致，属于 ownership/target drift，不能据此升级身份或执行 Controller-only strong-binding 操作。
 
 
 ## 任务拆分
@@ -36,7 +36,7 @@
 - Runtime project identity boundary：`/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge/.git`
 - Git：`main`；已建立首个 governance baseline `b909f3ebcbabf92cd07245876949f7ad749ab4bb`，后续 worktree / delegated assignment 可基于稳定 revision。
 - 唯一 logical Controller：`a697051d-402b-4062-a883-a29ba8b395e9`。
-- Runtime current Web execution target：`6a9e41a2-266c-83ea-9104-e768ed4ad3f2`，generation=1，provenance=manual_user_authorized，host_attested=false；本次人工 wake 不提升 attestation。
+- Runtime current Web ownership（fresh registry）：target=`6a9e4037-0a00-83ea-bb8e-1301c5f6b979`、generation=2、provenance=manual_user_authorized、host_attested=false；与 AGENTS.md 显式 bootstrap authorization 不一致，故只记录为 machine drift，不视为新的用户授权或 strong identity。
 - Bootstrap binding：`provenance=manual_user_authorized`、`binding=temporary`、`host_attested=false`、Runtime lease mode=`resume_only`。
 - Runtime assignment state fresh-read 仍为 leases={} / lineages={}，没有可恢复 non-terminal assignment。当前 Controller direct WIP=LAB-COMP-01 / LAB-HOST-01；LAB-WEX-01 已 adapter-level 收口，LAB-WEX-02 保持 BLOCKED。没有真实 dispatch primitive 时不得通过写 ACTIVE、开 browser tab 或手工新聊天冒充 child spawn。
 - SelfAlone 是完全独立项目，只可作为未来外部 E2E target / fixture；不得修改其 main、复用其 Controller/台账或接管 lifecycle。
@@ -46,7 +46,7 @@
 | 任务 | 候选 / 环境 | 验证结果 | 证据位置 / 失效条件 |
 | --- | --- | --- | --- |
 | LAB-GOV-01 | installed Runtime | installed Runtime exact revision 已 fresh-read 为 `65d381d9715087610a8d715681f53c185b7b6212`；manifest impact=`live_assignments`，Web host attestation 仍 unavailable，`web_agent_execution` 仍 `host_limited/configured=false` | 本 revision 已完成 canonical ACK；Live-E2E 不得伪造，按当前 host-attestation 实际能力单独处理 |
-| LAB-GOV-01 | controller registry | 本项目仅 `a697051d-402b-4062-a883-a29ba8b395e9` 一个 Controller；canonical target 当前为 Web `6a9e41a2-266c-83ea-9104-e768ed4ad3f2` generation=1；provenance=manual_user_authorized，host_attested=false；identity projection=DEGRADED/HOST_SESSION_ID_UNAVAILABLE | `~/.codex/adaptive-delivery-controllers.json`；后续 ownership/generation 变更时失效 |
+| LAB-GOV-01 | controller registry | fresh registry 仍只有 `a697051d-402b-4062-a883-a29ba8b395e9` 一个项目 Controller；但 canonical Web ownership 已投影到 `6a9e4037-...` generation=2，仍 manual_user_authorized / host_attested=false，与 AGENTS bootstrap target 不一致 | `~/.codex/adaptive-delivery-controllers.json`；按 drift/fail-closed 处理，不创建第二 Controller、不把 registry 漂移冒充用户授权 |
 | LAB-ID-01 | local Node test | 5 tests PASS / 0 FAIL | `node --test experiments/identity-probe/server.test.mjs`；实现或测试变化时重跑 |
 | LAB-BASE-01 | historical PoC | hardlink read escape 已复现；CatDesk identity/shell/computer 边界仍不足以直接 Go | `CHECKPOINT.md` 与 `/Users/echoman/CatDesk-PoC-20260907`；若上游/实现变化需复验 |
 

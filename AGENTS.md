@@ -172,6 +172,9 @@ If the active Web conversation changes before strong binding exists, the new exe
 
 Bootstrap machine-binding note (2026-09-07): Runtime canonical ownership currently selects Web execution target `6a9e41a2-266c-83ea-9104-e768ed4ad3f2` at generation 1 with provenance `manual_user_authorized` and `host_attested=false`. The earlier `6a9e4158-cc8c-83ea-9763-05a7fd51f597` entry remains lineage/history only. Adaptive Agent Runtime has recorded it in this Controller's Web lineage, but currently projects it as `historical_alias / STALE / EXPLICIT_CURRENT_TARGET_REQUIRED`; `host_attested=false` and Controller actions are not machine-authorized by this alias alone. The prior alias `6a9e4037-0a00-83ea-bb8e-1301c5f6b979` is historical only and must not be treated as the current project Controller execution entry.
 
+
+Bootstrap drift note (2026-09-08): a fresh read of `~/.codex/adaptive-delivery-controllers.json` still shows the same unique logical Controller `a697051d-402b-4062-a883-a29ba8b395e9`, but Runtime currently projects Web ownership to historical alias `6a9e4037-0a00-83ea-bb8e-1301c5f6b979` at generation 2 with `provenance=manual_user_authorized` and `host_attested=false`. This conflicts with the explicit user-authorized bootstrap target above. Treat this as Runtime ownership/target drift, not as fresh user authorization and not as strong host identity. Do not rewrite the user authorization source, create a second Controller, or perform Controller-only strong-binding actions from the drifted alias. Product development that does not depend on Controller identity may continue; LAB-GOV-02 remains fail-closed until Host attestation/re-entry is machine verified.
+
 ## 3. Automatic retirement conditions for bootstrap binding
 
 The Bootstrap / Temporary Controller Binding must be retired once the new Local Agent Bridge can provide sufficiently reliable machine facts for all of the following:
