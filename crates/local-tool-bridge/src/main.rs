@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // UDS ownership/permissions are the local ingress authentication boundary.
     // Capability replay state is persisted before any backend side effect.
-    let ingress = BridgeIngress::new_trusted_unix_socket(
+    let mut ingress = BridgeIngress::new_trusted_unix_socket(
         authority,
         issued,
         context,
@@ -90,6 +90,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         policy,
         state_dir.clone(),
     )?;
+    let computer_backend_url = env::var("LAB_COMPUTER_BACKEND_URL").ok();
+    let computer_backend_key_file = env::var("LAB_COMPUTER_BACKEND_KEY_FILE").ok();
+    match (
+        computer_backend_url.as_deref(),
+        computer_backend_key_file.as_deref(),
+    ) {
+        (Some(url), Some(key_file)) => {
+            let computer_key = read_private_secret_file(Path::new(key_file))?;
+            ingress = ingress.with_computer_backend(url, &computer_key)?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "LAB_COMPUTER_BACKEND_URL and LAB_COMPUTER_BACKEND_KEY_FILE must be configured together"
+                    .into(),
+            );
+        }
+    }
     let app = ingress.router();
 
     let socket = PathBuf::from(&socket_path);
@@ -111,9 +129,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = UnixListener::bind(&socket)?;
     set_socket_private(&socket)?;
     eprintln!(
-        "local-tool-bridge ready socket={} backend={} capability_id={}",
+        "local-tool-bridge ready socket={} backend={} computer_backend={} capability_id={}",
         socket.display(),
         backend_url,
+        computer_backend_url.as_deref().unwrap_or("disabled"),
         capability_id
     );
 

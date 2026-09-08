@@ -337,3 +337,146 @@ fn backend_hostname_localhost_is_rejected() {
         .is_err()
     );
 }
+
+#[derive(Clone, Default)]
+struct JsonCapture(Arc<Mutex<Vec<(HeaderMap, serde_json::Value)>>>);
+
+async fn json_backend(
+    State((capture, kind)): State<(JsonCapture, &'static str)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, axum::Json<serde_json::Value>) {
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    capture.0.lock().await.push((headers, parsed.clone()));
+    let method = parsed
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let id = parsed.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    if method == "tools/list" {
+        let tools = if kind == "computer" {
+            vec![
+                serde_json::json!({"name":"computer_session_open","inputSchema":{"type":"object"}}),
+            ]
+        } else {
+            vec![serde_json::json!({"name":"read","inputSchema":{"type":"object"}})]
+        };
+        return (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"tools":tools}})),
+        );
+    }
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"backend":kind}})),
+    )
+}
+
+async fn json_backend_server(capture: JsonCapture, kind: &'static str) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route("/mcp", post(json_backend))
+        .with_state((capture, kind));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://127.0.0.1:{}/mcp", addr.port())
+}
+
+#[tokio::test]
+async fn computer_tools_are_capability_gated_routed_and_merged_into_tools_list() {
+    let default_capture = JsonCapture::default();
+    let computer_capture = JsonCapture::default();
+    let default_url = json_backend_server(default_capture.clone(), "default").await;
+    let computer_url = json_backend_server(computer_capture.clone(), "computer").await;
+    let app = bridge(
+        &default_url,
+        vec![Capability::Discovery, Capability::Computer],
+    )
+    .with_computer_backend(&computer_url, BACKEND_KEY)
+    .unwrap()
+    .router();
+
+    let list_body = r#"{"jsonrpc":"2.0","id":"list","method":"tools/list","params":{}}"#;
+    let list_request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header("mcp-method", "tools/list")
+        .header("x-lab-ingress-key", KEY)
+        .body(Body::from(list_body))
+        .unwrap();
+    let list_response = app.clone().oneshot(list_request).await.unwrap();
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let list_bytes = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_json: serde_json::Value = serde_json::from_slice(&list_bytes).unwrap();
+    let names: Vec<_> = list_json["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(names.contains(&"read"));
+    assert!(names.contains(&"computer_session_open"));
+
+    let computer_body = r#"{"jsonrpc":"2.0","id":"computer","method":"tools/call","params":{"name":"computer_session_open","arguments":{}}}"#;
+    let computer_request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header("mcp-method", "tools/call")
+        .header("mcp-name", "computer_session_open")
+        .header("x-lab-ingress-key", KEY)
+        .body(Body::from(computer_body))
+        .unwrap();
+    let response = app.oneshot(computer_request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let computer_calls = computer_capture.0.lock().await;
+    assert!(computer_calls.iter().any(|(_, body)| {
+        body.get("params")
+            .and_then(|v| v.get("name"))
+            .and_then(serde_json::Value::as_str)
+            == Some("computer_session_open")
+    }));
+    assert!(computer_calls.iter().all(|(headers, _)| {
+        headers
+            .get("x-lab-backend-key")
+            .and_then(|v| v.to_str().ok())
+            == Some(BACKEND_KEY)
+    }));
+    let default_calls = default_capture.0.lock().await;
+    assert!(!default_calls.iter().any(|(_, body)| {
+        body.get("params")
+            .and_then(|v| v.get("name"))
+            .and_then(serde_json::Value::as_str)
+            == Some("computer_session_open")
+    }));
+}
+
+#[tokio::test]
+async fn computer_tool_without_computer_capability_fails_before_computer_backend() {
+    let default_capture = JsonCapture::default();
+    let computer_capture = JsonCapture::default();
+    let default_url = json_backend_server(default_capture, "default").await;
+    let computer_url = json_backend_server(computer_capture.clone(), "computer").await;
+    let app = bridge(&default_url, vec![Capability::Discovery])
+        .with_computer_backend(&computer_url, BACKEND_KEY)
+        .unwrap()
+        .router();
+    let body = r#"{"jsonrpc":"2.0","id":"computer","method":"tools/call","params":{"name":"computer_session_open","arguments":{}}}"#;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header("mcp-method", "tools/call")
+        .header("mcp-name", "computer_session_open")
+        .header("x-lab-ingress-key", KEY)
+        .body(Body::from(body))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(computer_capture.0.lock().await.is_empty());
+}

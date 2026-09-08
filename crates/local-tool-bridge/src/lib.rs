@@ -58,6 +58,13 @@ impl ToolPolicy {
             .insert("start_command", Capability::ProcessJobs)
             .insert("poll_command", Capability::ProcessJobs)
             .insert("cancel_command", Capability::ProcessJobs)
+            .insert("computer_session_open", Capability::Computer)
+            .insert("computer_session_close", Capability::Computer)
+            .insert("computer_permissions", Capability::Computer)
+            .insert("computer_list_apps", Capability::Computer)
+            .insert("computer_list_windows", Capability::Computer)
+            .insert("computer_active_window", Capability::Computer)
+            .insert("computer_activate_app", Capability::Computer)
     }
 
     pub fn required_capability(&self, method: &str, tool_name: &str) -> Result<Capability, String> {
@@ -91,13 +98,19 @@ pub struct BridgeIngress {
     inner: Arc<BridgeIngressInner>,
 }
 
+#[derive(Clone)]
+struct BackendTarget {
+    url: Url,
+    key: String,
+}
+
 struct BridgeIngressInner {
     authority: Mutex<CapabilityAuthority>,
     issued: IssuedCapability,
     context: ExecutionContext,
     local_auth: LocalIngressAuth,
-    backend_url: Url,
-    backend_key: String,
+    default_backend: BackendTarget,
+    computer_backend: Option<BackendTarget>,
     client: reqwest::Client,
     policy: ToolPolicy,
     state_dir: Option<PathBuf>,
@@ -151,8 +164,11 @@ impl BridgeIngress {
                 issued,
                 context,
                 local_auth: LocalIngressAuth::SharedKey(ingress_key_sha256),
-                backend_url,
-                backend_key: backend_key.to_string(),
+                default_backend: BackendTarget {
+                    url: backend_url,
+                    key: backend_key.to_string(),
+                },
+                computer_backend: None,
                 client: backend_client()?,
                 policy,
                 state_dir: Some(state_dir.into()),
@@ -180,13 +196,33 @@ impl BridgeIngress {
                 issued,
                 context,
                 local_auth: LocalIngressAuth::TrustedUnixSocket,
-                backend_url,
-                backend_key: backend_key.to_string(),
+                default_backend: BackendTarget {
+                    url: backend_url,
+                    key: backend_key.to_string(),
+                },
+                computer_backend: None,
                 client: backend_client()?,
                 policy,
                 state_dir: Some(state_dir.into()),
             }),
         })
+    }
+
+    pub fn with_computer_backend(
+        mut self,
+        backend_url: &str,
+        backend_key: &str,
+    ) -> Result<Self, String> {
+        let backend_url = validate_backend_url(backend_url)?;
+        validate_backend_key(backend_key)?;
+        let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
+            "computer backend must be configured before BridgeIngress is cloned".to_string()
+        })?;
+        inner.computer_backend = Some(BackendTarget {
+            url: backend_url,
+            key: backend_key.to_string(),
+        });
+        Ok(self)
     }
 
     pub fn router(self) -> Router {
@@ -289,7 +325,28 @@ async fn handle_mcp(
         }
     }
 
-    match forward_to_backend(&state, &headers, &proof.to_headers(), body).await {
+    if method == "tools/list" && state.inner.computer_backend.is_some() {
+        return match forward_merged_tools_list(&state, &headers, &proof.to_headers(), body).await {
+            Ok(response) => response,
+            Err(error) => text_response(StatusCode::BAD_GATEWAY, &error),
+        };
+    }
+
+    let target = if method == "tools/call" && tool_name.starts_with("computer_") {
+        match state.inner.computer_backend.as_ref() {
+            Some(target) => target,
+            None => {
+                return text_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Computer Runtime backend is not configured",
+                );
+            }
+        }
+    } else {
+        &state.inner.default_backend
+    };
+
+    match forward_to_backend(&state, target, &headers, &proof.to_headers(), body).await {
         Ok(response) => response,
         Err(error) => text_response(StatusCode::BAD_GATEWAY, &error),
     }
@@ -297,6 +354,7 @@ async fn handle_mcp(
 
 async fn forward_to_backend(
     state: &BridgeIngress,
+    target: &BackendTarget,
     incoming: &HeaderMap,
     proof_headers: &HashMap<String, String>,
     body: Bytes,
@@ -304,7 +362,7 @@ async fn forward_to_backend(
     let mut request = state
         .inner
         .client
-        .post(state.inner.backend_url.clone())
+        .post(target.url.clone())
         .body(body.to_vec());
     for name in FORWARDED_HEADERS {
         if let Some(value) = incoming.get(*name).and_then(|value| value.to_str().ok()) {
@@ -314,7 +372,7 @@ async fn forward_to_backend(
     for (name, value) in proof_headers {
         request = request.header(name, value);
     }
-    request = request.header("x-lab-backend-key", &state.inner.backend_key);
+    request = request.header("x-lab-backend-key", &target.key);
     let backend = request
         .send()
         .await
@@ -337,6 +395,63 @@ async fn forward_to_backend(
     response
         .body(Body::from(bytes))
         .map_err(|error| format!("backend response build failed: {error}"))
+}
+
+async fn forward_merged_tools_list(
+    state: &BridgeIngress,
+    incoming: &HeaderMap,
+    proof_headers: &HashMap<String, String>,
+    body: Bytes,
+) -> Result<Response<Body>, String> {
+    let computer = state
+        .inner
+        .computer_backend
+        .as_ref()
+        .ok_or_else(|| "Computer Runtime backend is not configured".to_string())?;
+    let default_response = forward_to_backend(
+        state,
+        &state.inner.default_backend,
+        incoming,
+        proof_headers,
+        body.clone(),
+    )
+    .await?;
+    let computer_response =
+        forward_to_backend(state, computer, incoming, proof_headers, body).await?;
+    if default_response.status() != StatusCode::OK || computer_response.status() != StatusCode::OK {
+        return Err(format!(
+            "tools/list backend status mismatch: default={} computer={}",
+            default_response.status(),
+            computer_response.status()
+        ));
+    }
+    let default_bytes = axum::body::to_bytes(default_response.into_body(), usize::MAX)
+        .await
+        .map_err(|error| format!("default tools/list response read failed: {error}"))?;
+    let computer_bytes = axum::body::to_bytes(computer_response.into_body(), usize::MAX)
+        .await
+        .map_err(|error| format!("computer tools/list response read failed: {error}"))?;
+    let mut default_json: serde_json::Value = serde_json::from_slice(&default_bytes)
+        .map_err(|error| format!("default tools/list response is not JSON: {error}"))?;
+    let computer_json: serde_json::Value = serde_json::from_slice(&computer_bytes)
+        .map_err(|error| format!("computer tools/list response is not JSON: {error}"))?;
+    let extra_tools = computer_json
+        .get("result")
+        .and_then(|value| value.get("tools"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .ok_or_else(|| "computer tools/list response has no result.tools array".to_string())?;
+    let tools = default_json
+        .get_mut("result")
+        .and_then(|value| value.get_mut("tools"))
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| "default tools/list response has no result.tools array".to_string())?;
+    tools.extend(extra_tools);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(default_json.to_string()))
+        .map_err(|error| format!("merged tools/list response build failed: {error}"))
 }
 
 fn validate_backend_url(value: &str) -> Result<Url, String> {
