@@ -262,3 +262,20 @@ Runtime collaborative 初始化器已建立并复用：
 - Host suite is 52/52 PASS with the new CLI tests.
 - Fresh installed Runtime inspection found the remaining integration gap: `web_lifecycle_bridge.py` keeps `_PEER_HOST_ATTESTATION_VERIFIERS` as an in-process empty dict and `_registered_peer_attestation_verifier("web")` has no external registration mechanism. `recover_same_controller_web_session` already has the correct fail-closed verifier call and generation recheck, but currently returns degraded when no callable verifier is registered.
 - Therefore product Host/browser work is no longer the blocker for trusted evidence generation. The next infrastructure step is a small Adaptive Agent Runtime change that registers/calls this product verifier interface without allowing caller injection, then reconciles the canonical Web target under exact ownership/generation fences. No registry mutation was performed in this run because current Runtime ownership is still the documented drifted manual alias and strong binding must fail closed until the trusted verifier is actually registered.
+
+
+## 2026-09-08 Runtime Host verifier installation / ACK
+
+- Fresh installed manifest now reports exact Adaptive Agent Runtime revision `d1de19b773b09a247d41c225071a0d48d359c117`, `impact=live_assignments`, manifest SHA256 `0ce90a410ec14210260f7a92cadebdfc7082b689fc2ad01ed70a5f1fe88a428f`.
+- The unique logical Controller `a697051d-402b-4062-a883-a29ba8b395e9` canonical-ACKed that exact revision at 2026-09-08T06:31:37Z. `live_e2e_required=true` remains open; no acceptance was fabricated.
+- Runtime verifier config is present at `~/.codex/adaptive-delivery-host-attestation-verifiers.json`, mode 0600, protocol `runtime_host_verifier_cli_v1`, with executable + five-file verifier bundle SHA256 pins.
+- Runtime v3 focused Host verifier/reentry tests: 7/7 PASS. Focused installer/release-gate tests: 3/3 PASS. Earlier full combined unittest attempts timed out at the local tool boundary and are not counted as PASS.
+- Canonical Web ownership remains the documented manual drifted target and `host_attested=false`; therefore next gate is supported ownership reconciliation followed by real terminal -> canonical continuation -> exact Host-attested same-Controller submit -> post-wake closed cycle -> `accept-live-e2e`.
+
+
+## 2026-09-08 Canonical target attestation attempt + Computer Runtime independence
+
+- Fresh Runtime registry now has the same unique logical Controller and canonical Web target `6a9e3b9a-2f5c-83ea-9fe6-87a08a08a8c9`, target generation 3 / ownership generation 3, still `manual_user_authorized` and `host_attested=false`.
+- Installed trusted `runtime_host_verifier_cli_v1` was invoked against that exact machine fence. It returned `RUNTIME_HOST_VERIFIER_FAILED: exact ChatGPT conversation target is unavailable`; no submit was attempted and no live-E2E acceptance was written.
+- The Host lifecycle branch therefore remains blocked on exact target availability in the authenticated Host boundary, while independent product work continues.
+- Added `crates/computer-runtime/tests/runtime_independence.rs`. Initial RED was a test-side wrong backend header and Runtime correctly returned HTTP 401; after correcting to the actual `x-lab-backend-key` contract, the real `computer-runtime` binary starts with an environment cleared of Adaptive Agent Runtime state and serves its Computer tool inventory: 1/1 PASS.
