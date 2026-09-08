@@ -2,7 +2,9 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use computer_runtime::{AppInfo, ComputerProvider, ComputerRuntime};
+use computer_runtime::{
+    AppInfo, ComputerProvider, ComputerRuntime, ElementIdentity, WindowIdentity,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
@@ -13,6 +15,8 @@ const KEY: &str = "computer-runtime-backend-key-0123456789abcdef0123456789abcdef
 #[derive(Clone, Default)]
 struct MockProvider {
     activations: Arc<Mutex<Vec<(i32, String)>>>,
+    clicks: Arc<Mutex<Vec<ElementIdentity>>>,
+    typed: Arc<Mutex<Vec<(WindowIdentity, String)>>>,
 }
 
 impl ComputerProvider for MockProvider {
@@ -45,6 +49,41 @@ impl ComputerProvider for MockProvider {
             .unwrap()
             .push((pid, bundle_id.into()));
         Ok(json!({"activated":true,"pid":pid,"bundle_id":bundle_id}))
+    }
+
+    fn screenshot(
+        &self,
+        window: &WindowIdentity,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<Value, String> {
+        Ok(
+            json!({"window_id":window.window_id,"pid":window.pid,"max_width":max_width,"max_height":max_height,"mime_type":"image/png","data_base64":"fixture"}),
+        )
+    }
+
+    fn find(
+        &self,
+        window: &WindowIdentity,
+        query: &str,
+        _max_results: u32,
+    ) -> Result<Value, String> {
+        Ok(
+            json!([{"element_id":format!("el:{query}"),"window_id":window.window_id,"pid":window.pid,"role":"button","label":query}]),
+        )
+    }
+
+    fn click(&self, element: &ElementIdentity) -> Result<Value, String> {
+        self.clicks.lock().unwrap().push(element.clone());
+        Ok(json!({"clicked":true,"element_id":element.element_id}))
+    }
+
+    fn type_text(&self, window: &WindowIdentity, text: &str) -> Result<Value, String> {
+        self.typed
+            .lock()
+            .unwrap()
+            .push((window.clone(), text.to_string()));
+        Ok(json!({"typed":true,"length":text.chars().count()}))
     }
 }
 
@@ -129,7 +168,7 @@ async fn computer_session_ownership_is_bound_to_bridge_execution_context() {
 
     let list = json!({
         "jsonrpc":"2.0","id":"apps","method":"tools/call",
-        "params":{"name":"computer_list_apps","arguments":{"session_id":session}}
+        "params":{"name":"computer_list_apps","arguments":{"session_id":session,"expected_session_generation":1}}
     })
     .to_string();
     let other_execution = app
@@ -159,7 +198,7 @@ async fn bounded_action_requires_target_from_same_session_observation() {
 
     let list = json!({
         "jsonrpc":"2.0","id":"apps","method":"tools/call",
-        "params":{"name":"computer_list_apps","arguments":{"session_id":session}}
+        "params":{"name":"computer_list_apps","arguments":{"session_id":session,"expected_session_generation":1}}
     })
     .to_string();
     let listed = body_json(
@@ -176,7 +215,7 @@ async fn bounded_action_requires_target_from_same_session_observation() {
     let forged_target = json!({
         "jsonrpc":"2.0","id":"activate","method":"tools/call",
         "params":{"name":"computer_activate_app","arguments":{
-            "session_id":session,"observation_id":observation,"pid":9999,"bundle_id":"com.example.other"
+            "session_id":session,"expected_session_generation":1,"observation_id":observation,"pid":9999,"bundle_id":"com.example.other"
         }}
     })
     .to_string();
@@ -191,7 +230,7 @@ async fn bounded_action_requires_target_from_same_session_observation() {
     let allowed = json!({
         "jsonrpc":"2.0","id":"activate","method":"tools/call",
         "params":{"name":"computer_activate_app","arguments":{
-            "session_id":session,"observation_id":observation,"pid":4242,"bundle_id":"com.example.fixture"
+            "session_id":session,"expected_session_generation":1,"observation_id":observation,"pid":4242,"bundle_id":"com.example.fixture"
         }}
     })
     .to_string();
@@ -218,4 +257,119 @@ async fn tampered_body_hash_fails_closed() {
         .insert("x-lab-body-sha256", "00".repeat(32).parse().unwrap());
     let response = app.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn window_actions_require_current_generation_and_observed_window() {
+    let provider = MockProvider::default();
+    let typed = Arc::clone(&provider.typed);
+    let app = ComputerRuntime::new(KEY.as_bytes(), provider)
+        .unwrap()
+        .router();
+    let open = r#"{"jsonrpc":"2.0","id":"open","method":"tools/call","params":{"name":"computer_session_open","arguments":{}}}"#;
+    let opened = body_json(
+        app.clone()
+            .oneshot(bridge_request(open, KEY, "exec-a"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let session = session_id(&opened);
+
+    let list = json!({"jsonrpc":"2.0","id":"windows","method":"tools/call","params":{"name":"computer_list_windows","arguments":{"session_id":session,"expected_session_generation":1}}}).to_string();
+    let listed = body_json(
+        app.clone()
+            .oneshot(bridge_request(&list, KEY, "exec-a"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let observation = listed["result"]["structuredContent"]["observation_id"]
+        .as_str()
+        .unwrap();
+
+    let stale = json!({"jsonrpc":"2.0","id":"type","method":"tools/call","params":{"name":"computer_type","arguments":{"session_id":session,"expected_session_generation":2,"observation_id":observation,"window_id":"wid_fixture","pid":4242,"text":"hello"}}}).to_string();
+    let response = app
+        .clone()
+        .oneshot(bridge_request(&stale, KEY, "exec-a"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(typed.lock().unwrap().is_empty());
+
+    let forged = json!({"jsonrpc":"2.0","id":"type","method":"tools/call","params":{"name":"computer_type","arguments":{"session_id":session,"expected_session_generation":1,"observation_id":observation,"window_id":"wid_other","pid":4242,"text":"hello"}}}).to_string();
+    let response = app
+        .clone()
+        .oneshot(bridge_request(&forged, KEY, "exec-a"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(typed.lock().unwrap().is_empty());
+
+    let allowed = json!({"jsonrpc":"2.0","id":"type","method":"tools/call","params":{"name":"computer_type","arguments":{"session_id":session,"expected_session_generation":1,"observation_id":observation,"window_id":"wid_fixture","pid":4242,"text":"hello"}}}).to_string();
+    let response = app
+        .oneshot(bridge_request(&allowed, KEY, "exec-a"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(typed.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn click_requires_element_from_same_session_find_observation() {
+    let provider = MockProvider::default();
+    let clicks = Arc::clone(&provider.clicks);
+    let app = ComputerRuntime::new(KEY.as_bytes(), provider)
+        .unwrap()
+        .router();
+    let open = r#"{"jsonrpc":"2.0","id":"open","method":"tools/call","params":{"name":"computer_session_open","arguments":{}}}"#;
+    let opened = body_json(
+        app.clone()
+            .oneshot(bridge_request(open, KEY, "exec-a"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let session = session_id(&opened);
+
+    let list = json!({"jsonrpc":"2.0","id":"windows","method":"tools/call","params":{"name":"computer_list_windows","arguments":{"session_id":session,"expected_session_generation":1}}}).to_string();
+    let listed = body_json(
+        app.clone()
+            .oneshot(bridge_request(&list, KEY, "exec-a"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let window_observation = listed["result"]["structuredContent"]["observation_id"]
+        .as_str()
+        .unwrap();
+
+    let find = json!({"jsonrpc":"2.0","id":"find","method":"tools/call","params":{"name":"computer_find","arguments":{"session_id":session,"expected_session_generation":1,"observation_id":window_observation,"window_id":"wid_fixture","pid":4242,"query":"Save","max_results":10}}}).to_string();
+    let found = body_json(
+        app.clone()
+            .oneshot(bridge_request(&find, KEY, "exec-a"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let element_observation = found["result"]["structuredContent"]["observation_id"]
+        .as_str()
+        .unwrap();
+
+    let forged = json!({"jsonrpc":"2.0","id":"click","method":"tools/call","params":{"name":"computer_click","arguments":{"session_id":session,"expected_session_generation":1,"observation_id":window_observation,"element_id":"el:Save","window_id":"wid_fixture","pid":4242}}}).to_string();
+    let response = app
+        .clone()
+        .oneshot(bridge_request(&forged, KEY, "exec-a"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(clicks.lock().unwrap().is_empty());
+
+    let allowed = json!({"jsonrpc":"2.0","id":"click","method":"tools/call","params":{"name":"computer_click","arguments":{"session_id":session,"expected_session_generation":1,"observation_id":element_observation,"element_id":"el:Save","window_id":"wid_fixture","pid":4242}}}).to_string();
+    let response = app
+        .oneshot(bridge_request(&allowed, KEY, "exec-a"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(clicks.lock().unwrap().len(), 1);
 }

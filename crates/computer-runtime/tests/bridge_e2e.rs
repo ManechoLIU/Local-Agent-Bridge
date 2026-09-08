@@ -118,7 +118,7 @@ mod macos {
             .oneshot(request(
                 "apps",
                 "computer_list_apps",
-                json!({"session_id":session}),
+                json!({"session_id":session,"expected_session_generation":1}),
             ))
             .await
             .unwrap();
@@ -141,7 +141,7 @@ mod macos {
             .oneshot(request(
                 "active",
                 "computer_active_window",
-                json!({"session_id":session}),
+                json!({"session_id":session,"expected_session_generation":1}),
             ))
             .await
             .unwrap();

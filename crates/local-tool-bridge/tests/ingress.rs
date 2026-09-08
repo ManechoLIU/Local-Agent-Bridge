@@ -432,7 +432,7 @@ async fn computer_tools_are_capability_gated_routed_and_merged_into_tools_list()
         .header("x-lab-ingress-key", KEY)
         .body(Body::from(computer_body))
         .unwrap();
-    let response = app.oneshot(computer_request).await.unwrap();
+    let response = app.clone().oneshot(computer_request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let computer_calls = computer_capture.0.lock().await;
     assert!(computer_calls.iter().any(|(_, body)| {
@@ -446,6 +446,26 @@ async fn computer_tools_are_capability_gated_routed_and_merged_into_tools_list()
             .get("x-lab-backend-key")
             .and_then(|v| v.to_str().ok())
             == Some(BACKEND_KEY)
+    }));
+
+    drop(computer_calls);
+    let screenshot_body = r#"{"jsonrpc":"2.0","id":"shot","method":"tools/call","params":{"name":"computer_screenshot","arguments":{}}}"#;
+    let screenshot_request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header("mcp-method", "tools/call")
+        .header("mcp-name", "computer_screenshot")
+        .header("x-lab-ingress-key", KEY)
+        .body(Body::from(screenshot_body))
+        .unwrap();
+    let response = app.clone().oneshot(screenshot_request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(computer_capture.0.lock().await.iter().any(|(_, body)| {
+        body.get("params")
+            .and_then(|v| v.get("name"))
+            .and_then(serde_json::Value::as_str)
+            == Some("computer_screenshot")
     }));
     let default_calls = default_capture.0.lock().await;
     assert!(!default_calls.iter().any(|(_, body)| {

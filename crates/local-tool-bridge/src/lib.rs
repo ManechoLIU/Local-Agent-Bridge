@@ -65,6 +65,12 @@ impl ToolPolicy {
             .insert("computer_list_windows", Capability::Computer)
             .insert("computer_active_window", Capability::Computer)
             .insert("computer_activate_app", Capability::Computer)
+            .insert("computer_screenshot", Capability::Computer)
+            .insert("computer_find", Capability::Computer)
+            .insert("computer_click", Capability::Computer)
+            .insert("computer_type", Capability::Computer)
+            .insert("computer_key", Capability::Computer)
+            .insert("computer_scroll", Capability::Computer)
     }
 
     pub fn required_capability(&self, method: &str, tool_name: &str) -> Result<Capability, String> {
