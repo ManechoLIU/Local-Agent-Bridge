@@ -1,0 +1,9 @@
+{
+  "name": "com.local_agent_bridge.web_host",
+  "description": "Local Agent Bridge Web Host native messaging adapter",
+  "path": "/ABSOLUTE/PATH/TO/experiments/web-host-attestation/chrome-host/native-host.mjs",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://REPLACE_WITH_INSTALLED_EXTENSION_ID/"
+  ]
+}

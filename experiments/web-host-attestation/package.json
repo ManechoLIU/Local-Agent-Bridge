@@ -3,6 +3,6 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test attestation.test.mjs"
+    "test": "node --test attestation.test.mjs chrome-host/*.test.mjs"
   }
 }

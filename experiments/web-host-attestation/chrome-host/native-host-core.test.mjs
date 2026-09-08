@@ -1,0 +1,153 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { RuntimeHostVerifier } from "../attestation.mjs";
+import {
+  createNativeHostHandler,
+  MAX_CONTINUATION_CHARS
+} from "./native-host-core.mjs";
+
+const SECRET = "chrome-host-test-secret-0123456789abcdef0123456789abcdef";
+const CONVERSATION = "6a9e4158-cc8c-83ea-9763-05a7fd51f597";
+
+function observation(targetId) {
+  return {
+    host_type: "chatgpt_web",
+    browser_target_id: targetId || "browser-target-7",
+    top_frame_id: "top-frame",
+    loader_id: "loader-current",
+    secure_origin: "https://chatgpt.com",
+    conversation_id: CONVERSATION,
+    observed_at_ms: 1800000000100,
+    source: "browser_cdp_page_frame_tree_v1"
+  };
+}
+
+test("native Host signs browser observation without exposing Host key to browser command", async function () {
+  let browserCommand;
+  const verifier = new RuntimeHostVerifier(SECRET, {
+    clock: function () { return 1800000000200; }
+  });
+  const challenge = verifier.issueChallenge({
+    conversation_id: CONVERSATION,
+    target_generation: 4,
+    ownership_generation: 8
+  });
+
+  const handle = createNativeHostHandler({
+    secret: SECRET,
+    clock: function () { return 1800000000200; },
+    sendBrowserCommand: async function (command) {
+      browserCommand = command;
+      return {
+        request_id: command.request_id,
+        ok: true,
+        result: { observation: observation() }
+      };
+    }
+  });
+
+  const result = await handle({ op: "attest", challenge: challenge });
+  assert.equal(browserCommand.op, "observe_conversation");
+  assert.equal(browserCommand.conversation_id, CONVERSATION);
+  assert.equal(JSON.stringify(browserCommand).includes(SECRET), false);
+
+  const verified = verifier.verifyAndConsume(result.attestation, {
+    conversation_id: CONVERSATION,
+    target_generation: 4,
+    ownership_generation: 8
+  });
+  assert.equal(verified.browser_target_id, "browser-target-7");
+  assert.equal(verified.top_frame_id, "top-frame");
+  assert.equal(verified.loader_id, "loader-current");
+});
+
+test("native Host rejects wrong target returned by browser machine boundary", async function () {
+  const handle = createNativeHostHandler({
+    secret: SECRET,
+    sendBrowserCommand: async function (command) {
+      return {
+        request_id: command.request_id,
+        ok: true,
+        result: { observation: observation("different-target") }
+      };
+    }
+  });
+  await assert.rejects(
+    handle({ op: "observe_target", browser_target_id: "expected-target" }),
+    /wrong target/
+  );
+});
+
+test("oversized continuation is rejected before browser dispatch", async function () {
+  let calls = 0;
+  const handle = createNativeHostHandler({
+    secret: SECRET,
+    sendBrowserCommand: async function (command) {
+      calls += 1;
+      return { request_id: command.request_id, ok: true, result: {} };
+    }
+  });
+  await assert.rejects(
+    handle({
+      op: "submit_continuation",
+      browser_target_id: "browser-target-7",
+      conversation_id: CONVERSATION,
+      payload: "x".repeat(MAX_CONTINUATION_CHARS + 1),
+      wake_id: "wake",
+      wake_nonce: "nonce"
+    }),
+    /payload exceeds limit/
+  );
+  assert.equal(calls, 0);
+});
+
+test("submit not implemented remains a confirmed pre-dispatch non-PASS result", async function () {
+  const handle = createNativeHostHandler({
+    secret: SECRET,
+    sendBrowserCommand: async function (command) {
+      return {
+        request_id: command.request_id,
+        ok: true,
+        result: {
+          dispatch_attempted: false,
+          submit_confirmed: false,
+          retryable: false,
+          status: "submit_not_implemented",
+          host_submit_receipt: null
+        }
+      };
+    }
+  });
+  const result = await handle({
+    op: "submit_continuation",
+    browser_target_id: "browser-target-7",
+    conversation_id: CONVERSATION,
+    payload: "resume",
+    wake_id: "wake",
+    wake_nonce: "nonce"
+  });
+  assert.deepEqual(result, {
+    dispatch_attempted: false,
+    submit_confirmed: false,
+    retryable: false,
+    status: "submit_not_implemented",
+    host_submit_receipt: null
+  });
+});
+
+test("browser response request id mismatch fails closed", async function () {
+  const handle = createNativeHostHandler({
+    secret: SECRET,
+    sendBrowserCommand: async function () {
+      return {
+        request_id: "wrong",
+        ok: true,
+        result: { observation: observation() }
+      };
+    }
+  });
+  await assert.rejects(
+    handle({ op: "observe_target", browser_target_id: "browser-target-7" }),
+    /request_id mismatch/
+  );
+});

@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Local Agent Bridge Web Host",
+  "version": "0.1.0",
+  "description": "Machine-boundary ChatGPT Web target observation for Local Agent Bridge.",
+  "permissions": ["debugger", "nativeMessaging"],
+  "host_permissions": ["https://chatgpt.com/*"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  }
+}
