@@ -34,6 +34,19 @@ test("Runtime-facing Chrome integration issues challenge obtains Host attestatio
     secret: SECRET,
     clock: function () { return 1800000000200; },
     sendBrowserCommand: async function (command) {
+      if (command.op === "submit_continuation") {
+        return {
+          request_id: command.request_id,
+          ok: true,
+          result: {
+            dispatch_attempted: true,
+            submit_confirmed: true,
+            retryable: false,
+            status: "submit_confirmed",
+            host_submit_receipt: "chrome_submit_integration"
+          }
+        };
+      }
       return {
         request_id: command.request_id,
         ok: true,
@@ -110,6 +123,21 @@ test("Runtime-facing Chrome integration issues challenge obtains Host attestatio
   assert.equal(result.verified_target.browser_target_id, "browser-target-integration");
   assert.equal(result.verified_target.target_generation, 7);
   assert.equal(result.verified_target.ownership_generation, 11);
+
+  const submitted = await integration.submitAndVerifyReentry({
+    host_receipt_id: result.host_receipt_id,
+    conversation_id: CONVERSATION,
+    wake_id: "wake-integration-full",
+    wake_nonce: "nonce-integration-full",
+    continuation_payload: "continue exact controller",
+    expected_target_generation: 7,
+    expected_ownership_generation: 11
+  });
+  assert.equal(submitted.result_class, "SUBMIT_CONFIRMED");
+  assert.equal(submitted.browser_target_id, "browser-target-integration");
+  assert.equal(submitted.wake_id, "wake-integration-full");
+  assert.equal(submitted.target_generation, 7);
+  assert.equal(submitted.ownership_generation, 11);
 });
 
 test("Runtime verifier command boundary returns only machine-verifiable attestation result", async function () {

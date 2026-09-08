@@ -82,7 +82,10 @@ export function createChromeRuntimeHostIntegration(options) {
       });
       return verifyReentryReceipt(secret, receipt, {
         wake_id: input && input.wake_id,
+        wake_nonce: input && input.wake_nonce,
+        continuation_payload: input && input.continuation_payload,
         conversation_id: input && input.conversation_id,
+        browser_target_id: verifiedTarget.browser_target_id,
         target_generation: input && input.expected_target_generation,
         ownership_generation: input && input.expected_ownership_generation
       });
