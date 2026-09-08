@@ -76,6 +76,10 @@ test("real native Host process bridges Unix socket to Native Messaging and signs
 
   let stdoutBuffer = Buffer.alloc(0);
   let stderr = "";
+  let resolveHelloAck;
+  const helloAck = new Promise(function (resolve) {
+    resolveHelloAck = resolve;
+  });
   child.stderr.on("data", function (chunk) {
     stderr += chunk.toString("utf8");
   });
@@ -85,6 +89,10 @@ test("real native Host process bridges Unix socket to Native Messaging and signs
     const parsed = consumeNativeFrames(stdoutBuffer);
     stdoutBuffer = parsed.remainder;
     for (const command of parsed.messages) {
+      if (command.kind === "extension_hello_ack" && command.request_id === "eh_test") {
+        resolveHelloAck(command);
+        continue;
+      }
       if (command.op !== "observe_conversation") continue;
       const response = {
         request_id: command.request_id,
@@ -107,6 +115,31 @@ test("real native Host process bridges Unix socket to Native Messaging and signs
   });
 
   await waitForSocket(socketPath);
+
+  child.stdin.write(encodeNativeMessage({
+    request_id: "eh_test",
+    op: "extension_hello",
+    interface_version: 1,
+    extension_id: "ikidefdlcddfomimpckflbajjccnmfna"
+  }));
+  const hello = await Promise.race([
+    helloAck,
+    new Promise(function (_, reject) {
+      setTimeout(function () {
+        reject(new Error("extension hello acknowledgement timed out"));
+      }, 2000);
+    })
+  ]);
+  assert.deepEqual(hello, {
+    kind: "extension_hello_ack",
+    request_id: "eh_test",
+    ok: true,
+    result: {
+      status: "native_host_ready",
+      interface_version: 1,
+      socket_path: socketPath
+    }
+  });
 
   const verifier = new RuntimeHostVerifier(SECRET);
   const challenge = verifier.issueChallenge({

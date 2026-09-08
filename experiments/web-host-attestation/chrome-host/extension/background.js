@@ -7,7 +7,36 @@ import { submitContinuationThroughChrome } from "./browser-submit.js";
 
 const NATIVE_HOST = "com.local_agent_bridge.web_host";
 const CDP_VERSION = "1.3";
+
+function setNativeDiagnostic(state, error, details) {
+  globalThis.__LAB_HOST_NATIVE_STATE = Object.freeze({
+    state: state,
+    error: error == null ? null : String(error),
+    socket_path: details?.socket_path == null ? null : String(details.socket_path),
+    updated_at_ms: Date.now()
+  });
+}
+
+setNativeDiagnostic("connecting", null);
 const port = chrome.runtime.connectNative(NATIVE_HOST);
+const extensionHelloId = "eh_" + crypto.randomUUID();
+
+port.onDisconnect.addListener(function () {
+  const message = chrome.runtime.lastError?.message || "native_port_disconnected";
+  setNativeDiagnostic("disconnected", message);
+});
+
+try {
+  port.postMessage({
+    request_id: extensionHelloId,
+    op: "extension_hello",
+    interface_version: 1,
+    extension_id: chrome.runtime.id
+  });
+  setNativeDiagnostic("handshake_sent", null);
+} catch (error) {
+  setNativeDiagnostic("disconnected", error?.message || "native_handshake_send_failed");
+}
 
 async function allTargets() {
   return await chrome.debugger.getTargets();
@@ -103,6 +132,16 @@ async function handleCommand(message) {
 port.onMessage.addListener(function (message) {
   const requestId = String(message && message.request_id || "");
   if (!requestId) return;
+  if (message?.kind === "extension_hello_ack" && requestId === extensionHelloId) {
+    if (message.ok === true && message?.result?.status === "native_host_ready") {
+      setNativeDiagnostic("connected", null, {
+        socket_path: message?.result?.socket_path
+      });
+    } else {
+      setNativeDiagnostic("disconnected", message?.error || "native_handshake_rejected");
+    }
+    return;
+  }
   handleCommand(message).then(function (result) {
     port.postMessage({ request_id: requestId, ok: true, result: result });
   }).catch(function (error) {

@@ -106,6 +106,19 @@ function consumeBrowserInput(chunk) {
   nativeInput = parsed.remainder;
   for (const message of parsed.messages) {
     const requestId = String(message && message.request_id || "");
+    if (message?.op === "extension_hello") {
+      sendNative({
+        kind: "extension_hello_ack",
+        request_id: requestId,
+        ok: true,
+        result: {
+          status: "native_host_ready",
+          interface_version: 1,
+          socket_path: socketPath
+        }
+      });
+      continue;
+    }
     const pending = pendingBrowser.get(requestId);
     if (!pending) continue;
     clearTimeout(pending.timeout);
