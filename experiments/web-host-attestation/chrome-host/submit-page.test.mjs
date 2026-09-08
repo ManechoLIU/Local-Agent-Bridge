@@ -107,13 +107,23 @@ test("prepare inserts payload and returns trusted click coordinates without synt
   assert.equal(page.syntheticClicks(), 0);
 });
 
-test("prepare clears its own payload when send button is unavailable", async function (t) {
+test("prepare keeps its own payload while send is unavailable so retry can resume", async function (t) {
   const page = withPage(t, { button: false });
   const result = await pagePrepareSubmitFunction("resume", CONVERSATION);
   assert.equal(result.ready_to_dispatch, false);
   assert.equal(result.retryable, true);
   assert.equal(result.status, "send_unavailable");
-  assert.equal(page.composer.innerText, "");
+  assert.equal(page.composer.innerText, "resume");
+});
+
+test("prepare reuses an identical Runtime-owned payload instead of treating it as a user draft", async function (t) {
+  const page = withPage(t, { initialText: "resume" });
+  const result = await pagePrepareSubmitFunction("resume", CONVERSATION);
+  assert.equal(result.ready_to_dispatch, true);
+  assert.equal(result.status, "ready_to_dispatch");
+  assert.deepEqual(result.click_point, { x: 120, y: 210 });
+  assert.equal(page.composer.innerText, "resume");
+  assert.equal(page.syntheticClicks(), 0);
 });
 
 test("prepare clears its own payload when send button has no clickable geometry", async function (t) {

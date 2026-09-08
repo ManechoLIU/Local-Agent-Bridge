@@ -127,7 +127,10 @@ export async function pagePrepareSubmitFunction(payloadValue, expectedConversati
       status: "composer_unavailable"
     };
   }
-  if (normalizedComposerText(composer) !== "") {
+
+  const existingComposerText = normalizedComposerText(composer);
+  const ownsPreparedPayload = existingComposerText === payload.trim();
+  if (existingComposerText !== "" && !ownsPreparedPayload) {
     return {
       ready_to_dispatch: false,
       dispatch_attempted: false,
@@ -137,17 +140,20 @@ export async function pagePrepareSubmitFunction(payloadValue, expectedConversati
     };
   }
 
-  insertPayload(composer, payload);
+  if (!ownsPreparedPayload) {
+    insertPayload(composer, payload);
+  }
 
   const sendButton = await waitForSendButton(1500);
   if (!sendButton) {
-    const cleaned = clearOwnPayloadIfSafe(composer, payload);
     return {
       ready_to_dispatch: false,
       dispatch_attempted: false,
       submit_confirmed: false,
-      retryable: cleaned,
-      status: cleaned ? "send_unavailable" : "composer_changed_before_dispatch"
+      retryable: normalizedComposerText(composer) === payload.trim(),
+      status: normalizedComposerText(composer) === payload.trim()
+        ? "send_unavailable"
+        : "composer_changed_before_dispatch"
     };
   }
 
