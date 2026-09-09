@@ -20,31 +20,49 @@ Minimal target sequence where the surface permits it:
 
 ## Current status
 
-| Surface | Official path | Local MCP preflight | Live provider UI/account | Real Web->LAB tool call | Status | Current blocker / next action |
-|---|---|---|---|---|---|---|
-| ChatGPT Personal Web | Secure MCP / Plugin reference path | PASS | PASS | **PASS** in mainline evidence | **REFERENCE PASS** | Owned by main Controller; do not duplicate |
-| Claude Web | Remote MCP custom connector | PASS using existing standard-MCP safe PoC server on 127.0.0.1:33302 | **PASS**: current Free account exposes Add custom connector + remote MCP URL field | NOT YET | **READY / INGRESS BLOCKED** | Current network/VPN blocks temporary public tunnel handshakes; retry with working public HTTPS ingress |
-| Kimi Web | Official Plugin containing MCP | reusable standard MCP server ready | **Web opened; not signed in** | NOT YET | **ACCOUNT + INGRESS GATED** | User login is required; then confirm supported K3/K3 Swarm/plugin surface and invoke LAB through official plugin/MCP |
-| Grok Web | Official custom MCP connector; official tunneling docs | reusable standard MCP server ready | **Connectors page opened; not signed in** | NOT YET | **ACCOUNT + INGRESS GATED** | User login + working public HTTPS ingress |
-| QwenWork | Official custom MCP client/connector | reusable server; may use remote HTTP or local STDIO depending surface | not checked in this cycle | NOT YET | **SURFACE VERIFY** | Confirm whether custom MCP can be added/used directly from Web or must be configured in desktop first |
-| Gemini Spark | Custom Connected Apps via standard MCP URL | reusable standard MCP server ready | current Gemini account is logged in, but Spark access not established | NOT YET | **ELIGIBILITY GATED** | Verify Spark access, US/personal account/English/Keep Activity conditions, then run PoC |
-| Coze Agent | Official custom MCP | reusable standard MCP server ready | not checked in this cycle | NOT YET | **POC READY BY PRODUCT** | Account/surface live E2E |
-| DeepSeek consumer Web | no official custom MCP established | n/a | n/a | NOT RUN | **DEPRIORITIZED** | Do not browser-automate without explicit permission; API is separate |
-| Doubao consumer Web | no direct official custom MCP established | n/a | n/a | NOT RUN | **DEPRIORITIZED** | Prefer Coze official MCP ecosystem; do not infer Coze=Doubao Web |
+| Surface | Official path | Live evidence | Real Web->LAB tool call | Status | Current blocker / next action |
+|---|---|---|---|---|---|
+| ChatGPT Personal Web | Secure MCP / Plugin reference path | mainline evidence | **PASS** | **REFERENCE PASS** | Owned by main Controller; do not duplicate |
+| Claude Web | Official Remote MCP custom connector | Free account added and connected `LAB Safe PoC`; Claude discovered all 7 safe tools | **PASS**: read, `/bin/pwd`, write, edit, start job, poll terminal | **FULL PASS** | Productize authenticated ingress; temporary unauthenticated tunnel is PoC-only |
+| Kimi Web | Official Plugin containing MCP | account logged in; Web plugin marketplace works; current official flow requires personal custom plugin registration through Kimi Work Plugin Builder | NOT YET | **NATIVE REGISTRATION GATED** | Kimi Work is not installed on this machine; create/register LAB personal plugin in Kimi Work, then invoke it from Kimi Web |
+| Grok Web | Official Custom MCP connector | account logged in; Connectors and enabled `New Connector` button confirmed; docs specify `New Connector -> Custom -> MCP URL` | NOT YET | **HOST UI BLOCKED** | Current AI-Bridge browser click does not open Grok's Radix connector dialog even though DOM says enabled; not a provider capability failure |
+| QwenWork Web | Official connector ecosystem / MCP-backed connectors | account logged in; Web connector marketplace verified; personal free Web UI exposes market/install only, no custom-MCP add control | NOT YET | **DESKTOP CONFIG GATED** | Official custom MCP setup is desktop-centric; QwenWork desktop is not installed here. Verify desktop-configured connector sync/use in Web |
+| Gemini Spark | Custom Connected Apps via standard MCP URL | personal account logged in; English UI checked; no `Switch to Spark` or `Custom apps for Spark` surfaced | NOT YET | **ELIGIBILITY BLOCKED** | Current account does not expose Spark. Google requires Spark access before custom MCP can be used |
+| Coze Agent | Official custom Streamable HTTP/SSE MCP | account logged in; custom `lab_safe_poc` saved; bound to default Agent; binding visible as `1 Agent` | NOT YET | **AGENT TOOLSET LOAD BLOCKED** | even after a new task, Agent runtime tool inventory omitted `lab_safe_poc`; registration/association passes but actual tool invocation does not |
+| DeepSeek consumer Web | no official custom MCP established | account surface available | NOT RUN | **DEPRIORITIZED** | Do not browser-automate without explicit permission; API is separate |
+| Doubao consumer Web | no direct official custom MCP established | not needed for representative official-MCP PoC | NOT RUN | **DEPRIORITIZED** | Prefer Coze official MCP ecosystem; do not infer Coze=Doubao Web |
 
-## Claude live attempt evidence
+## Claude live PASS evidence
 
-This cycle verified all preconditions except public reachability:
+Claude is the first non-ChatGPT Provider to complete the full safe Web -> LAB PoC in this research branch.
 
-- existing LAB safe PoC MCP server responds to standard initialize on 127.0.0.1:33302;
-- the server exposes only fixed isolated tools and does not expose arbitrary project paths/shell;
-- logged-in Claude Free UI exposes Settings -> Connectors -> Add -> Add custom connector;
-- the modal asks for Name and Remote MCP server URL over HTTPS;
-- no connector was saved and no account configuration was mutated;
-- localhost.run and Pinggy SSH tunnels stalled under the current network path;
-- Cloudflare Quick Tunnel allocated a URL but edge TLS negotiation failed with EOF; temporary processes were cleaned up.
+Observed path:
 
-This is **not a Claude failure**. It is a local network/public-ingress blocker.
+```text
+Claude Web
+  -> Anthropic Remote MCP
+  -> temporary public HTTPS tunnel
+  -> local LAB safe MCP server
+  -> isolated PoC workspace/process
+  -> result returned to Claude Web
+```
+
+Verified live:
+
+- current Claude Free account exposes custom remote MCP connectors;
+- `LAB Safe PoC` was saved and connected;
+- Claude discovered four read-only and three write/delete safe tools;
+- read-only calls require explicit approval under the selected connector policy;
+- write/job calls also require explicit approval;
+- `poc_command` executed fixed `/bin/pwd` and returned:
+  `/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge/experiments/web-local-poc/web-safe-workspace`;
+- `poc_write` succeeded in the isolated fixed target;
+- `poc_edit` returned:
+  `written-by-chatgpt-web-poc -> edited-by-chatgpt-web-poc`;
+- `poc_start_job` returned job id `eb372b1e-8a11-4ecb-a14f-b6e605a53361`;
+- `poc_poll_job` reached terminal `finished (code 0)` with `stdout: job-done`.
+
+The successful public ingress used a temporary PoC tunnel only. It must not be treated as the production ingress/security design.
 
 ## Fresh product corrections
 
@@ -64,13 +82,13 @@ Official QwenWork docs define QwenWork as an MCP client and document Streamable 
 
 ## Next PoC order
 
-Use official paths first and do not implement browser adapters where an official connector exists:
+Use official paths first and stop spending effort where the blocker is account/host tooling rather than provider feasibility:
 
-1. finish Claude Web once public ingress is reachable;
-2. Kimi Web Plugin/MCP;
-3. Grok Web BYO MCP;
-4. QwenWork exact Web/desktop connector behavior;
-5. Gemini Spark if current account is eligible;
-6. Coze Agent.
+1. productionize the provider-neutral authenticated HTTPS -> LAB ingress pattern learned from Claude;
+2. Grok Web BYO MCP once the host browser can open its custom-connector dialog;
+3. Kimi Work registration -> Kimi Web invocation;
+4. QwenWork desktop custom MCP -> Web visibility/use;
+5. Coze Agent toolset refresh/deploy behavior for an already associated custom MCP;
+6. Gemini only when a Spark-eligible account is available.
 
-One representative PASS per integration family is enough before expanding breadth. Do not require every Provider to repeat every security proof already owned by the shared LAB Tool Plane; Provider PoCs prove provider transport/tool invocation compatibility, while LAB security remains a shared product gate.
+One representative full PASS per integration family is enough before expanding breadth. The Claude full PASS already proves that a non-OpenAI consumer Web provider can invoke the shared LAB safe MCP over an official connector path.

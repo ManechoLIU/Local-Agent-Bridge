@@ -246,3 +246,7 @@ China:
 5. consumer browser adapters only when the exact consumer surface passes an explicit commercial gate.
 
 This sequence validates architectural diversity without starting all Providers simultaneously.
+
+## Agent Mesh and adaptive governance
+
+Multi-Provider must not imply Controller-mediated communication. Agents should be able to communicate directly across Web, desktop, local runtimes and Providers through an A2A-compatible Agent Mesh. Controller authority remains for canonical project state, policy, escalation and profile-dependent acceptance. Governance depth is adaptive (G0 Direct, G1 Delegated, G2 Mesh Collaboration, G3 Strong Governance). See `docs/a2a-agent-mesh-adaptive-governance.md` and `docs/edict-design-review.md`.
