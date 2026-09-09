@@ -12,10 +12,25 @@ import {
 import { pageSubmitOperationFunction } from "./submit-page.js";
 import { createTrustedInputController } from "./trusted-input.js";
 import { createSubmitTransactionQueue } from "./submit-transaction-queue.js";
+import { createCurrentEntryRegistry, selectCurrentEntryTarget } from "./current-entry-registry.js";
 
 const NATIVE_HOST = "com.local_agent_bridge.web_host";
 const submitJournal = createChromeSubmitJournal(chrome);
 const submitTransactions = createSubmitTransactionQueue();
+const currentEntryRegistry = createCurrentEntryRegistry();
+
+const currentEntryRequestFilter = {
+  urls: ["https://chatgpt.com/backend-api/*"]
+};
+chrome.webRequest.onBeforeRequest.addListener(function (details) {
+  currentEntryRegistry.observeStart(details);
+}, currentEntryRequestFilter);
+chrome.webRequest.onCompleted.addListener(function (details) {
+  currentEntryRegistry.observeFinish(details);
+}, currentEntryRequestFilter);
+chrome.webRequest.onErrorOccurred.addListener(function (details) {
+  currentEntryRegistry.observeFinish(details);
+}, currentEntryRequestFilter);
 
 function setNativeDiagnostic(state, error, details) {
   globalThis.__LAB_HOST_NATIVE_STATE = Object.freeze({
@@ -86,6 +101,34 @@ async function withDebugger(target, callback) {
   });
 }
 
+async function discoverCurrentEntryContext() {
+  const candidate = currentEntryRegistry.resolveCurrent();
+  if (!candidate) {
+    throw new Error("HOST_CURRENT_ENTRY_UNAVAILABLE: no active ChatGPT generation");
+  }
+  const target = selectCurrentEntryTarget(await allTargets(), candidate);
+  const observation = await withDebugger(target, async function (targetInfo, frameTree) {
+    return observationFromDebugger({
+      targetInfo,
+      frameTree,
+      observedAtMs: Date.now()
+    });
+  });
+  if (!currentEntryRegistry.isStillCurrent(candidate)) {
+    throw new Error("HOST_CURRENT_ENTRY_UNAVAILABLE: generation ended during machine observation");
+  }
+  return Object.freeze({
+    entry_scope: "runtime_invocation",
+    machine_source: "host_invocation_context_v1",
+    conversation_id: observation.conversation_id,
+    browser_target_id: observation.browser_target_id,
+    top_frame_id: observation.top_frame_id,
+    loader_id: observation.loader_id,
+    secure_origin: observation.secure_origin,
+    observed_at_ms: observation.observed_at_ms
+  });
+}
+
 async function observeConversation(conversationId) {
   const target = selectUniqueConversationTarget(await allTargets(), conversationId);
   return await withDebugger(target, async function (targetInfo, frameTree) {
@@ -138,6 +181,11 @@ startupRecovery.then(function (results) {
 
 async function handleCommand(message) {
   const op = String(message && message.op || "");
+  if (op === "discover_current_entry") {
+    return await submitTransactions.run(async function () {
+      return { current_entry_context: await discoverCurrentEntryContext() };
+    });
+  }
   if (op === "observe_conversation") {
     return await submitTransactions.run(async function () {
       return { observation: await observeConversation(message.conversation_id) };

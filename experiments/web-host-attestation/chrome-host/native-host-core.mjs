@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
+  signCurrentEntryEvidence,
   signHostAttestation,
   validateMachineObservation
 } from "../attestation.mjs";
@@ -163,6 +164,28 @@ export function createNativeHostHandler(options) {
         ...(live.submit_live_validated === true && Number.isSafeInteger(live.validated_at_ms)
           ? { submit_live_validated_at_ms: live.validated_at_ms }
           : {})
+      };
+    }
+
+    if (op === "discover_current_entry") {
+      if (Object.prototype.hasOwnProperty.call(request, "conversation_id")) {
+        throw new Error("current-entry discovery does not accept caller conversation identity");
+      }
+      const targetGeneration = positiveInteger(request.target_generation, "target_generation");
+      const ownershipGeneration = positiveInteger(request.ownership_generation, "ownership_generation");
+      const browserResult = await browser("discover_current_entry", {});
+      const machineContext = browserResult && browserResult.current_entry_context;
+      if (!machineContext) {
+        throw new Error("HOST_CURRENT_ENTRY_UNAVAILABLE: trusted Host invocation context unavailable");
+      }
+      return {
+        current_entry: signCurrentEntryEvidence({
+          secret: secret,
+          machineContext: machineContext,
+          targetGeneration: targetGeneration,
+          ownershipGeneration: ownershipGeneration,
+          clock: clock
+        })
       };
     }
 

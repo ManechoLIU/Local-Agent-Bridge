@@ -95,6 +95,7 @@ test("Runtime-facing Chrome integration issues challenge obtains Host attestatio
     "issueChallenge",
     "requestAttestation",
     "verifyAttestation",
+    "discoverCurrentEntry",
     "attestAndVerify",
     "consumeVerifiedTarget",
     "submitReentry",
@@ -363,4 +364,50 @@ test("Runtime verifier CLI process performs fresh challenge Host request and exa
   assert.equal(payload.verified_target.target_generation, 21);
   assert.equal(payload.verified_target.ownership_generation, 34);
   assert.equal(payload.verified_target.provenance, "runtime_host_verifier_v1");
+});
+
+test("Runtime verifier discover_current_entry never accepts caller conversation and returns Host machine entry", async function () {
+  const module = await import("./integration.mjs");
+  const calls = [];
+  const result = await module.executeRuntimeVerifierCommand({
+    operation: "discover_current_entry",
+    controller_id: "controller-existing",
+    target_generation: 21,
+    ownership_generation: 34
+  }, {
+    integration: {
+      async discoverCurrentEntry(input) {
+        calls.push(input);
+        return {
+          provenance: "runtime_host_current_entry_v1",
+          entry_scope: "runtime_invocation",
+          machine_source: "host_invocation_context_v1",
+          conversation_id: CONVERSATION,
+          browser_target_id: "browser-current-runtime",
+          top_frame_id: "frame-current-runtime",
+          loader_id: "loader-current-runtime",
+          secure_origin: "https://chatgpt.com",
+          target_generation: 21,
+          ownership_generation: 34,
+          host_receipt_id: "hce_runtime",
+          observed_at_unix_ms: 1800000000200
+        };
+      }
+    }
+  });
+  assert.deepEqual(calls, [{ target_generation: 21, ownership_generation: 34 }]);
+  assert.equal(result.ok, true);
+  assert.equal(result.operation, "discover_current_entry");
+  assert.equal(result.current_entry.conversation_id, CONVERSATION);
+  assert.equal(result.current_entry.provenance, "runtime_host_current_entry_v1");
+
+  await assert.rejects(
+    module.executeRuntimeVerifierCommand({
+      operation: "discover_current_entry",
+      conversation_id: CONVERSATION,
+      target_generation: 21,
+      ownership_generation: 34
+    }, { integration: { async discoverCurrentEntry() { return {}; } } }),
+    /caller.*conversation|conversation.*not.*accepted/i
+  );
 });

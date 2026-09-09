@@ -30,6 +30,7 @@ const RUNTIME_VERIFIER_BUNDLE_PATHS = Object.freeze([
   fileURLToPath(new URL("./extension/timeout-budget.js", import.meta.url)),
   fileURLToPath(new URL("./extension/manifest.json", import.meta.url)),
   fileURLToPath(new URL("./extension/background.js", import.meta.url)),
+  fileURLToPath(new URL("./extension/current-entry-registry.js", import.meta.url)),
   fileURLToPath(new URL("./extension/debugger-session.js", import.meta.url)),
   fileURLToPath(new URL("./extension/observation.js", import.meta.url)),
   fileURLToPath(new URL("./extension/browser-submit.js", import.meta.url)),

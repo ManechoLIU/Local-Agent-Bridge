@@ -78,6 +78,15 @@ export function createChromeHostDriver(options) {
   return Object.freeze({
     interface_version: 1,
 
+    async discoverCurrentEntry(input) {
+      const result = await requestNativeHost(socketPath, {
+        op: "discover_current_entry",
+        target_generation: Number(input && input.target_generation),
+        ownership_generation: Number(input && input.ownership_generation)
+      }, { timeoutMs: timeoutMs });
+      return result.current_entry;
+    },
+
     async attest(challenge) {
       const result = await requestNativeHost(socketPath, {
         op: "attest",

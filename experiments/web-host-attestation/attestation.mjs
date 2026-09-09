@@ -6,6 +6,11 @@ export const ATTESTATION_PROVENANCE = "browser_host_machine_attested_v1";
 export const MACHINE_OBSERVATION_SOURCE = "browser_cdp_page_frame_tree_v1";
 export const VERIFIED_TARGET_PROVENANCE = "runtime_host_verifier_v1";
 export const REENTRY_RECEIPT_PROVENANCE = "browser_host_reentry_receipt_v1";
+export const INVOCATION_ORIGIN_PROVENANCE = "runtime_invocation_origin_v1";
+export const MACHINE_INVOCATION_ORIGIN_SOURCE = "browser_cdp_invocation_origin_v1";
+export const CURRENT_ENTRY_PROVENANCE = "runtime_host_current_entry_v1";
+export const CURRENT_ENTRY_SCOPE = "runtime_invocation";
+export const HOST_INVOCATION_CONTEXT_SOURCE = "host_invocation_context_v1";
 
 function nonEmpty(value, name) {
   const text = String(value ?? "").trim();
@@ -202,6 +207,317 @@ export function validateMachineObservation(input) {
     throw new Error("conversation_id is not a stable ChatGPT conversation identifier");
   }
   return observation;
+}
+
+
+export function validateMachineInvocationOrigin(input) {
+  const origin = {
+    host_type: nonEmpty(input?.host_type, "invocation_origin.host_type"),
+    invocation_id: nonEmpty(input?.invocation_id, "invocation_origin.invocation_id"),
+    operation: nonEmpty(input?.operation, "invocation_origin.operation"),
+    browser_target_id: nonEmpty(input?.browser_target_id, "invocation_origin.browser_target_id"),
+    top_frame_id: nonEmpty(input?.top_frame_id, "invocation_origin.top_frame_id"),
+    loader_id: nonEmpty(input?.loader_id, "invocation_origin.loader_id"),
+    secure_origin: nonEmpty(input?.secure_origin, "invocation_origin.secure_origin"),
+    conversation_id: nonEmpty(input?.conversation_id, "invocation_origin.conversation_id"),
+    observed_at_ms: positiveInteger(input?.observed_at_ms, "invocation_origin.observed_at_ms"),
+    source: nonEmpty(input?.source, "invocation_origin.source")
+  };
+  if (origin.host_type !== "chatgpt_web") throw new Error("unsupported invocation origin host_type");
+  if (origin.secure_origin !== "https://chatgpt.com") throw new Error("invocation origin requires secure chatgpt.com origin");
+  if (origin.source !== MACHINE_INVOCATION_ORIGIN_SOURCE) {
+    throw new Error("invocation origin requires browser machine invocation provenance");
+  }
+  if (!/^[0-9a-f-]{20,80}$/i.test(origin.conversation_id)) {
+    throw new Error("invocation origin conversation_id is not a stable ChatGPT conversation identifier");
+  }
+  return Object.freeze(origin);
+}
+
+
+export function validateHostInvocationContext(input) {
+  const context = {
+    entry_scope: nonEmpty(input?.entry_scope, "current_entry.entry_scope"),
+    machine_source: nonEmpty(input?.machine_source, "current_entry.machine_source"),
+    conversation_id: nonEmpty(input?.conversation_id, "current_entry.conversation_id"),
+    browser_target_id: nonEmpty(input?.browser_target_id, "current_entry.browser_target_id"),
+    top_frame_id: nonEmpty(input?.top_frame_id, "current_entry.top_frame_id"),
+    loader_id: nonEmpty(input?.loader_id, "current_entry.loader_id"),
+    secure_origin: nonEmpty(input?.secure_origin, "current_entry.secure_origin"),
+    observed_at_ms: positiveInteger(input?.observed_at_ms, "current_entry.observed_at_ms")
+  };
+  if (context.entry_scope !== CURRENT_ENTRY_SCOPE) {
+    throw new Error("current-entry evidence must be bound to this Runtime invocation");
+  }
+  if (context.machine_source !== HOST_INVOCATION_CONTEXT_SOURCE) {
+    throw new Error("current-entry evidence requires trusted Host invocation context");
+  }
+  if (context.secure_origin !== "https://chatgpt.com") {
+    throw new Error("current-entry evidence requires secure ChatGPT origin");
+  }
+  if (!/^[0-9a-f-]{20,80}$/i.test(context.conversation_id)) {
+    throw new Error("current-entry conversation_id is not a stable ChatGPT conversation identifier");
+  }
+  return Object.freeze(context);
+}
+
+export function signCurrentEntryEvidence({
+  secret,
+  machineContext,
+  targetGeneration,
+  ownershipGeneration,
+  clock = Date.now,
+  ttlMs = 15_000,
+  maxObservationAgeMs = 30_000,
+  futureSkewMs = 5_000
+}) {
+  if (!secret || Buffer.byteLength(secret) < 32) throw new Error("host secret must be at least 32 bytes");
+  const context = validateHostInvocationContext(machineContext);
+  const now = nowMs(clock);
+  if (context.observed_at_ms > now + Number(futureSkewMs) || now - context.observed_at_ms > Number(maxObservationAgeMs)) {
+    throw new Error("current-entry Host invocation context is stale");
+  }
+  const evidence = {
+    schema_version: 1,
+    provenance: CURRENT_ENTRY_PROVENANCE,
+    entry_scope: CURRENT_ENTRY_SCOPE,
+    machine_source: HOST_INVOCATION_CONTEXT_SOURCE,
+    conversation_id: context.conversation_id,
+    browser_target_id: context.browser_target_id,
+    top_frame_id: context.top_frame_id,
+    loader_id: context.loader_id,
+    secure_origin: context.secure_origin,
+    target_generation: positiveInteger(targetGeneration, "current_entry.target_generation"),
+    ownership_generation: positiveInteger(ownershipGeneration, "current_entry.ownership_generation"),
+    host_receipt_id: `hce_${randomUUID()}`,
+    observed_at_unix_ms: context.observed_at_ms,
+    issued_at_unix_ms: now,
+    expires_at_unix_ms: now + positiveInteger(ttlMs, "current_entry.ttlMs")
+  };
+  return Object.freeze({ ...evidence, host_mac_sha256: hmac(secret, evidence) });
+}
+
+export function verifyCurrentEntryEvidence({
+  secret,
+  evidence,
+  expectedTargetGeneration,
+  expectedOwnershipGeneration,
+  clock = Date.now,
+  futureSkewMs = 5_000
+}) {
+  if (!secret || Buffer.byteLength(secret) < 32) throw new Error("host secret must be at least 32 bytes");
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) {
+    throw new Error("current-entry evidence object is required");
+  }
+  const unsigned = { ...evidence };
+  const mac = nonEmpty(unsigned.host_mac_sha256, "current_entry.host_mac_sha256");
+  delete unsigned.host_mac_sha256;
+  if (!secureEqualHex(mac, hmac(secret, unsigned))) {
+    throw new Error("current-entry evidence authentication failed");
+  }
+  if (Number(evidence.schema_version) !== 1 || evidence.schema_version !== 1) throw new Error("current-entry schema_version is unsupported");
+  if (evidence.provenance !== CURRENT_ENTRY_PROVENANCE) throw new Error("current-entry provenance is not trusted");
+  if (evidence.entry_scope !== CURRENT_ENTRY_SCOPE) throw new Error("current-entry scope is not runtime invocation");
+  if (evidence.machine_source !== HOST_INVOCATION_CONTEXT_SOURCE) throw new Error("current-entry machine source is not trusted");
+  if (nonEmpty(evidence.secure_origin, "current_entry.secure_origin") !== "https://chatgpt.com") throw new Error("current-entry secure origin is invalid");
+  const conversation = nonEmpty(evidence.conversation_id, "current_entry.conversation_id");
+  if (!/^[0-9a-f-]{20,80}$/i.test(conversation)) throw new Error("current-entry conversation_id is invalid");
+  nonEmpty(evidence.browser_target_id, "current_entry.browser_target_id");
+  nonEmpty(evidence.top_frame_id, "current_entry.top_frame_id");
+  nonEmpty(evidence.loader_id, "current_entry.loader_id");
+  nonEmpty(evidence.host_receipt_id, "current_entry.host_receipt_id");
+  const targetGeneration = positiveInteger(evidence.target_generation, "current_entry.target_generation");
+  const ownershipGeneration = positiveInteger(evidence.ownership_generation, "current_entry.ownership_generation");
+  if (targetGeneration !== positiveInteger(expectedTargetGeneration, "expected target generation")) throw new Error("current-entry target generation mismatch");
+  if (ownershipGeneration !== positiveInteger(expectedOwnershipGeneration, "expected ownership generation")) throw new Error("current-entry ownership generation mismatch");
+  const observedAt = positiveInteger(evidence.observed_at_unix_ms, "current_entry.observed_at_unix_ms");
+  const issuedAt = positiveInteger(evidence.issued_at_unix_ms, "current_entry.issued_at_unix_ms");
+  const expiresAt = positiveInteger(evidence.expires_at_unix_ms, "current_entry.expires_at_unix_ms");
+  const now = nowMs(clock);
+  if (observedAt > now + Number(futureSkewMs) || issuedAt > now + Number(futureSkewMs)) throw new Error("current-entry evidence is from the future");
+  if (expiresAt <= issuedAt || now > expiresAt) throw new Error("current-entry evidence expired");
+  return Object.freeze({ ...evidence, host_mac_sha256: mac });
+}
+
+function normalizeInvocationOriginChallenge(input) {
+  const challenge = {
+    schema_version: Number(input?.schema_version),
+    challenge_id: nonEmpty(input?.challenge_id, "invocation challenge_id"),
+    challenge_nonce: nonEmpty(input?.challenge_nonce, "invocation challenge_nonce"),
+    host_type: nonEmpty(input?.host_type, "invocation host_type"),
+    invocation_id: nonEmpty(input?.invocation_id, "invocation_id"),
+    operation: nonEmpty(input?.operation, "operation"),
+    target_generation: positiveInteger(input?.target_generation, "target_generation"),
+    ownership_generation: positiveInteger(input?.ownership_generation, "ownership_generation"),
+    issued_at_ms: positiveInteger(input?.issued_at_ms, "issued_at_ms"),
+    expires_at_ms: positiveInteger(input?.expires_at_ms, "expires_at_ms")
+  };
+  if (challenge.schema_version !== 1) throw new Error("invocation challenge schema_version is unsupported");
+  if (challenge.host_type !== "chatgpt_web") throw new Error("invocation challenge host_type is unsupported");
+  if (challenge.expires_at_ms <= challenge.issued_at_ms) throw new Error("invocation challenge expiry is invalid");
+  return challenge;
+}
+
+export function signRuntimeInvocationOriginReceipt({
+  secret,
+  challenge,
+  machineOrigin,
+  hostEpoch,
+  clock = Date.now,
+  ttlMs = 15_000
+}) {
+  if (!secret || Buffer.byteLength(secret) < 32) throw new Error("host secret must be at least 32 bytes");
+  const normalizedChallenge = normalizeInvocationOriginChallenge(challenge);
+  const origin = validateMachineInvocationOrigin(machineOrigin);
+  const epoch = nonEmpty(hostEpoch, "host_epoch");
+  if (origin.invocation_id !== normalizedChallenge.invocation_id) {
+    throw new Error("machine invocation_id does not match Runtime challenge");
+  }
+  if (origin.operation !== normalizedChallenge.operation) {
+    throw new Error("machine invocation operation does not match Runtime challenge");
+  }
+  const issuedAt = nowMs(clock);
+  const receipt = {
+    schema_version: 1,
+    receipt_id: `rio_${randomUUID()}`,
+    provenance: INVOCATION_ORIGIN_PROVENANCE,
+    host_type: origin.host_type,
+    conversation_id: origin.conversation_id,
+    browser_target_id: origin.browser_target_id,
+    top_frame_id: origin.top_frame_id,
+    loader_id: origin.loader_id,
+    secure_origin: origin.secure_origin,
+    invocation_id: origin.invocation_id,
+    operation: origin.operation,
+    challenge_id: normalizedChallenge.challenge_id,
+    challenge_nonce_sha256: sha256Text(normalizedChallenge.challenge_nonce),
+    target_generation: normalizedChallenge.target_generation,
+    ownership_generation: normalizedChallenge.ownership_generation,
+    observed_at_ms: origin.observed_at_ms,
+    issued_at_ms: issuedAt,
+    expires_at_ms: Math.min(
+      issuedAt + positiveInteger(ttlMs, "invocation receipt ttlMs"),
+      normalizedChallenge.expires_at_ms
+    ),
+    host_epoch: epoch,
+    single_use: true,
+    machine_origin_source: origin.source
+  };
+  return Object.freeze({ ...receipt, host_mac_sha256: hmac(secret, receipt) });
+}
+
+export class RuntimeInvocationOriginVerifier {
+  constructor(secret, {
+    clock = Date.now,
+    challengeTtlMs = 30_000,
+    receiptTtlMs = 15_000,
+    attestationSkewMs = 5_000,
+    hostEpoch,
+    statePath = null
+  } = {}) {
+    if (!secret || Buffer.byteLength(secret) < 32) throw new Error("verifier secret must be at least 32 bytes");
+    this.secret = secret;
+    this.clock = clock;
+    this.challengeTtlMs = positiveInteger(challengeTtlMs, "challengeTtlMs");
+    this.receiptTtlMs = positiveInteger(receiptTtlMs, "receiptTtlMs");
+    this.attestationSkewMs = Number(attestationSkewMs);
+    this.hostEpoch = nonEmpty(hostEpoch, "hostEpoch");
+    this.statePath = statePath;
+    const persisted = loadPrivateState(statePath);
+    this.challenges = new Map(Array.isArray(persisted?.challenges) ? persisted.challenges : []);
+    this.usedReceipts = new Set(persisted?.used_receipts ?? []);
+  }
+
+  #persist() {
+    savePrivateState(this.statePath, {
+      schema_version: 1,
+      challenges: [...this.challenges.entries()],
+      used_receipts: [...this.usedReceipts]
+    });
+  }
+
+  issueChallenge({ invocation_id, operation, target_generation, ownership_generation }) {
+    const issuedAt = nowMs(this.clock);
+    const challenge = Object.freeze({
+      schema_version: 1,
+      challenge_id: `ric_${randomUUID()}`,
+      challenge_nonce: randomBytes(24).toString("hex"),
+      host_type: "chatgpt_web",
+      invocation_id: nonEmpty(invocation_id, "invocation_id"),
+      operation: nonEmpty(operation, "operation"),
+      target_generation: positiveInteger(target_generation, "target_generation"),
+      ownership_generation: positiveInteger(ownership_generation, "ownership_generation"),
+      issued_at_ms: issuedAt,
+      expires_at_ms: issuedAt + this.challengeTtlMs
+    });
+    this.challenges.set(challenge.challenge_id, { challenge: structuredClone(challenge), consumed: false });
+    this.#persist();
+    return structuredClone(challenge);
+  }
+
+  verifyAndConsume(receipt, expected = {}) {
+    const now = nowMs(this.clock);
+    if (Number(receipt?.schema_version) !== 1 || receipt?.schema_version !== 1) {
+      throw new Error("invocation origin receipt schema_version is unsupported");
+    }
+    const challengeId = nonEmpty(receipt?.challenge_id, "receipt.challenge_id");
+    const challengeRecord = this.challenges.get(challengeId);
+    if (!challengeRecord) throw new Error("unknown invocation origin challenge");
+    if (challengeRecord.consumed) throw new Error("invocation origin challenge was already consumed");
+    const challenge = normalizeInvocationOriginChallenge(challengeRecord.challenge);
+    if (now > challenge.expires_at_ms) throw new Error("invocation origin challenge expired");
+
+    const unsigned = { ...receipt };
+    const mac = nonEmpty(unsigned.host_mac_sha256, "receipt.host_mac_sha256");
+    delete unsigned.host_mac_sha256;
+    if (!secureEqualHex(mac, hmac(this.secret, unsigned))) {
+      throw new Error("invocation origin receipt authentication failed");
+    }
+    if (receipt.provenance !== INVOCATION_ORIGIN_PROVENANCE) throw new Error("untrusted invocation origin receipt provenance");
+    if (receipt.host_type !== challenge.host_type) throw new Error("invocation origin host_type mismatch");
+    if (receipt.invocation_id !== challenge.invocation_id) throw new Error("invocation_id does not match challenge");
+    if (receipt.operation !== challenge.operation) throw new Error("invocation operation does not match challenge");
+    if (receipt.target_generation !== challenge.target_generation) throw new Error("target generation does not match challenge");
+    if (receipt.ownership_generation !== challenge.ownership_generation) throw new Error("ownership generation does not match challenge");
+    if (receipt.challenge_nonce_sha256 !== sha256Text(challenge.challenge_nonce)) throw new Error("invocation challenge nonce mismatch");
+    if (receipt.host_epoch !== this.hostEpoch) throw new Error("Host epoch mismatch after restart");
+    if (receipt.single_use !== true) throw new Error("invocation origin receipt must be single-use");
+    if (receipt.machine_origin_source !== MACHINE_INVOCATION_ORIGIN_SOURCE) throw new Error("invocation origin machine source mismatch");
+    if (this.usedReceipts.has(receipt.receipt_id)) throw new Error("invocation origin receipt replayed");
+
+    const origin = validateMachineInvocationOrigin({
+      host_type: receipt.host_type,
+      invocation_id: receipt.invocation_id,
+      operation: receipt.operation,
+      browser_target_id: receipt.browser_target_id,
+      top_frame_id: receipt.top_frame_id,
+      loader_id: receipt.loader_id,
+      secure_origin: receipt.secure_origin,
+      conversation_id: receipt.conversation_id,
+      observed_at_ms: receipt.observed_at_ms,
+      source: receipt.machine_origin_source
+    });
+    if (origin.observed_at_ms < challenge.issued_at_ms - this.attestationSkewMs || origin.observed_at_ms > now + this.attestationSkewMs) {
+      throw new Error("invocation origin machine observation is not fresh for challenge");
+    }
+    if (receipt.issued_at_ms < challenge.issued_at_ms || receipt.issued_at_ms > now + this.attestationSkewMs) {
+      throw new Error("invocation origin receipt issue time is not fresh");
+    }
+    if (receipt.expires_at_ms > challenge.expires_at_ms || receipt.expires_at_ms > receipt.issued_at_ms + this.receiptTtlMs || now > receipt.expires_at_ms) {
+      throw new Error("invocation origin receipt expired or outlives challenge");
+    }
+
+    if (expected.invocation_id && receipt.invocation_id !== expected.invocation_id) throw new Error("wrong invocation_id");
+    if (expected.operation && receipt.operation !== expected.operation) throw new Error("wrong invocation operation");
+    if (expected.conversation_id && receipt.conversation_id !== expected.conversation_id) throw new Error("wrong invocation conversation");
+    if (expected.target_generation && receipt.target_generation !== expected.target_generation) throw new Error("stale target generation");
+    if (expected.ownership_generation && receipt.ownership_generation !== expected.ownership_generation) throw new Error("stale ownership generation");
+
+    challengeRecord.consumed = true;
+    this.usedReceipts.add(nonEmpty(receipt.receipt_id, "receipt.receipt_id"));
+    this.#persist();
+    return Object.freeze({ ...receipt });
+  }
 }
 
 

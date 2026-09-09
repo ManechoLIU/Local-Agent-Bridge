@@ -299,3 +299,68 @@ test("native Host submit diagnostics are structurally whitelisted and never carr
   assert.equal(serialized.includes("MUST_NOT_ESCAPE"), false);
   assert.equal(serialized.includes("secret prompt body"), false);
 });
+
+test("current-entry discovery rejects caller conversation and requires browser machine invocation context", async function () {
+  let calls = 0;
+  const handle = createNativeHostHandler({
+    secret: SECRET,
+    clock: function () { return 1800000000200; },
+    sendBrowserCommand: async function (command) {
+      calls += 1;
+      return { request_id: command.request_id, ok: false, error: "HOST_CURRENT_ENTRY_UNAVAILABLE: no active ChatGPT generation" };
+    }
+  });
+  await assert.rejects(
+    handle({ op: "discover_current_entry", conversation_id: CONVERSATION, target_generation: 4, ownership_generation: 8 }),
+    /caller.*conversation|conversation.*not.*accepted/i
+  );
+  assert.equal(calls, 0);
+  await assert.rejects(
+    handle({ op: "discover_current_entry", target_generation: 4, ownership_generation: 8 }),
+    /CURRENT_ENTRY_UNAVAILABLE|active ChatGPT generation/i
+  );
+  assert.equal(calls, 1);
+});
+
+test("current-entry discovery signs only browser-provided runtime-invocation machine context", async function () {
+  let browserCommand = null;
+  const handle = createNativeHostHandler({
+    secret: SECRET,
+    clock: function () { return 1800000000200; },
+    sendBrowserCommand: async function (command) {
+      browserCommand = command;
+      return {
+        request_id: command.request_id,
+        ok: true,
+        result: {
+          current_entry_context: {
+            entry_scope: "runtime_invocation",
+            machine_source: "host_invocation_context_v1",
+            conversation_id: CONVERSATION,
+            browser_target_id: "browser-target-current-entry",
+            top_frame_id: "top-frame-current-entry",
+            loader_id: "loader-current-entry",
+            secure_origin: "https://chatgpt.com",
+            observed_at_ms: 1800000000150
+          }
+        }
+      };
+    }
+  });
+  const result = await handle({ op: "discover_current_entry", target_generation: 4, ownership_generation: 8 });
+  assert.equal(browserCommand.op, "discover_current_entry");
+  assert.equal(Object.prototype.hasOwnProperty.call(browserCommand, "conversation_id"), false);
+  assert.equal(result.current_entry.provenance, "runtime_host_current_entry_v1");
+  assert.equal(result.current_entry.entry_scope, "runtime_invocation");
+  assert.equal(result.current_entry.machine_source, "host_invocation_context_v1");
+  assert.equal(result.current_entry.conversation_id, CONVERSATION);
+  assert.equal(result.current_entry.browser_target_id, "browser-target-current-entry");
+  assert.equal(result.current_entry.top_frame_id, "top-frame-current-entry");
+  assert.equal(result.current_entry.loader_id, "loader-current-entry");
+  assert.equal(result.current_entry.secure_origin, "https://chatgpt.com");
+  assert.equal(result.current_entry.target_generation, 4);
+  assert.equal(result.current_entry.ownership_generation, 8);
+  assert.match(result.current_entry.host_receipt_id, /^hce_/);
+  assert.equal(result.current_entry.observed_at_unix_ms, 1800000000150);
+  assert.match(result.current_entry.host_mac_sha256, /^[0-9a-f]{64}$/);
+});

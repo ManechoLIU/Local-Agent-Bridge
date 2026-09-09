@@ -1,5 +1,5 @@
 import { createRuntimeHostProvider } from "../provider.mjs";
-import { verifyReentryReceipt } from "../attestation.mjs";
+import { verifyCurrentEntryEvidence, verifyReentryReceipt } from "../attestation.mjs";
 import { createChromeHostDriver } from "./client.mjs";
 import { RUNTIME_HOST_REQUEST_TIMEOUT_MS } from "./extension/timeout-budget.js";
 
@@ -30,7 +30,7 @@ export function createChromeRuntimeHostIntegration(options) {
       "issueChallenge",
       "requestAttestation",
       "verifyAttestation",
-      "attestAndVerify",
+      "discoverCurrentEntry",      "attestAndVerify",
       "consumeVerifiedTarget",
       "submitReentry",
       "submitAndVerifyReentry"
@@ -46,6 +46,17 @@ export function createChromeRuntimeHostIntegration(options) {
 
     verifyAttestation(attestation, expected) {
       return provider.verifyAttestation(attestation, expected);
+    },
+
+    async discoverCurrentEntry(input) {
+      const raw = await driver.discoverCurrentEntry(input);
+      return verifyCurrentEntryEvidence({
+        secret: secret,
+        evidence: raw,
+        expectedTargetGeneration: input && input.target_generation,
+        expectedOwnershipGeneration: input && input.ownership_generation,
+        clock: clock
+      });
     },
 
     async attestAndVerify(input) {
@@ -109,12 +120,43 @@ function requiredRuntimeGeneration(value, name) {
 
 export async function executeRuntimeVerifierCommand(input, options) {
   const operation = requiredRuntimeText(input && input.operation, "operation", 64);
-  if (operation !== "attest_and_verify" && operation !== "submit_reentry") {
+  if (operation !== "discover_current_entry" && operation !== "attest_and_verify" && operation !== "submit_reentry") {
     throw new Error("unsupported Runtime Host operation: " + operation);
   }
   const integration = options && options.integration;
   if (!integration) {
     throw new Error("Runtime Host integration is required");
+  }
+
+  if (operation === "discover_current_entry") {
+    if (Object.prototype.hasOwnProperty.call(input || {}, "conversation_id")) {
+      throw new Error("current-entry discovery does not accept caller conversation identity");
+    }
+    if (typeof integration.discoverCurrentEntry !== "function") {
+      throw new Error("Runtime Host current-entry integration is required");
+    }
+    const request = {
+      target_generation: requiredRuntimeGeneration(input && input.target_generation, "target_generation"),
+      ownership_generation: requiredRuntimeGeneration(input && input.ownership_generation, "ownership_generation")
+    };
+    const current = await integration.discoverCurrentEntry(request);
+    if (!current || current.provenance !== "runtime_host_current_entry_v1" ||
+        current.entry_scope !== "runtime_invocation" ||
+        current.machine_source !== "host_invocation_context_v1") {
+      throw new Error("Runtime Host current-entry discovery did not return trusted machine evidence");
+    }
+    if (current.target_generation !== request.target_generation ||
+        current.ownership_generation !== request.ownership_generation) {
+      throw new Error("Runtime Host current-entry discovery returned stale ownership fence");
+    }
+    if (current.secure_origin !== "https://chatgpt.com") {
+      throw new Error("Runtime Host current-entry discovery returned invalid secure origin");
+    }
+    for (const field of ["conversation_id", "browser_target_id", "top_frame_id", "loader_id", "host_receipt_id"]) {
+      requiredRuntimeText(current[field], "current_entry." + field, 512);
+    }
+    requiredRuntimeGeneration(current.observed_at_unix_ms, "current_entry.observed_at_unix_ms");
+    return Object.freeze({ ok: true, operation: operation, current_entry: current });
   }
 
   if (operation === "attest_and_verify") {

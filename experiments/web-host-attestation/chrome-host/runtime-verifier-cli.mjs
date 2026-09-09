@@ -32,7 +32,7 @@ async function main() {
   const input = await readOneJsonLine();
   const operation = String(input?.operation || "").trim();
   let integration = null;
-  if (operation === "attest_and_verify" || operation === "submit_reentry") {
+  if (operation === "discover_current_entry" || operation === "attest_and_verify" || operation === "submit_reentry") {
     const root = join(homedir(), ".local-agent-bridge", "web-host");
     const keyPath = process.env.LAB_HOST_ATTESTATION_KEY_FILE || join(root, "attestation.key");
     const socketPath = process.env.LAB_HOST_ADAPTER_SOCKET || join(root, "host.sock");

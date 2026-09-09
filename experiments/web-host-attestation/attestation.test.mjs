@@ -7,10 +7,13 @@ import { tmpdir } from "node:os";
 import {
   MACHINE_OBSERVATION_SOURCE,
   RuntimeHostVerifier,
+  RuntimeInvocationOriginVerifier,
   WebReentryAdapter,
   machineObservationFromFrameTree,
   signHostAttestation,
+  signRuntimeInvocationOriginReceipt,
   validateMachineObservation,
+  validateMachineInvocationOrigin,
   verifyReentryReceipt
 } from "./attestation.mjs";
 import { createHostDriver } from "./host-driver.mjs";
@@ -830,4 +833,174 @@ test("signed re-entry receipt carries structured submit diagnostics without prom
   assert.equal(verifiedReceipt.submit_diagnostics.debugger_attach.ok, true);
   assert.equal(verifiedReceipt.submit_diagnostics.confirmation.exact_new_user_message, true);
   assert.equal(JSON.stringify(verifiedReceipt.submit_diagnostics).includes("sensitive continuation body"), false);
+});
+
+
+const INVOCATION_ID = "f98bbb53-3c0e-480b-814a-e0c1f75c98c6/3htx";
+
+function invocationOrigin(at = 1_800_000_000_100, overrides = {}) {
+  return {
+    host_type: "chatgpt_web",
+    invocation_id: INVOCATION_ID,
+    operation: "controller_privileged_mutation",
+    browser_target_id: "browser-target-origin-1",
+    top_frame_id: "frame-origin-1",
+    loader_id: "loader-origin-1",
+    secure_origin: "https://chatgpt.com",
+    conversation_id: CONVERSATION,
+    observed_at_ms: at,
+    source: "browser_cdp_invocation_origin_v1",
+    ...overrides
+  };
+}
+
+test("runtime invocation origin challenge never accepts or carries caller conversation identity", () => {
+  const time = clock();
+  const verifier = new RuntimeInvocationOriginVerifier(SECRET, {
+    clock: time.now,
+    hostEpoch: "host-epoch-a"
+  });
+  const challenge = verifier.issueChallenge({
+    invocation_id: INVOCATION_ID,
+    operation: "controller_privileged_mutation",
+    target_generation: 7,
+    ownership_generation: 7,
+    conversation_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+  });
+  assert.equal("conversation_id" in challenge, false);
+  assert.equal(challenge.invocation_id, INVOCATION_ID);
+  assert.equal(challenge.operation, "controller_privileged_mutation");
+});
+
+test("runtime invocation origin receipt binds machine origin and verifies exactly once", () => {
+  const time = clock();
+  const verifier = new RuntimeInvocationOriginVerifier(SECRET, {
+    clock: time.now,
+    hostEpoch: "host-epoch-a"
+  });
+  const challenge = verifier.issueChallenge({
+    invocation_id: INVOCATION_ID,
+    operation: "controller_privileged_mutation",
+    target_generation: 7,
+    ownership_generation: 7
+  });
+  time.add(50);
+  const receipt = signRuntimeInvocationOriginReceipt({
+    secret: SECRET,
+    challenge,
+    machineOrigin: invocationOrigin(time.now()),
+    hostEpoch: "host-epoch-a",
+    clock: time.now
+  });
+  const verified = verifier.verifyAndConsume(receipt, {
+    invocation_id: INVOCATION_ID,
+    operation: "controller_privileged_mutation",
+    conversation_id: CONVERSATION,
+    target_generation: 7,
+    ownership_generation: 7
+  });
+  assert.equal(verified.provenance, "runtime_invocation_origin_v1");
+  assert.equal(verified.conversation_id, CONVERSATION);
+  assert.equal(verified.browser_target_id, "browser-target-origin-1");
+  assert.equal(verified.top_frame_id, "frame-origin-1");
+  assert.equal(verified.loader_id, "loader-origin-1");
+  assert.equal(verified.invocation_id, INVOCATION_ID);
+  assert.equal(verified.operation, "controller_privileged_mutation");
+  assert.throws(() => verifier.verifyAndConsume(receipt), /already consumed|replay/i);
+});
+
+test("runtime invocation origin rejects foreign conversation operation generation and forged machine source", () => {
+  const cases = [
+    ["conversation", { expected: { conversation_id: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff" }, pattern: /conversation/i }],
+    ["operation", { expected: { operation: "different_operation" }, pattern: /operation/i }],
+    ["target generation", { expected: { target_generation: 8 }, pattern: /target generation/i }],
+    ["ownership generation", { expected: { ownership_generation: 8 }, pattern: /ownership generation/i }]
+  ];
+  for (const [name, spec] of cases) {
+    const time = clock();
+    const verifier = new RuntimeInvocationOriginVerifier(SECRET, { clock: time.now, hostEpoch: "host-epoch-a" });
+    const challenge = verifier.issueChallenge({
+      invocation_id: INVOCATION_ID,
+      operation: "controller_privileged_mutation",
+      target_generation: 7,
+      ownership_generation: 7
+    });
+    time.add(10);
+    const receipt = signRuntimeInvocationOriginReceipt({
+      secret: SECRET,
+      challenge,
+      machineOrigin: invocationOrigin(time.now()),
+      hostEpoch: "host-epoch-a",
+      clock: time.now
+    });
+    assert.throws(() => verifier.verifyAndConsume(receipt, spec.expected), spec.pattern, name);
+  }
+
+  assert.throws(
+    () => validateMachineInvocationOrigin(invocationOrigin(undefined, { source: "caller_supplied_conversation" })),
+    /machine invocation provenance/i
+  );
+});
+
+test("runtime invocation origin receipt expires and dies across Host epoch restart", () => {
+  const time = clock();
+  const originStateDir = mkdtempSync(join(tmpdir(), "lab-invocation-origin-state-"));
+  const originStatePath = join(originStateDir, "state.json");
+  const first = new RuntimeInvocationOriginVerifier(SECRET, {
+    clock: time.now,
+    hostEpoch: "host-epoch-a",
+    challengeTtlMs: 100,
+    receiptTtlMs: 50,
+    statePath: originStatePath
+  });
+  const challenge = first.issueChallenge({
+    invocation_id: INVOCATION_ID,
+    operation: "controller_privileged_mutation",
+    target_generation: 7,
+    ownership_generation: 7
+  });
+  time.add(10);
+  const receipt = signRuntimeInvocationOriginReceipt({
+    secret: SECRET,
+    challenge,
+    machineOrigin: invocationOrigin(time.now()),
+    hostEpoch: "host-epoch-a",
+    clock: time.now,
+    ttlMs: 50
+  });
+
+  const restarted = new RuntimeInvocationOriginVerifier(SECRET, {
+    clock: time.now,
+    hostEpoch: "host-epoch-b",
+    statePath: originStatePath
+  });
+  assert.throws(() => restarted.verifyAndConsume(receipt), /Host epoch/i);
+
+  time.add(60);
+  assert.throws(() => first.verifyAndConsume(receipt), /expired/i);
+});
+
+test("two concurrent Web conversation receipts cannot cross-consume", () => {
+  const time = clock();
+  const verifier = new RuntimeInvocationOriginVerifier(SECRET, { clock: time.now, hostEpoch: "host-epoch-a" });
+  const c1 = verifier.issueChallenge({ invocation_id: "invocation-a", operation: "op-a", target_generation: 7, ownership_generation: 7 });
+  const c2 = verifier.issueChallenge({ invocation_id: "invocation-b", operation: "op-a", target_generation: 7, ownership_generation: 7 });
+  time.add(10);
+  const r1 = signRuntimeInvocationOriginReceipt({
+    secret: SECRET,
+    challenge: c1,
+    machineOrigin: invocationOrigin(time.now(), { invocation_id: "invocation-a", operation: "op-a", conversation_id: CONVERSATION }),
+    hostEpoch: "host-epoch-a",
+    clock: time.now
+  });
+  const foreign = "cccccccc-dddd-eeee-ffff-000000000000";
+  const r2 = signRuntimeInvocationOriginReceipt({
+    secret: SECRET,
+    challenge: c2,
+    machineOrigin: invocationOrigin(time.now(), { invocation_id: "invocation-b", operation: "op-a", conversation_id: foreign, browser_target_id: "browser-target-origin-2" }),
+    hostEpoch: "host-epoch-a",
+    clock: time.now
+  });
+  assert.throws(() => verifier.verifyAndConsume(r1, { invocation_id: "invocation-b" }), /invocation/i);
+  assert.throws(() => verifier.verifyAndConsume(r2, { conversation_id: CONVERSATION }), /conversation/i);
 });
