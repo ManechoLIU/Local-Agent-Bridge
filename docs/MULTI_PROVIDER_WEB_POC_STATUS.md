@@ -64,6 +64,18 @@ Verified live:
 
 The successful public ingress used a temporary PoC tunnel only. It must not be treated as the production ingress/security design.
 
+### PoC cleanup
+
+After evidence collection:
+
+- all temporary public tunnel processes were stopped;
+- the fixed local safe PoC server remains bound only to `127.0.0.1:33302` as expected;
+- the temporary Claude `LAB Safe PoC` connector was disconnected and removed;
+- the Claude evidence chat was retained, but it no longer has the connector;
+- Coze still displays the temporary `lab_safe_poc` account object/Agent association because its current management UI did not expose a reliable remove/detach action through the host bridge;
+- that Coze object points to the now-dead temporary public URL, so it cannot reach the local LAB server.
+
+
 ## Fresh product corrections
 
 ### Kimi
