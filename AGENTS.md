@@ -29,6 +29,8 @@ Before delegation, inspect the execution and delegation capabilities actually av
 
 ### 1.3 Model and executor routing
 
+backend default provider=grok-build model=grok-4.6 auth_mode=oauth
+
 This project does **not** inherit the old SelfAlone restriction that a Web Controller may use only Web-hosted models.
 
 The current project Controller may select any genuinely available executor according to task fit, including:
