@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import signal
+import shlex
 import socket
 import stat
 import subprocess
@@ -39,9 +41,15 @@ RUNTIME_META = RUNTIME_ROOT / "runtime.json"
 BRIDGE_TTL_MS = int(os.environ.get("LAB_M0_BRIDGE_TTL_MS", "86400000"))
 MIN_REMAINING_MS = int(os.environ.get("LAB_M0_MIN_REMAINING_MS", "3600000"))
 
-TUNNEL_PROFILE_DIR = PROJECT_ROOT / "experiments" / "web-local-poc" / "tunnel-runtime"
+TUNNEL_RUNTIME_DIR = Path(
+    os.environ.get("LAB_M0_TUNNEL_RUNTIME_DIR", str(RUNTIME_ROOT / "tunnel"))
+)
+TUNNEL_PROFILE_DIR = Path(
+    os.environ.get("LAB_M0_TUNNEL_PROFILE_DIR", str(TUNNEL_RUNTIME_DIR))
+)
 TUNNEL_PROFILE_NAME = "local-agent-bridge-poc"
-TUNNEL_PID_FILE = TUNNEL_PROFILE_DIR / "local-agent-bridge-poc.manual.pid"
+TUNNEL_PID_FILE = RUNTIME_ROOT / "tunnel.pid"
+TUNNEL_META = RUNTIME_ROOT / "tunnel.json"
 
 MCP_VERSION = "2026-07-28"
 M0_REQUIRED_TOOLS = {
@@ -143,6 +151,209 @@ def _write_json_private(path: Path, value: dict[str, Any]) -> None:
     path.chmod(0o600)
 
 
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _tunnel_profile_path(profile_dir: Path) -> Path:
+    return profile_dir / f"{TUNNEL_PROFILE_NAME}.yaml"
+
+
+def _validate_tunnel_profile_dir(profile_dir: Path) -> dict[str, Any]:
+    profile = _tunnel_profile_path(profile_dir)
+    _private_file(profile, "tunnel profile")
+    try:
+        value = json.loads(profile.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise RuntimeError("tunnel profile is not valid JSON") from error
+    control = value.get("control_plane")
+    mcp = value.get("mcp")
+    if not isinstance(control, dict) or not isinstance(mcp, dict):
+        raise RuntimeError("tunnel profile is missing control_plane or mcp")
+    tunnel_id = control.get("tunnel_id")
+    if not isinstance(tunnel_id, str) or not tunnel_id.strip():
+        raise RuntimeError("tunnel profile tunnel_id is missing")
+    server_urls = mcp.get("server_urls")
+    if not isinstance(server_urls, list):
+        raise RuntimeError("tunnel profile mcp.server_urls is missing")
+    sockets = {
+        str(item.get("unix_socket"))
+        for item in server_urls
+        if isinstance(item, dict) and item.get("unix_socket")
+    }
+    if str(PREVIEW_SOCKET) not in sockets:
+        raise RuntimeError("tunnel profile is not bound to the current M0 bridge socket")
+    return {
+        "profile_dir": str(profile_dir),
+        "profile_path": str(profile),
+        "tunnel_id": tunnel_id.strip(),
+        "profile_sha256": hashlib.sha256(profile.read_bytes()).hexdigest(),
+    }
+
+
+def _parse_tunnel_process(pid: int, command: str) -> dict[str, Any] | None:
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    if len(argv) < 2 or Path(argv[0]).name != "tunnel-client" or argv[1] != "run":
+        return None
+    try:
+        profile_index = argv.index("--profile")
+        profile_dir_index = argv.index("--profile-dir")
+    except ValueError:
+        return None
+    if profile_index + 1 >= len(argv) or profile_dir_index + 1 >= len(argv):
+        return None
+    if argv[profile_index + 1] != TUNNEL_PROFILE_NAME:
+        return None
+    profile_dir = Path(argv[profile_dir_index + 1]).expanduser()
+    try:
+        profile = _validate_tunnel_profile_dir(profile_dir)
+    except (OSError, RuntimeError):
+        return None
+    return {
+        "pid": pid,
+        "command": command,
+        **profile,
+    }
+
+
+def _discover_running_tunnels() -> list[dict[str, Any]]:
+    cp = subprocess.run(
+        ["ps", "-axo", "pid=,command="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if cp.returncode != 0:
+        return []
+    found: list[dict[str, Any]] = []
+    for raw in cp.stdout.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        pieces = raw.split(None, 1)
+        if len(pieces) != 2:
+            continue
+        try:
+            pid = int(pieces[0])
+        except ValueError:
+            continue
+        parsed = _parse_tunnel_process(pid, pieces[1])
+        if parsed is not None and _pid_alive(pid):
+            found.append(parsed)
+    return found
+
+
+def _tunnel_runtime_meta() -> dict[str, Any]:
+    return _read_json_object(TUNNEL_META)
+
+
+def _tunnel_status() -> dict[str, Any]:
+    discovered = _discover_running_tunnels()
+    by_pid = {int(item["pid"]): item for item in discovered}
+    if len(by_pid) > 1:
+        return {
+            "ready": False,
+            "pid": None,
+            "source": "ambiguous_live_processes",
+            "reason": "multiple_active_tunnels",
+            "active_pids": sorted(by_pid),
+            "generation": None,
+            "tunnel_id": None,
+            "profile_dir": None,
+        }
+    if not by_pid:
+        return {
+            "ready": False,
+            "pid": None,
+            "source": "none",
+            "reason": "tunnel_not_running",
+            "active_pids": [],
+            "generation": None,
+            "tunnel_id": None,
+            "profile_dir": None,
+        }
+
+    item = next(iter(by_pid.values()))
+    meta = _tunnel_runtime_meta()
+    canonical = (
+        meta.get("pid") == item["pid"]
+        and meta.get("tunnel_id") == item["tunnel_id"]
+        and isinstance(meta.get("endpoint_generation"), int)
+        and not isinstance(meta.get("endpoint_generation"), bool)
+        and meta.get("endpoint_generation") >= 1
+    )
+    return {
+        "ready": True,
+        "pid": item["pid"],
+        "source": "canonical_runtime_meta" if canonical else "live_process_discovery",
+        "reason": None,
+        "active_pids": [item["pid"]],
+        "generation": meta.get("endpoint_generation") if canonical else None,
+        "tunnel_id": item["tunnel_id"],
+        "profile_dir": item["profile_dir"],
+        "profile_sha256": item["profile_sha256"],
+    }
+
+
+def _write_tunnel_runtime_state(
+    *,
+    pid: int,
+    tunnel_id: str,
+    active_profile_dir: Path,
+    endpoint_generation: int,
+) -> dict[str, Any]:
+    _private_dir(RUNTIME_ROOT)
+    _private_dir(TUNNEL_PROFILE_DIR)
+    source_info = _validate_tunnel_profile_dir(active_profile_dir)
+    source_value = json.loads(Path(source_info["profile_path"]).read_text(encoding="utf-8"))
+    canonical_profile = _tunnel_profile_path(TUNNEL_PROFILE_DIR)
+    _write_json_private(canonical_profile, source_value)
+    canonical_info = _validate_tunnel_profile_dir(TUNNEL_PROFILE_DIR)
+    value = {
+        "schema_version": 1,
+        "pid": pid,
+        "profile_name": TUNNEL_PROFILE_NAME,
+        "active_profile_dir": str(active_profile_dir),
+        "canonical_profile_dir": str(TUNNEL_PROFILE_DIR),
+        "tunnel_id": tunnel_id,
+        "profile_sha256": canonical_info["profile_sha256"],
+        "endpoint_generation": endpoint_generation,
+        "updated_at_ms": _now_ms(),
+    }
+    _write_json_private(TUNNEL_META, value)
+    TUNNEL_PID_FILE.write_text(str(pid), encoding="utf-8")
+    TUNNEL_PID_FILE.chmod(0o600)
+    return value
+
+
+def _adopt_live_tunnel(status_value: dict[str, Any]) -> dict[str, Any]:
+    if status_value.get("ready") is not True or not isinstance(status_value.get("pid"), int):
+        raise RuntimeError("cannot adopt an unavailable tunnel")
+    prior = _tunnel_runtime_meta()
+    prior_generation = prior.get("endpoint_generation")
+    generation = (
+        prior_generation
+        if isinstance(prior_generation, int)
+        and not isinstance(prior_generation, bool)
+        and prior_generation >= 1
+        and prior.get("tunnel_id") == status_value.get("tunnel_id")
+        else 1
+    )
+    return _write_tunnel_runtime_state(
+        pid=int(status_value["pid"]),
+        tunnel_id=str(status_value["tunnel_id"]),
+        active_profile_dir=Path(str(status_value["profile_dir"])),
+        endpoint_generation=generation,
+    )
+
+
 def _stop_verified_bridge_pid(pid: int | None) -> None:
     if not pid or not _pid_alive(pid):
         return
@@ -216,9 +427,17 @@ def _find_tunnel_client() -> Path:
 
 
 def ensure_tunnel() -> int:
-    pid = _read_pid(TUNNEL_PID_FILE)
-    if pid and _pid_alive(pid) and "tunnel-client" in _pid_command(pid):
-        return pid
+    current = _tunnel_status()
+    if current.get("ready") is True:
+        if current.get("source") != "canonical_runtime_meta":
+            _adopt_live_tunnel(current)
+        return int(current["pid"])
+    if current.get("reason") == "multiple_active_tunnels":
+        raise RuntimeError("multiple active M0 tunnel processes detected; refusing implicit selection")
+
+    # New starts require the canonical private profile. Existing legacy source-tree
+    # profiles are adopted only while their verified process is still running.
+    profile = _validate_tunnel_profile_dir(TUNNEL_PROFILE_DIR)
     tunnel_client = _find_tunnel_client()
     out = BRIDGE_LOG_DIR / "tunnel.out"
     err = BRIDGE_LOG_DIR / "tunnel.err"
@@ -240,11 +459,31 @@ def ensure_tunnel() -> int:
             start_new_session=True,
             close_fds=True,
         )
-    TUNNEL_PID_FILE.write_text(str(process.pid), encoding="utf-8")
     for _ in range(30):
         if not _pid_alive(process.pid):
             raise RuntimeError("OpenAI tunnel-client exited during startup")
+        discovered = _tunnel_status()
+        if discovered.get("ready") is True and discovered.get("pid") == process.pid:
+            break
         time.sleep(0.1)
+    else:
+        raise RuntimeError("OpenAI tunnel-client did not become observable after startup")
+
+    prior = _tunnel_runtime_meta()
+    previous_generation = prior.get("endpoint_generation")
+    generation = (
+        previous_generation + 1
+        if isinstance(previous_generation, int)
+        and not isinstance(previous_generation, bool)
+        and previous_generation >= 1
+        else 1
+    )
+    _write_tunnel_runtime_state(
+        pid=process.pid,
+        tunnel_id=str(profile["tunnel_id"]),
+        active_profile_dir=TUNNEL_PROFILE_DIR,
+        endpoint_generation=generation,
+    )
     return process.pid
 
 
@@ -419,8 +658,8 @@ def start_bridge(force: bool = False) -> dict[str, Any]:
 def status() -> dict[str, Any]:
     meta = _runtime_meta()
     bridge_ok = bridge_healthy()
-    tunnel_pid = _read_pid(TUNNEL_PID_FILE)
-    tunnel_ok = bool(tunnel_pid and _pid_alive(tunnel_pid) and "tunnel-client" in _pid_command(tunnel_pid))
+    tunnel = _tunnel_status()
+    tunnel_ok = tunnel.get("ready") is True
     return {
         "m0_preview_ready": bool(bridge_ok and tunnel_ok and _tcp_ready("127.0.0.1", CATDESK_PORT)),
         "bridge_ready": bridge_ok,
@@ -428,7 +667,12 @@ def status() -> dict[str, Any]:
         "lease_remaining_ms": _lease_remaining_ms(meta),
         "backend_ready": _tcp_ready("127.0.0.1", CATDESK_PORT),
         "tunnel_ready": tunnel_ok,
-        "tunnel_pid": tunnel_pid,
+        "tunnel_pid": tunnel.get("pid"),
+        "tunnel_id": tunnel.get("tunnel_id"),
+        "tunnel_endpoint_generation": tunnel.get("generation"),
+        "tunnel_state_source": tunnel.get("source"),
+        "tunnel_state_reason": tunnel.get("reason"),
+        "tunnel_profile_dir": tunnel.get("profile_dir"),
         "socket": str(PREVIEW_SOCKET),
         "tools": meta.get("tools") or [],
     }
