@@ -71,11 +71,13 @@ For every provider/surface record:
 | Grok Web BYO MCP | LIKELY GO |
 | Grok consumer browser executor | UNCERTAIN |
 | Grok Bot business/agent surface | LIKELY GO subject to customer agreement |
+| Kimi Web official Plugin/MCP | LIKELY GO within documented model/scenario surface; revalidate plan/region |
 | Kimi consumer browser executor | NO-GO absent permission |
 | Kimi Code | LIKELY GO as adjacent official surface |
 | DeepSeek consumer browser executor | NO-GO / high risk absent permission |
 | DeepSeek API | GO under developer terms, but not Web-subscription route |
-| Qwen consumer browser executor | NO-GO absent permission |
+| qwen.ai consumer browser executor | NO-GO absent permission |
+| QwenWork custom MCP/Connector | LIKELY GO within documented product surface; exact Web custom-MCP availability still verify |
 | Qwen Code | LIKELY GO as adjacent official surface |
 | Doubao consumer browser executor | UNCERTAIN / high risk |
 | Coze custom MCP/Agent | LIKELY GO within plan/terms |

@@ -233,15 +233,16 @@ After `CHATGPT_LAB_REFERENCE_PASS` and core M0 stability:
 Current research preference, subject to fresh re-check at promotion time:
 
 International:
-1. Grok Web -> LAB official BYO MCP;
-2. Claude Web -> LAB official remote MCP;
-3. Gemini Spark -> LAB custom MCP;
+1. Claude Web -> LAB official remote MCP (current Free test account exposes custom connector UI);
+2. Grok Web -> LAB official BYO MCP;
+3. Gemini Spark -> LAB custom MCP when eligibility is present;
 4. Grok Bot / provider-supported outbound agent surface.
 
 China:
-1. Coze Agent -> LAB custom MCP;
-2. Kimi Code -> LAB or LAB-adjacent MCP execution surface;
-3. Qwen Code -> LAB or LAB-adjacent MCP execution surface;
-4. consumer Web adapters only after explicit commercial permission.
+1. Kimi Web -> LAB official Plugin/MCP on supported Kimi Web surfaces;
+2. QwenWork -> LAB custom MCP after exact Web-vs-desktop availability verification;
+3. Coze Agent -> LAB custom MCP;
+4. Kimi Code / Qwen Code as adjacent native runtimes;
+5. consumer browser adapters only when the exact consumer surface passes an explicit commercial gate.
 
 This sequence validates architectural diversity without starting all Providers simultaneously.
