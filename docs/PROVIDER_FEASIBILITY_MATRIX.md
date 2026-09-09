@@ -12,11 +12,12 @@
 | Claude Web | **GO** via official remote MCP custom connector | **LIKELY GO** for connector use | **LIKELY** technically via browser, but not preferred | **NO-GO absent explicit permission** for consumer browser automation | 5h session reset + weekly cap; exact usage is dynamic | First international A PoC after ChatGPT PASS |
 | Gemini Spark | **GO, constrained**: custom MCP only inside Spark tasks | **LIKELY GO** within documented feature | **LIKELY** technically; official Gemini-in-Chrome agent surface also exists | **UNCERTAIN** for third-party browser-driving consumer UI | compute-based dynamic quota; up to 15 concurrent Spark tasks | Research provider-supported Spark/Chrome seam before browser adapter |
 | Grok Web | **GO** via official BYO MCP; official docs explicitly support tunneling local MCP | **LIKELY GO** within connector terms | **LIKELY** technically; Grok Bot is a stronger provider-supported agent surface | Consumer browser automation **UNCERTAIN**; Grok Bot business use **LIKELY GO** subject to agreement | paid shared weekly pool; free limits separate; exact remaining may be UI-dependent | Highest-priority international dual-direction PoC candidate |
-| Kimi consumer Web | No official custom MCP found: **UNCERTAIN** | **UNCERTAIN** | Browser control technically **LIKELY** | **NO-GO absent permission**: current Kimi terms prohibit scripts/bots simulating manual automated/bulk use | monthly shared credits; official UI exposes balance % + next refresh | Do not build consumer Web Adapter; evaluate Kimi Code separately |
+| Kimi Web (plugin-capable surfaces) | **GO, constrained**: official Kimi Plugins can include MCP; Web currently supports MCP/Skills with K3/K3 Swarm and selected scenarios | **LIKELY GO** within documented plugin surface; exact plan/region terms still revalidate | Browser control technically **LIKELY** but unnecessary for official tool access | Consumer browser automation **NO-GO absent permission**; this does **not** taint official Plugin/MCP use | monthly shared credits; official UI exposes balance % + next refresh | **Formal Web->LAB PoC candidate** using official plugin/MCP; avoid browser-driving path |
 | Kimi Code CLI | **GO** MCP client; can consume LAB through a thin MCP-to-UDS adapter | **GO for interactive own-work use; unattended/commercial requires suitable platform terms** | **GO/LIKELY** via ACP/local Server API, but **not Web** | **CONDITIONAL**: consumer subscription is interactive-use oriented | shared credits + rate windows | Optional executor + architecture reference |
 | DeepSeek consumer Web | No official custom MCP found: **UNCERTAIN** | **UNCERTAIN** | Playwright/CDP PoCs prove **LIKELY** technical feasibility | **NO-GO/high risk absent permission**: terms restrict automated capture/copy via robots/spiders/automatic setups | consumer Web exact quotas not reliably published -> **UNKNOWN** | Do not prioritize consumer Web adapter |
 | DeepSeek API/Open Platform | Not the Web subscription path | API terms | **GO** as API executor | **GO/LIKELY** under developer agreement | API usage/price observable | Keep as optional BYO API executor, not Web differentiator |
-| Qwen consumer Web | No direct qwen.ai custom MCP found: **UNCERTAIN** | **UNCERTAIN** | Browser automation technically **LIKELY** | **NO-GO**: current qwen.ai terms prohibit automated interaction/extraction/download incl Outputs | consumer Web allowance -> **UNKNOWN** unless UI exposes it | Do not build consumer Web Adapter |
+| qwen.ai consumer Web | No direct custom MCP established: **UNCERTAIN** | **UNCERTAIN** | Browser automation technically **LIKELY** | **NO-GO absent permission** for automated consumer-Web interaction/extraction under current service terms | consumer Web allowance -> **UNKNOWN** unless UI exposes it | Do not build consumer Web Adapter |
+| QwenWork Web/Desktop | **GO at product level**: official Connectors + custom MCP; docs define QwenWork as MCP client with Streamable HTTP/SSE/STDIO. Exact custom-MCP Web setup/use still needs live surface verification. | **LIKELY GO** within documented QwenWork connector surface | Provider-native agent/local/browser capabilities exist; outbound executor classification is separate | **LIKELY/CONDITIONAL** by plan/surface | account/version dependent | **Formal China PoC candidate**; verify whether custom MCP configured on desktop is usable from Web and whether Web can add it directly |
 | Qwen Code | **GO** official MCP client; can consume LAB through a thin MCP-to-UDS adapter | **GO at open-source client layer; model-plan terms depend on auth** | **GO/LIKELY** via ACP/qwen serve, but **not Web** | **CONDITIONAL**: Coding Plan forbids non-interactive backend use | plan/provider-specific | Optional executor + runtime architecture reference |
 | Doubao consumer Web | Direct custom MCP not established: **UNCERTAIN** | **UNCERTAIN** | Open-source Playwright/CDP proves **LIKELY** technical feasibility | **UNCERTAIN / HIGH-RISK**: consumer license is personal/non-commercial; unauthorized access/use restrictions apply | paid quota refreshes monthly; units vary by feature; exact allowance is UI-defined | Avoid browser Adapter until explicit commercial permission |
 | Coze / 扣子 Web & Desktop Agent | **GO** official custom MCP over Streamable HTTP/SSE | **LIKELY GO** under applicable Coze plan | Provider-supported Agent workflows **GO/LIKELY**, but not the same as Doubao consumer Web | **LIKELY GO** subject to plan/enterprise agreement | documented plan call limits for some MCP/plugin surfaces | Strong China representative for official MCP PoC |
@@ -60,13 +61,14 @@ A stronger path exists: **Grok Bot** terms explicitly support internal business 
 
 ### Kimi
 
-Kimi Code is architecturally friendly: official MCP client support includes stdio, HTTP and SSE. That is a **provider-supported adjacent surface**, not proof that ordinary Kimi consumer Web has custom MCP.
+Fresh official Kimi Help Center documentation now establishes an official **Web Plugin/MCP** path. Kimi Plugins may include MCP, and the Kimi Web experience currently supports MCP and Skills. Availability is surface-specific: current docs name K3/K3 Swarm and selected scenarios such as Deep Research, Websites and PPT; plugins are not universally available in every Kimi conversation surface.
 
-Current Kimi consumer terms prohibit automated scripts/programs/tools (including bots/crawlers/scheduled tasks) that simulate manual operation for automated or bulk use. Therefore:
-- consumer Web browser Adapter: technical LIKELY, commercial NO-GO absent permission;
+Therefore:
+- Kimi Web official Plugin/MCP -> LAB: **GO, constrained**, and should be the preferred Web path;
+- consumer Web browser Adapter: technical LIKELY, but commercial **NO-GO absent permission** because current consumer terms restrict scripted/manual-simulation automation;
 - Kimi Code: GO/LIKELY adjacent executor/tool client.
 
-Community Kimi browser projects are useful only as technical evidence. Do not copy credential/cookie handling patterns into LAB.
+The browser-automation restriction is **surface-specific** and must not be used to classify official Plugin/MCP use as prohibited. Community Kimi browser projects remain technical evidence only.
 
 ### DeepSeek
 
@@ -78,9 +80,13 @@ DeepSeek’s official API/Open Platform remains a clean optional BYO API route, 
 
 ### Qwen
 
-Qwen Code has official MCP support (HTTP/SSE/stdio), making it an attractive adjacent provider-supported surface.
+Qwen must be classified by surface.
 
-For qwen.ai consumer Web, current Terms of Service prohibit automated interaction, extraction or download of Service information/content including Outputs, and separately prohibit scraping/mining/distilling via scripts/tools/agents. Therefore consumer Web browser execution is commercial NO-GO absent explicit permission even if technically easy.
+- **qwen.ai consumer Web**: no official custom MCP was established in this audit; browser automation remains a separate high-risk/NO-GO surface absent permission under current consumer-service terms.
+- **QwenWork**: official documentation defines QwenWork as an MCP client and supports custom Streamable HTTP/SSE and STDIO MCP servers. The connector configuration instructions are desktop-specific, while Web documentation confirms connector support generally; exact custom-MCP Web setup/use still needs live verification.
+- **Qwen Code**: official MCP support (HTTP/SSE/stdio) remains an attractive adjacent provider-supported surface.
+
+Do not transfer restrictions from qwen.ai consumer Web to QwenWork/Qwen Code.
 
 ### Doubao / Coze
 
@@ -118,12 +124,13 @@ Optional reset timestamps or quantitative remaining allowance may be surfaced on
 
 Recommended representative sequence based on official integration strength + product differentiation + commercial risk:
 
-1. **Grok Web -> LAB BYO MCP** — strongest structural match to LAB tunnel model.
-2. **Claude Web -> LAB remote MCP** — mature official connector, broad consumer-plan availability.
-3. **Gemini Spark -> LAB custom MCP** — official but constrained; validates Google ecosystem.
-4. **Coze Agent -> LAB custom MCP** — strongest current China official-MCP representative.
-5. **Grok Bot as LAB executor** — provider-supported outbound/agent surface candidate.
-6. **Kimi Code / Qwen Code** — adjacent official executor/tool surfaces; useful for architecture, but not Web subscription proof.
+1. **Claude Web -> LAB remote MCP** — current test account visibly exposes Add custom connector; local standard-MCP preflight already passes. Finish public-ingress E2E.
+2. **Kimi Web -> LAB Plugin/MCP** — official Web MCP path now documented; validates the desired China consumer-Web UX without browser automation.
+3. **Grok Web -> LAB BYO MCP** — strongest documented tunneling match to LAB and available to all Grok users.
+4. **QwenWork -> LAB custom MCP** — official MCP client; first verify exact Web availability versus desktop-only setup.
+5. **Gemini Spark -> LAB custom MCP** — official but eligibility/surface constrained.
+6. **Coze Agent -> LAB custom MCP** — strong China official-MCP representative.
+7. **Grok Bot / Kimi Code / Qwen Code** — provider-supported outbound/adjacent executor surfaces.
 
 Do **not** prioritize consumer browser adapters for Claude, Kimi, DeepSeek or Qwen while current terms remain restrictive.
 
@@ -141,10 +148,14 @@ Official sources checked:
 - Grok MCP tunneling: https://docs.x.ai/grok/connectors/custom-mcp-tunneling
 - Grok Consumer Terms: https://x.ai/legal/terms-of-service
 - Grok Bot Terms: https://x.ai/legal/grok-bot-terms
+- Kimi Web Plugins/MCP: https://www.kimi.com/en/help/plugins-and-skills/overview
+- Kimi plugin creation/import: https://www.kimi.com/en/help/plugins-and-skills/create
 - Kimi Code MCP: https://moonshotai.github.io/kimi-code/en/customization/mcp.html
 - Kimi terms: https://www.kimi.com/user/agreement/modelUse?version=v2
 - DeepSeek Terms: https://cdn.deepseek.com/policies/en-US/deepseek-terms-of-use.html
 - Qwen Terms: https://qwen.ai/termsservice
+- QwenWork connectors/MCP: https://help.aliyun.com/zh/qwenwork/qw-connectors
+- QwenWork Web core: https://help.aliyun.com/zh/qwenwork/core-features-of-the-web/
 - Qwen Code MCP docs: https://github.com/QwenLM/qwen-code-docs/blob/main/website/content/en/users/features/mcp.md
 - Doubao User Agreement: https://www.doubao.com/legal/terms
 - Coze MCP: https://docs.coze.cn/mcp
