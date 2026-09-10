@@ -333,26 +333,61 @@ def install_release_bundle(
     if missing:
         raise RuntimeError("production release sources missing: " + ", ".join(missing))
 
+    resolved_sources: dict[str, Path] = {}
+    try:
+        resolved_sources = {
+            name: Path(sources[name]).expanduser() for name in required
+        }
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("production release source path is invalid") from error
+    for name in (
+        "bridge_binary",
+        "catdesk_binary",
+        "catdesk_config",
+        "catdesk_backend_key",
+        "host_attestation_key",
+    ):
+        _validate_owned_file_source(
+            resolved_sources[name], f"production release source {name}"
+        )
+    _validate_owned_tree_source(
+        resolved_sources["host_source_dir"], "production Host source tree"
+    )
+    source_profile_path = resolved_sources["tunnel_profile"]
+    if not source_profile_path.is_absolute():
+        raise RuntimeError(
+            "source tunnel profile must be an explicit absolute path; set "
+            "LAB_PRODUCTION_TUNNEL_SOURCE_PROFILE"
+        )
+    try:
+        _validate_private_source(source_profile_path, "source tunnel profile")
+    except RuntimeError as error:
+        raise RuntimeError(
+            f"{error}; provide an explicit verified private profile with "
+            "LAB_PRODUCTION_TUNNEL_SOURCE_PROFILE"
+        ) from error
+    try:
+        source_profile = json.loads(source_profile_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("source tunnel profile is not valid UTF-8 JSON") from error
+    profile = production_tunnel_profile(source_profile, manifest, layout)
+    node = _validate_runtime_dependencies(manifest)["node"]
+
     _private_dir(release_dir.parent)
     release_dir.mkdir(mode=0o700)
     try:
-        _copy_owned_file(sources["bridge_binary"], layout["bridge_binary"], 0o700)
-        _copy_owned_file(sources["catdesk_binary"], layout["catdesk_binary"], 0o700)
-        _copy_owned_file(sources["catdesk_config"], layout["catdesk_config"], 0o600)
-        _copy_owned_file(sources["catdesk_backend_key"], layout["catdesk_backend_key"], 0o600)
-        _copy_owned_file(sources["host_attestation_key"], layout["host_attestation_key"], 0o600)
-        _copy_owned_tree(sources["host_source_dir"], layout["host_dir"])
+        _copy_owned_file(resolved_sources["bridge_binary"], layout["bridge_binary"], 0o700)
+        _copy_owned_file(resolved_sources["catdesk_binary"], layout["catdesk_binary"], 0o700)
+        _copy_owned_file(resolved_sources["catdesk_config"], layout["catdesk_config"], 0o600)
+        _copy_owned_file(resolved_sources["catdesk_backend_key"], layout["catdesk_backend_key"], 0o600)
+        _copy_owned_file(resolved_sources["host_attestation_key"], layout["host_attestation_key"], 0o600)
+        _copy_owned_tree(resolved_sources["host_source_dir"], layout["host_dir"])
         _private_dir(layout["host_backend_key"].parent)
         layout["host_backend_key"].write_bytes(secrets.token_bytes(32).hex().encode("ascii"))
         layout["host_backend_key"].chmod(0o600)
 
-        source_profile_path = Path(sources["tunnel_profile"])
-        _validate_private_source(source_profile_path, "source tunnel profile")
-        source_profile = json.loads(source_profile_path.read_text(encoding="utf-8"))
-        profile = production_tunnel_profile(source_profile, manifest, layout)
         _write_json_private(layout["release_tunnel_profile"], profile)
 
-        node = _validate_runtime_dependencies(manifest)["node"]
         wrapper = "\n".join(
             [
                 "#!/bin/sh",
@@ -381,10 +416,18 @@ def install_release_bundle(
 
         _private_dir(layout["tunnel_dir"])
         _write_json_private(layout["tunnel_profile"], profile)
-    except Exception:
-        shutil.rmtree(release_dir, ignore_errors=True)
+        validate_installed_release(layout)
+    except Exception as error:
+        try:
+            shutil.rmtree(release_dir)
+            if release_dir.exists():
+                raise RuntimeError("partial production release directory still exists")
+        except Exception as cleanup_error:
+            raise RuntimeError(
+                f"production release install failed: {error}; "
+                f"incomplete release cleanup failed: {cleanup_error}"
+            ) from error
         raise
-    validate_installed_release(layout)
     return layout
 
 
@@ -3033,25 +3076,58 @@ def _validate_private_source(path: Path, label: str) -> None:
         raise RuntimeError(f"{label} permissions must be 0600 or stricter")
 
 
+def _validate_owned_file_source(source: Path, label: str) -> None:
+    source = Path(source)
+    try:
+        info = source.lstat()
+    except FileNotFoundError as error:
+        raise RuntimeError(f"{label} is missing: {source}") from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"{label} must be a regular non-symlink file: {source}")
+    if info.st_uid != os.geteuid():
+        raise RuntimeError(f"{label} owner mismatch: {source}")
+
+
 def _copy_owned_file(source: Path, destination: Path, mode: int) -> None:
     source = Path(source)
-    info = source.lstat()
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        raise RuntimeError(f"release source must be a regular non-symlink file: {source}")
-    if info.st_uid != os.geteuid():
-        raise RuntimeError(f"release source owner mismatch: {source}")
+    _validate_owned_file_source(source, "release source")
     _private_dir(destination.parent)
     shutil.copyfile(source, destination)
     destination.chmod(mode)
 
 
+def _validate_owned_tree_source(source: Path, label: str) -> None:
+    source = Path(source)
+    try:
+        source_info = source.lstat()
+    except FileNotFoundError as error:
+        raise RuntimeError(f"{label} is missing: {source}") from error
+    if (
+        stat.S_ISLNK(source_info.st_mode)
+        or not stat.S_ISDIR(source_info.st_mode)
+        or source_info.st_uid != os.geteuid()
+    ):
+        raise RuntimeError(f"{label} is unsafe: {source}")
+    try:
+        items = list(source.rglob("*"))
+    except OSError as error:
+        raise RuntimeError(f"{label} cannot be enumerated: {source}") from error
+    for item in items:
+        try:
+            info = item.lstat()
+        except FileNotFoundError as error:
+            raise RuntimeError(f"{label} changed during preflight: {item}") from error
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or (not stat.S_ISDIR(info.st_mode) and not stat.S_ISREG(info.st_mode))
+            or info.st_uid != os.geteuid()
+        ):
+            raise RuntimeError(f"{label} member is unsafe: {item}")
+
+
 def _copy_owned_tree(source: Path, destination: Path) -> None:
     source = Path(source)
-    if source.is_symlink() or not source.is_dir() or source.stat().st_uid != os.geteuid():
-        raise RuntimeError(f"release source tree is unsafe: {source}")
-    for item in source.rglob("*"):
-        if item.is_symlink() or item.stat().st_uid != os.geteuid():
-            raise RuntimeError(f"release source tree member is unsafe: {item}")
+    _validate_owned_tree_source(source, "release source tree")
     shutil.copytree(source, destination)
     for item in destination.rglob("*"):
         if item.is_dir():

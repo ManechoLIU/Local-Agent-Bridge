@@ -139,6 +139,49 @@ class ProductionConnectorContractTests(unittest.TestCase):
             endpoint_generation=generation,
         )
 
+    def _release_sources(self, root: Path) -> dict[str, Path]:
+        sources_root = root / "sources"
+        host = sources_root / "host"
+        chrome_host = host / "chrome-host"
+        (chrome_host / "extension").mkdir(parents=True)
+        (chrome_host / "native-host.mjs").write_text("#!/usr/bin/env node\n", encoding="utf-8")
+        (chrome_host / "host-mcp-adapter.mjs").write_text("#!/usr/bin/env node\n", encoding="utf-8")
+        (chrome_host / "extension" / "manifest.json").write_text(
+            json.dumps({"version": "0.1.1"}), encoding="utf-8"
+        )
+        for name in ("bridge", "catdesk"):
+            path = sources_root / name
+            path.write_bytes(name.encode() * 32)
+            path.chmod(0o700)
+        for name, content in (
+            ("catdesk-config", b"mcpSlug = 'private-slug'\n"),
+            ("catdesk-key", b"k" * 64),
+            ("attestation-key", b"a" * 32),
+        ):
+            path = sources_root / name
+            path.write_bytes(content)
+            path.chmod(0o600)
+        tunnel = sources_root / "m0-profile.json"
+        tunnel.write_text(json.dumps({
+            "config_version": 1,
+            "control_plane": {
+                "tunnel_id": "tunnel_existing_private_connector",
+                "base_url": "https://api.openai.com",
+                "api_key": "file:/private/key",
+            },
+            "mcp": {"server_urls": [{"url": "http://localhost/mcp", "unix_socket": "/tmp/lab-real-ingress-e2e/bridge.sock"}]},
+        }), encoding="utf-8")
+        tunnel.chmod(0o600)
+        return {
+            "bridge_binary": sources_root / "bridge",
+            "catdesk_binary": sources_root / "catdesk",
+            "catdesk_config": sources_root / "catdesk-config",
+            "catdesk_backend_key": sources_root / "catdesk-key",
+            "host_attestation_key": sources_root / "attestation-key",
+            "host_source_dir": host,
+            "tunnel_profile": tunnel,
+        }
+
     def _healthy(self, manifest):
         return {
             "connector_id": manifest["connector_id"],
@@ -389,6 +432,82 @@ class ProductionConnectorContractTests(unittest.TestCase):
             layout["bridge_binary"].write_bytes(b"tampered")
             with self.assertRaisesRegex(RuntimeError, "hash|artifact"):
                 pc.validate_installed_release(layout)
+
+    def test_release_source_preflight_rejects_missing_profile_before_creating_release_dir(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            sources = self._release_sources(root)
+            sources["tunnel_profile"] = root / "snapshot" / "experiments" / "web-local-poc" / "tunnel-runtime" / "local-agent-bridge-poc.yaml"
+            layout = pc.production_layout(
+                manifest,
+                runtime_root=root / "runtime",
+                bridge_socket=root / "socket" / "bridge.sock",
+            )
+            with patch.object(pc, "_copy_owned_file") as forbidden_copy, patch.object(
+                pc.shutil, "rmtree"
+            ) as forbidden_cleanup:
+                with self.assertRaisesRegex(RuntimeError, "tunnel profile.*missing|LAB_PRODUCTION_TUNNEL_SOURCE_PROFILE"):
+                    pc.install_release_bundle(manifest, layout, sources)
+            forbidden_copy.assert_not_called()
+            forbidden_cleanup.assert_not_called()
+            self.assertFalse(layout["release_dir"].exists())
+
+            sources["tunnel_profile"] = Path("relative-private-profile.json")
+            with patch.object(pc, "_copy_owned_file") as forbidden_copy:
+                with self.assertRaisesRegex(RuntimeError, "absolute path|LAB_PRODUCTION_TUNNEL_SOURCE_PROFILE"):
+                    pc.install_release_bundle(manifest, layout, sources)
+            forbidden_copy.assert_not_called()
+            self.assertFalse(layout["release_dir"].exists())
+
+    def test_release_copy_failure_removes_partial_dir_and_allows_exact_retry(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            sources = self._release_sources(root)
+            layout = pc.production_layout(
+                manifest,
+                runtime_root=root / "runtime",
+                bridge_socket=root / "socket" / "bridge.sock",
+            )
+            real_copy = pc._copy_owned_file
+            calls = 0
+
+            def fail_second_copy(source, destination, mode):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("injected copy failure")
+                return real_copy(source, destination, mode)
+
+            with patch.object(pc, "_copy_owned_file", side_effect=fail_second_copy):
+                with self.assertRaisesRegex(OSError, "copy failure"):
+                    pc.install_release_bundle(manifest, layout, sources)
+            self.assertFalse(layout["release_dir"].exists())
+
+            installed = pc.install_release_bundle(manifest, layout, sources)
+            self.assertEqual(installed, layout)
+            pc.validate_installed_release(layout)
+
+    def test_release_cleanup_failure_reports_original_and_cleanup_errors(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            sources = self._release_sources(root)
+            layout = pc.production_layout(
+                manifest,
+                runtime_root=root / "runtime",
+                bridge_socket=root / "socket" / "bridge.sock",
+            )
+            with patch.object(
+                pc, "_copy_owned_file", side_effect=OSError("injected copy failure")
+            ), patch.object(
+                pc.shutil, "rmtree", side_effect=OSError("injected cleanup failure")
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    pc.install_release_bundle(manifest, layout, sources)
+            self.assertIn("injected copy failure", str(raised.exception))
+            self.assertIn("injected cleanup failure", str(raised.exception))
 
     def test_native_messaging_manifests_pin_both_chrome_targets_to_same_release(self):
         manifest = self._manifest()
