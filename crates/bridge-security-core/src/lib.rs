@@ -15,6 +15,7 @@ use std::process::{Command, Output};
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Capability {
     Discovery,
+    HostAttestation,
     FileRead,
     FileWrite,
     FileMove,

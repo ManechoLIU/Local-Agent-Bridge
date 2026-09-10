@@ -1,0 +1,3593 @@
+#!/usr/bin/env python3
+"""Canonical Local Agent Bridge production connector contract.
+
+This module is intentionally fail-closed: production publication is valid only
+when Host, Bridge, tunnel profile, release revision, endpoint generation, tool
+surface, and canonical workspace all agree on one immutable release contract.
+"""
+from __future__ import annotations
+
+import argparse
+import ctypes
+import glob
+import hashlib
+import ipaddress
+import json
+import os
+import secrets
+import shlex
+import shutil
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+CANONICAL_PROJECT_ROOT = Path("/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge")
+CONTRACT_VERSION = "lab-production-connector-v1"
+CONNECTOR_ID = "local-agent-bridge-production"
+CONNECTOR_DISPLAY_NAME = "Local Agent Bridge"
+TUNNEL_PROFILE_NAME = "local-agent-bridge-production"
+HISTORICAL_TUNNEL_PROFILE_NAMES = ("local-agent-bridge-poc",)
+HISTORICAL_CONNECTOR_NAMES = ("Local Bridge Identity Probe",)
+HOST_EXTENSION_ID = "ikidefdlcddfomimpckflbajjccnmfna"
+MIN_HOST_EXTENSION_VERSION = "0.1.1"
+PRODUCTION_RUNTIME_ROOT = Path.home() / ".local-agent-bridge" / "production-connector"
+PRODUCTION_BRIDGE_SOCKET = Path("/tmp/local-agent-bridge-production/bridge.sock")
+PRODUCTION_CATDESK_PORT = 33331
+PRODUCTION_HOST_MCP_PORT = 33321
+HISTORICAL_M0_BRIDGE_SOCKET = Path("/tmp/lab-real-ingress-e2e/bridge.sock")
+HISTORICAL_M0_RUNTIME_STATE = Path.home() / ".local-agent-bridge" / "m0-preview" / "runtime.json"
+AI_BRIDGE_FALLBACK_HEALTH_URL_FILE = (
+    Path.home()
+    / "Library"
+    / "Application Support"
+    / "ai.originone.gpt-bridge"
+    / "managed-tunnel"
+    / "health-url"
+)
+DEFAULT_NATIVE_USER_DATA_DIR_NAMES = (
+    "chrome-profile",
+    "chrome-for-testing-profile",
+    "chrome-profile-current-entry-v2",
+)
+CANONICAL_CONTROL_PLANE_BASE_URL = "https://api.openai.com"
+ALLOWED_BUILD_UNTRACKED = frozenset(
+    {
+        "experiments/web-host-attestation/chrome-host/host-mcp-adapter.mjs.orig",
+        "experiments/web-host-attestation/chrome-host/host-mcp-adapter.mjs.rej",
+    }
+)
+LEGACY_CANDIDATE_MARKERS = (
+    "/tmp/lab-catdesk-candidate-e2e",
+    "/private/tmp/lab-catdesk-candidate-e2e",
+)
+REQUIRED_TOOLS = frozenset(
+    {
+        "discover_current_entry",
+        "catdesk_instruction",
+        "read",
+        "search",
+        "write",
+        "edit",
+        "delete",
+        "run_command",
+        "start_command",
+        "poll_command",
+        "cancel_command",
+    }
+)
+
+
+def canonical_workspace() -> Path:
+    return validate_workspace(CANONICAL_PROJECT_ROOT)
+
+
+def production_paths() -> dict[str, Any]:
+    return {
+        "runtime_root": PRODUCTION_RUNTIME_ROOT,
+        "bridge_socket": PRODUCTION_BRIDGE_SOCKET,
+        "tunnel_profile_name": TUNNEL_PROFILE_NAME,
+    }
+
+
+def default_release_sources(repo_root: Path = CANONICAL_PROJECT_ROOT) -> dict[str, Path]:
+    """Return only explicit source paths; callers still validate each source.
+
+    The CatDesk inputs are copied into an immutable release and are never used as
+    its runtime workspace or socket.  Operators can point at a newer hardened
+    candidate with the corresponding LAB_PRODUCTION_* environment variables.
+    """
+    root = Path(repo_root).expanduser()
+    catdesk_home = Path(
+        os.environ.get("LAB_PRODUCTION_CATDESK_HOME", "/tmp/lab-catdesk-candidate-e2e/home")
+    ).expanduser()
+    return {
+        "bridge_binary": root / "crates" / "local-tool-bridge" / "target" / "release" / "local-tool-bridge",
+        "catdesk_binary": Path(
+            os.environ.get(
+                "LAB_PRODUCTION_CATDESK_BINARY",
+                "/Users/echoman/CatDesk-PoC-20260907/worktrees/lab-safe-01/target/debug/catdesk",
+            )
+        ).expanduser(),
+        "catdesk_config": catdesk_home / ".catdesk" / "config.toml",
+        "catdesk_backend_key": catdesk_home / ".catdesk" / "backend.key",
+        "host_attestation_key": Path(
+            os.environ.get(
+                "LAB_PRODUCTION_HOST_ATTESTATION_KEY",
+                str(Path.home() / ".local-agent-bridge" / "web-host" / "attestation.key"),
+            )
+        ).expanduser(),
+        "host_source_dir": root / "experiments" / "web-host-attestation",
+        "tunnel_profile": Path(
+            os.environ.get(
+                "LAB_PRODUCTION_TUNNEL_SOURCE_PROFILE",
+                str(root / "experiments" / "web-local-poc" / "tunnel-runtime" / "local-agent-bridge-poc.yaml"),
+            )
+        ).expanduser(),
+    }
+
+
+def _git_head(repo_root: Path = CANONICAL_PROJECT_ROOT) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("cannot resolve canonical Local Agent Bridge Git HEAD")
+    return _release_revision(completed.stdout.strip())
+
+
+def require_exact_git_head(release_revision: str, repo_root: Path = CANONICAL_PROJECT_ROOT) -> str:
+    expected = _release_revision(release_revision)
+    actual = _git_head(Path(repo_root))
+    if actual != expected:
+        raise RuntimeError(f"canonical repository HEAD {actual} does not match requested release revision {expected}")
+    return actual
+
+
+def _validate_manifest_identity(manifest: dict[str, Any]) -> None:
+    if not isinstance(manifest, dict):
+        raise RuntimeError("production release manifest must be an object")
+    if manifest.get("connector_id") != CONNECTOR_ID:
+        raise RuntimeError("production release manifest connector identity mismatch")
+    if manifest.get("contract_version") != CONTRACT_VERSION or manifest.get("fail_closed") is not True:
+        raise RuntimeError("production release manifest is not the canonical fail-closed contract")
+    _release_revision(str(manifest.get("release_revision") or ""))
+    _endpoint_generation(manifest.get("endpoint_generation"))
+    if manifest.get("workspace") != str(canonical_workspace()):
+        raise RuntimeError("production release manifest workspace mismatch")
+    if (manifest.get("tunnel") or {}).get("profile_name") != TUNNEL_PROFILE_NAME:
+        raise RuntimeError("production release manifest tunnel profile mismatch")
+
+
+def production_layout(
+    manifest: dict[str, Any],
+    *,
+    runtime_root: Path = PRODUCTION_RUNTIME_ROOT,
+    bridge_socket: Path = PRODUCTION_BRIDGE_SOCKET,
+) -> dict[str, Path]:
+    _validate_manifest_identity(manifest)
+    root = Path(runtime_root).expanduser()
+    revision = str(manifest["release_revision"])
+    generation = int(manifest["endpoint_generation"])
+    release_dir = root / "releases" / revision / f"generation-{generation}"
+    secrets_dir = release_dir / "secrets"
+    catdesk_home = release_dir / "catdesk-home"
+    tunnel_dir = root / "tunnel"
+    return {
+        "runtime_root": root,
+        "release_dir": release_dir,
+        "release_manifest": release_dir / "release.json",
+        "bridge_binary": release_dir / "bin" / "local-tool-bridge",
+        "catdesk_binary": release_dir / "bin" / "catdesk",
+        "catdesk_runner": release_dir / "bin" / "run-catdesk.py",
+        "catdesk_home": catdesk_home,
+        "catdesk_config": catdesk_home / ".catdesk" / "config.toml",
+        "catdesk_backend_key": catdesk_home / ".catdesk" / "backend.key",
+        "host_dir": release_dir / "host",
+        "host_mcp_adapter": release_dir / "host" / "chrome-host" / "host-mcp-adapter.mjs",
+        "native_host": release_dir / "host" / "chrome-host" / "native-host.mjs",
+        "native_host_wrapper": release_dir / "bin" / "native-host-production",
+        "host_backend_key": secrets_dir / "host-backend.key",
+        "host_attestation_key": secrets_dir / "host-attestation.key",
+        "host_socket": release_dir / "state" / "host.sock",
+        "host_verifier_state": release_dir / "state" / "runtime-verifier-state.json",
+        "host_reentry_state": release_dir / "state" / "runtime-reentry-state.json",
+        "bridge_state_dir": release_dir / "state" / "bridge",
+        "bridge_socket": Path(bridge_socket),
+        "release_tunnel_profile": release_dir / "tunnel" / f"{TUNNEL_PROFILE_NAME}.yaml",
+        "tunnel_dir": tunnel_dir,
+        "tunnel_profile": tunnel_dir / f"{TUNNEL_PROFILE_NAME}.yaml",
+        "tunnel_health_url": tunnel_dir / "health" / f"{TUNNEL_PROFILE_NAME}.url",
+        "tunnel_log": tunnel_dir / "logs" / f"{TUNNEL_PROFILE_NAME}.log",
+        "runtime_state": root / "runtime.json",
+        "rollback_receipt": root / "activation-rollback.json",
+        "logs_dir": root / "logs",
+        "catdesk_child_pid": root / "catdesk-child.pid",
+    }
+
+
+def production_component_env(
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+    *,
+    catdesk_slug: str,
+) -> dict[str, dict[str, str]]:
+    _validate_manifest_contract(manifest)
+    slug = str(catdesk_slug or "").strip()
+    if not slug or "/" in slug:
+        raise RuntimeError("production CatDesk mcpSlug is missing or invalid")
+    fence = {
+        "LAB_PRODUCTION_RELEASE_MANIFEST_FILE": str(layout["release_manifest"]),
+        "LAB_PRODUCTION_CONNECTOR_ID": CONNECTOR_ID,
+        "LAB_PRODUCTION_CONTRACT_VERSION": CONTRACT_VERSION,
+        "LAB_PRODUCTION_RELEASE_REVISION": str(manifest["release_revision"]),
+        "LAB_PRODUCTION_ENDPOINT_GENERATION": str(manifest["endpoint_generation"]),
+        "LAB_PRODUCTION_WORKSPACE": str(manifest["workspace"]),
+        "LAB_PRODUCTION_TUNNEL_PROFILE_NAME": TUNNEL_PROFILE_NAME,
+    }
+    host = {
+        **fence,
+        "LAB_HOST_MCP_BACKEND_KEY_FILE": str(layout["host_backend_key"]),
+        "LAB_HOST_ATTESTATION_KEY_FILE": str(layout["host_attestation_key"]),
+        "LAB_HOST_ADAPTER_SOCKET": str(layout["host_socket"]),
+        "LAB_HOST_VERIFIER_STATE_FILE": str(layout["host_verifier_state"]),
+        "LAB_HOST_REENTRY_STATE_FILE": str(layout["host_reentry_state"]),
+        "LAB_HOST_MCP_BIND": "127.0.0.1",
+        "LAB_HOST_MCP_PORT": str(PRODUCTION_HOST_MCP_PORT),
+    }
+    bridge = {
+        **fence,
+        "LAB_BRIDGE_SOCKET": str(layout["bridge_socket"]),
+        "LAB_BRIDGE_BACKEND_URL": f"http://127.0.0.1:{PRODUCTION_CATDESK_PORT}/{slug}/mcp",
+        "LAB_BRIDGE_BACKEND_KEY_FILE": str(layout["catdesk_backend_key"]),
+        "LAB_BRIDGE_STATE_DIR": str(layout["bridge_state_dir"]),
+        "LAB_BRIDGE_WORKSPACE_ID": CONNECTOR_ID,
+        "LAB_BRIDGE_PRINCIPAL_ID": "tunnel-client-production-uds",
+        "LAB_BRIDGE_CAPABILITIES": (
+            "discovery,host_attestation,file_read,file_write,file_move,shell,process_jobs"
+        ),
+        "LAB_HOST_BACKEND_URL": f"http://127.0.0.1:{PRODUCTION_HOST_MCP_PORT}/mcp",
+        "LAB_HOST_BACKEND_KEY_FILE": str(layout["host_backend_key"]),
+    }
+    return {"host": host, "bridge": bridge}
+
+
+def production_tunnel_profile(
+    source: dict[str, Any],
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+) -> dict[str, Any]:
+    _validate_manifest_contract(manifest)
+    if not isinstance(source, dict):
+        raise RuntimeError("source tunnel profile must be an object")
+    control = source.get("control_plane")
+    if not isinstance(control, dict):
+        raise RuntimeError("source tunnel profile is missing control_plane")
+    if not isinstance(control.get("tunnel_id"), str) or not control["tunnel_id"].strip():
+        raise RuntimeError("source tunnel profile tunnel_id is missing")
+    if control.get("base_url") != "https://api.openai.com":
+        raise RuntimeError("source tunnel profile must use the OpenAI control plane")
+    api_key = control.get("api_key")
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise RuntimeError("source tunnel profile control-plane key reference is missing")
+    return {
+        "config_version": 1,
+        "control_plane": json.loads(json.dumps(control)),
+        "mcp": {
+            "server_urls": [
+                {
+                    "channel": "main",
+                    "url": "http://localhost/mcp",
+                    "unix_socket": str(layout["bridge_socket"]),
+                }
+            ]
+        },
+        "health": {
+            "listen_addr": "127.0.0.1:0",
+            "url_file": str(layout["tunnel_health_url"]),
+        },
+        "log": {
+            "file": str(layout["tunnel_log"]),
+            "format": "json",
+            "level": "info",
+        },
+        "admin_ui": {"open_browser": False},
+    }
+
+
+def install_release_bundle(
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+    sources: dict[str, Path],
+) -> dict[str, Path]:
+    _validate_manifest_contract(manifest)
+    release_dir = layout["release_dir"]
+    if release_dir.exists():
+        raise RuntimeError(f"immutable production release already exists: {release_dir}")
+    required = {
+        "bridge_binary",
+        "catdesk_binary",
+        "catdesk_config",
+        "catdesk_backend_key",
+        "host_attestation_key",
+        "host_source_dir",
+        "tunnel_profile",
+    }
+    missing = sorted(required.difference(sources))
+    if missing:
+        raise RuntimeError("production release sources missing: " + ", ".join(missing))
+
+    _private_dir(release_dir.parent)
+    release_dir.mkdir(mode=0o700)
+    try:
+        _copy_owned_file(sources["bridge_binary"], layout["bridge_binary"], 0o700)
+        _copy_owned_file(sources["catdesk_binary"], layout["catdesk_binary"], 0o700)
+        _copy_owned_file(sources["catdesk_config"], layout["catdesk_config"], 0o600)
+        _copy_owned_file(sources["catdesk_backend_key"], layout["catdesk_backend_key"], 0o600)
+        _copy_owned_file(sources["host_attestation_key"], layout["host_attestation_key"], 0o600)
+        _copy_owned_tree(sources["host_source_dir"], layout["host_dir"])
+        _private_dir(layout["host_backend_key"].parent)
+        layout["host_backend_key"].write_bytes(secrets.token_bytes(32).hex().encode("ascii"))
+        layout["host_backend_key"].chmod(0o600)
+
+        source_profile_path = Path(sources["tunnel_profile"])
+        _validate_private_source(source_profile_path, "source tunnel profile")
+        source_profile = json.loads(source_profile_path.read_text(encoding="utf-8"))
+        profile = production_tunnel_profile(source_profile, manifest, layout)
+        _write_json_private(layout["release_tunnel_profile"], profile)
+
+        node = _validate_runtime_dependencies(manifest)["node"]
+        wrapper = "\n".join(
+            [
+                "#!/bin/sh",
+                f"export LAB_HOST_ADAPTER_SOCKET={shlex.quote(str(layout['host_socket']))}",
+                f"export LAB_HOST_ATTESTATION_KEY_FILE={shlex.quote(str(layout['host_attestation_key']))}",
+                f"exec {shlex.quote(node['path'])} {shlex.quote(str(layout['native_host']))}",
+                "",
+            ]
+        )
+        _write_text_private(layout["native_host_wrapper"], wrapper, 0o700)
+        _write_text_private(
+            layout["catdesk_runner"],
+            _catdesk_runner_source(manifest, layout),
+            0o700,
+        )
+
+        artifacts: dict[str, str] = {}
+        for path in sorted(
+            (item for item in release_dir.rglob("*") if item.is_file()),
+            key=lambda item: str(item.relative_to(release_dir)),
+        ):
+            artifacts[str(path.relative_to(release_dir))] = _sha256_file(path)
+        installed_manifest = json.loads(json.dumps(manifest))
+        installed_manifest["artifacts_sha256"] = artifacts
+        _write_json_private(layout["release_manifest"], installed_manifest)
+
+        _private_dir(layout["tunnel_dir"])
+        _write_json_private(layout["tunnel_profile"], profile)
+    except Exception:
+        shutil.rmtree(release_dir, ignore_errors=True)
+        raise
+    validate_installed_release(layout)
+    return layout
+
+
+def validate_installed_release(layout: dict[str, Path]) -> dict[str, Any]:
+    manifest_path = layout["release_manifest"]
+    _validate_private_source(manifest_path, "production release manifest")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    _validate_manifest_contract(manifest)
+    artifacts = manifest.get("artifacts_sha256")
+    if not isinstance(artifacts, dict) or not artifacts:
+        raise RuntimeError("production release manifest has no artifact hashes")
+    _validate_runtime_dependencies(manifest)
+    release_dir = layout["release_dir"]
+    expected_files = {str(relative) for relative in artifacts}
+    if "release.json" in expected_files:
+        raise RuntimeError("production release manifest must not hash itself as an artifact")
+    actual_files: set[str] = set()
+    for item in release_dir.rglob("*"):
+        if item.is_symlink():
+            raise RuntimeError(f"production release contains unsafe symlink: {item.relative_to(release_dir)}")
+        if item.is_file():
+            actual_files.add(str(item.relative_to(release_dir)))
+    extras = sorted(actual_files.difference(expected_files | {"release.json"}))
+    missing = sorted(expected_files.difference(actual_files))
+    if extras:
+        raise RuntimeError("production release contains unlisted extra artifacts: " + ", ".join(extras))
+    if missing:
+        raise RuntimeError("production release artifacts are missing: " + ", ".join(missing))
+    for relative, expected in artifacts.items():
+        relative_path = Path(str(relative))
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise RuntimeError(f"production release artifact path is unsafe: {relative}")
+        path = release_dir / relative_path
+        if not path.is_file() or path.is_symlink():
+            raise RuntimeError(f"production release artifact missing or unsafe: {relative}")
+        if _sha256_file(path) != expected:
+            raise RuntimeError(f"production release artifact hash mismatch: {relative}")
+    if _sha256_file(layout["tunnel_profile"]) != _sha256_file(layout["release_tunnel_profile"]):
+        raise RuntimeError("production tunnel profile does not match immutable release artifact")
+    return manifest
+
+
+def _validate_rollback_release(
+    requested_manifest: dict[str, Any], layout: dict[str, Path]
+) -> dict[str, Any]:
+    """Validate only immutable identity needed to recover a tunnel."""
+    _validate_manifest_identity(requested_manifest)
+    manifest_path = layout["release_manifest"]
+    _validate_private_source(manifest_path, "production release manifest for rollback")
+    try:
+        installed = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise RuntimeError("production release manifest for rollback is invalid JSON") from error
+    _validate_manifest_identity(installed)
+    for key in (
+        "connector_id", "contract_version", "release_revision", "endpoint_generation", "workspace"
+    ):
+        if installed.get(key) != requested_manifest.get(key):
+            raise RuntimeError("rollback release identity does not match the requested manifest")
+    return installed
+
+
+def install_native_messaging_manifests(
+    layout: dict[str, Path],
+    manifest: dict[str, Any],
+    *,
+    home_dir: Path = Path.home(),
+    native_user_data_dirs: Iterable[Path] = (),
+) -> dict[str, Path]:
+    _validate_manifest_contract(manifest)
+    _validate_immutable_native_wrapper(layout, manifest)
+    wrapper = layout["native_host_wrapper"]
+    info = wrapper.lstat()
+    if wrapper.is_symlink() or not wrapper.is_file() or info.st_uid != os.geteuid():
+        raise RuntimeError("production Native Messaging wrapper is unsafe")
+    if not os.access(wrapper, os.X_OK):
+        raise RuntimeError("production Native Messaging wrapper is not executable")
+    extension_manifest = layout["host_dir"] / "chrome-host" / "extension" / "manifest.json"
+    extension = json.loads(extension_manifest.read_text(encoding="utf-8"))
+    version = str(extension.get("version") or "")
+    if _version_tuple(version) < _version_tuple(str(manifest["host"]["minimum_extension_version"])):
+        raise RuntimeError("production Host extension version is stale")
+
+    value = {
+        "name": "com.local_agent_bridge.web_host",
+        "description": "Local Agent Bridge production Web Host native messaging adapter",
+        "path": str(wrapper),
+        "type": "stdio",
+        "allowed_origins": [f"chrome-extension://{HOST_EXTENSION_ID}/"],
+    }
+    paths = _native_messaging_paths(home_dir, native_user_data_dirs=native_user_data_dirs)
+    installed: dict[str, Path] = {}
+    for browser, path in paths.items():
+        root = path.parent
+        root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        if root.is_symlink() or not root.is_dir() or root.stat().st_uid != os.geteuid():
+            raise RuntimeError(f"Native Messaging directory is unsafe for {browser}")
+        _write_json_private(path, value, private_parent=False)
+        installed[browser] = path
+    return installed
+
+
+def _native_messaging_paths(
+    home_dir: Path,
+    *,
+    native_user_data_dirs: Iterable[Path] = (),
+) -> dict[str, Path]:
+    roots = {
+        "chrome": Path(home_dir)
+        / "Library"
+        / "Application Support"
+        / "Google"
+        / "Chrome"
+        / "NativeMessagingHosts",
+        "chrome-for-testing": Path(home_dir)
+        / "Library"
+        / "Application Support"
+        / "Google"
+        / "ChromeForTesting"
+        / "NativeMessagingHosts",
+    }
+    paths = {browser: root / "com.local_agent_bridge.web_host.json" for browser, root in roots.items()}
+    for name in DEFAULT_NATIVE_USER_DATA_DIR_NAMES:
+        user_data_dir = (Path(home_dir) / ".chatgpt-web-mcp" / name).resolve()
+        paths[f"custom:{user_data_dir}"] = (
+            user_data_dir / "NativeMessagingHosts" / "com.local_agent_bridge.web_host.json"
+        )
+    seen = {path.parent.resolve() for path in paths.values()}
+    for raw in native_user_data_dirs:
+        expanded_user_data_dir = Path(raw).expanduser()
+        if not expanded_user_data_dir.is_absolute():
+            raise RuntimeError("custom Chrome user-data-dir must be absolute")
+        user_data_dir = expanded_user_data_dir.resolve()
+        root = user_data_dir / "NativeMessagingHosts"
+        resolved_root = root.resolve()
+        if resolved_root in seen:
+            continue
+        seen.add(resolved_root)
+        paths[f"custom:{user_data_dir}"] = root / "com.local_agent_bridge.web_host.json"
+    return paths
+
+
+def _validate_immutable_native_wrapper(
+    layout: dict[str, Path], manifest: dict[str, Any]
+) -> dict[str, Any]:
+    installed = validate_installed_release(layout)
+    if (
+        installed.get("release_revision") != manifest.get("release_revision")
+        or installed.get("endpoint_generation") != manifest.get("endpoint_generation")
+    ):
+        raise RuntimeError("Native Messaging wrapper release pin does not match requested manifest")
+    relative = str(layout["native_host_wrapper"].relative_to(layout["release_dir"]))
+    expected = (installed.get("artifacts_sha256") or {}).get(relative)
+    if not isinstance(expected, str) or _sha256_file(layout["native_host_wrapper"]) != expected:
+        raise RuntimeError("Native Messaging wrapper is not pinned to an immutable release artifact")
+    return installed
+
+
+def validate_native_messaging_manifests(
+    layout: dict[str, Path],
+    manifest: dict[str, Any],
+    *,
+    home_dir: Path = Path.home(),
+    native_user_data_dirs: Iterable[Path] = (),
+) -> dict[str, Path]:
+    """Require both supported Chrome installations to pin the same immutable wrapper."""
+    _validate_manifest_contract(manifest)
+    _validate_immutable_native_wrapper(layout, manifest)
+    expected = {
+        "name": "com.local_agent_bridge.web_host",
+        "path": str(layout["native_host_wrapper"]),
+        "type": "stdio",
+        "allowed_origins": [f"chrome-extension://{HOST_EXTENSION_ID}/"],
+    }
+    paths = _native_messaging_paths(home_dir, native_user_data_dirs=native_user_data_dirs)
+    for browser, path in paths.items():
+        _validate_private_source(path, f"Native Messaging manifest for {browser}")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"Native Messaging manifest for {browser} is not valid JSON") from error
+        if not isinstance(value, dict) or any(value.get(key) != wanted for key, wanted in expected.items()):
+            raise RuntimeError(f"Native Messaging manifest pin mismatch for {browser}")
+    return paths
+
+
+def _read_loopback_url_file(path: Path, label: str) -> tuple[str, urllib.parse.SplitResult]:
+    _validate_private_source(path, label)
+    value = path.read_text(encoding="utf-8").strip()
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme != "http" or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise RuntimeError(f"{label} must contain a private loopback HTTP URL")
+    try:
+        address = ipaddress.ip_address(parsed.hostname or "")
+        port = parsed.port
+    except ValueError as error:
+        raise RuntimeError(f"{label} must contain a private loopback HTTP URL") from error
+    if not address.is_loopback or port is None:
+        raise RuntimeError(f"{label} must contain a private loopback HTTP URL with an explicit port")
+    return value, parsed
+
+
+def _decode_json_or_sse(raw: bytes, label: str) -> dict[str, Any]:
+    text = raw.decode("utf-8")
+    candidates = [text]
+    candidates.extend(
+        line[5:].strip()
+        for line in text.splitlines()
+        if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]")
+    )
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    raise RuntimeError(f"{label} did not return a JSON object")
+
+
+def _request_json(request: urllib.request.Request, label: str) -> dict[str, Any]:
+    try:
+        with urllib.request.urlopen(request, timeout=3.0) as response:
+            if getattr(response, "status", None) != 200:
+                raise RuntimeError(f"{label} returned HTTP {getattr(response, 'status', 'unknown')}")
+            return _decode_json_or_sse(response.read(), label)
+    except RuntimeError:
+        raise
+    except Exception as error:
+        raise RuntimeError(f"{label} request failed") from error
+
+
+MCP_STREAMABLE_PROTOCOL_VERSION = "2025-03-26"
+MCP_STREAMABLE_ACCEPT = "application/json, text/event-stream"
+
+
+def _single_jsonrpc_result(
+    raw: bytes, label: str, *, expected_id: str, content_type: str
+) -> dict[str, Any]:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RuntimeError(f"{label} returned non-UTF-8 data") from error
+    payloads: list[Any] = []
+    if content_type == "application/json":
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"{label} returned invalid JSON for application/json") from error
+        payloads.append(value)
+    elif content_type == "text/event-stream":
+        data_lines = [
+            line[5:].strip()
+            for line in text.splitlines()
+            if line.startswith("data:") and line[5:].strip()
+        ]
+        for data in data_lines:
+            try:
+                payloads.append(json.loads(data))
+            except json.JSONDecodeError as error:
+                raise RuntimeError(f"{label} returned invalid SSE JSON") from error
+    else:
+        raise RuntimeError(f"{label} returned unsupported Content-Type {content_type or 'missing'}")
+    if len(payloads) != 1 or not isinstance(payloads[0], dict):
+        raise RuntimeError(f"{label} must return a single JSON-RPC result")
+    payload = payloads[0]
+    if payload.get("jsonrpc") != "2.0" or payload.get("id") != expected_id:
+        raise RuntimeError(f"{label} returned a mismatched JSON-RPC id")
+    if "error" in payload:
+        raise RuntimeError(f"{label} returned a JSON-RPC error")
+    if not isinstance(payload.get("result"), dict):
+        raise RuntimeError(f"{label} omitted its JSON-RPC result")
+    return payload
+
+
+def _response_session_id(response: Any, label: str) -> str | None:
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    get_all = getattr(headers, "get_all", None)
+    values = get_all("Mcp-Session-Id") if callable(get_all) else None
+    if values is None:
+        value = headers.get("Mcp-Session-Id")
+        values = [] if value is None else [value]
+    if len(values) > 1:
+        raise RuntimeError(f"{label} returned multiple MCP session ids")
+    if not values:
+        return None
+    session_id = str(values[0])
+    if not 1 <= len(session_id) <= 256 or any(
+        ord(character) < 0x21 or ord(character) > 0x7E for character in session_id
+    ):
+        raise RuntimeError(f"{label} returned an invalid MCP session id")
+    return session_id
+
+
+def _open_mcp_streamable(
+    request: urllib.request.Request,
+    label: str,
+    *,
+    allowed_statuses: set[int],
+    expected_session: str | None = None,
+) -> tuple[bytes, str | None, str | None]:
+    try:
+        with urllib.request.urlopen(request, timeout=3.0) as response:
+            status = getattr(response, "status", None)
+            if status not in allowed_statuses:
+                raise RuntimeError(f"{label} returned HTTP {status}")
+            response_session = _response_session_id(response, label)
+            if expected_session is not None and response_session not in (None, expected_session):
+                raise RuntimeError(f"{label} returned a mismatched MCP session id")
+            raw_content_type = response.headers.get("Content-Type") if getattr(response, "headers", None) else None
+            content_type = (
+                str(raw_content_type).split(";", 1)[0].strip().lower()
+                if raw_content_type is not None
+                else None
+            )
+            return response.read(), response_session, content_type
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"{label} returned HTTP {error.code}") from error
+    except RuntimeError:
+        raise
+    except Exception as error:
+        raise RuntimeError(f"{label} request failed") from error
+
+
+def _mcp_streamable_tools_list(compute_url: str) -> dict[str, Any]:
+    parsed = urllib.parse.urlsplit(compute_url)
+    try:
+        address = ipaddress.ip_address(parsed.hostname or "")
+        port = parsed.port
+    except ValueError as error:
+        raise RuntimeError("fallback MCP endpoint must be an explicit loopback HTTP URL") from error
+    if (
+        parsed.scheme != "http"
+        or not address.is_loopback
+        or port is None
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError("fallback MCP endpoint must be an explicit loopback HTTP URL")
+
+    common_headers = {
+        "Accept": MCP_STREAMABLE_ACCEPT,
+        "MCP-Protocol-Version": MCP_STREAMABLE_PROTOCOL_VERSION,
+    }
+    session_id: str | None = None
+    result: dict[str, Any] | None = None
+    primary_error: Exception | None = None
+    try:
+        initialize_id = "fallback-initialize"
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": initialize_id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_STREAMABLE_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "local-agent-bridge-production-fallback-check",
+                    "version": "1",
+                },
+            },
+        }
+        raw, session_id, content_type = _open_mcp_streamable(
+            urllib.request.Request(
+                compute_url,
+                data=json.dumps(initialize, separators=(",", ":")).encode("utf-8"),
+                method="POST",
+                headers={**common_headers, "Content-Type": "application/json"},
+            ),
+            "AI-Bridge fallback initialize",
+            allowed_statuses={200},
+        )
+        if session_id is None:
+            raise RuntimeError("AI-Bridge fallback initialize omitted its MCP session id")
+        initialize_response = _single_jsonrpc_result(
+            raw,
+            "AI-Bridge fallback initialize",
+            expected_id=initialize_id,
+            content_type=str(content_type or ""),
+        )
+        if initialize_response["result"].get("protocolVersion") != MCP_STREAMABLE_PROTOCOL_VERSION:
+            raise RuntimeError("AI-Bridge fallback initialize protocol version mismatch")
+
+        session_headers = {**common_headers, "Mcp-Session-Id": session_id}
+        initialized = {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        }
+        raw, _, content_type = _open_mcp_streamable(
+            urllib.request.Request(
+                compute_url,
+                data=json.dumps(initialized, separators=(",", ":")).encode("utf-8"),
+                method="POST",
+                headers={**session_headers, "Content-Type": "application/json"},
+            ),
+            "AI-Bridge fallback initialized notification",
+            allowed_statuses={202},
+            expected_session=session_id,
+        )
+        if raw:
+            raise RuntimeError("AI-Bridge fallback initialized notification returned an unexpected body")
+        if content_type not in (None, "application/json", "text/event-stream"):
+            raise RuntimeError("AI-Bridge fallback initialized notification returned unsupported Content-Type")
+
+        tools_id = "fallback-tools-list"
+        tools_request = {
+            "jsonrpc": "2.0",
+            "id": tools_id,
+            "method": "tools/list",
+            "params": {},
+        }
+        raw, _, content_type = _open_mcp_streamable(
+            urllib.request.Request(
+                compute_url,
+                data=json.dumps(tools_request, separators=(",", ":")).encode("utf-8"),
+                method="POST",
+                headers={**session_headers, "Content-Type": "application/json"},
+            ),
+            "AI-Bridge fallback tools/list",
+            allowed_statuses={200},
+            expected_session=session_id,
+        )
+        result = _single_jsonrpc_result(
+            raw,
+            "AI-Bridge fallback tools/list",
+            expected_id=tools_id,
+            content_type=str(content_type or ""),
+        )
+    except Exception as error:
+        primary_error = error
+    cleanup_error: Exception | None = None
+    if session_id is not None:
+        try:
+            raw, _, content_type = _open_mcp_streamable(
+                urllib.request.Request(
+                    compute_url,
+                    method="DELETE",
+                    headers={**common_headers, "Mcp-Session-Id": session_id},
+                ),
+                "AI-Bridge fallback session cleanup",
+                allowed_statuses={202},
+                expected_session=session_id,
+            )
+            if raw:
+                raise RuntimeError("AI-Bridge fallback session cleanup returned an unexpected body")
+            if content_type not in (None, "application/json", "text/event-stream"):
+                raise RuntimeError("AI-Bridge fallback session cleanup returned unsupported Content-Type")
+        except Exception as error:
+            cleanup_error = error
+    if primary_error is not None:
+        if cleanup_error is not None:
+            raise RuntimeError(f"{primary_error}; session cleanup failed: {cleanup_error}") from primary_error
+        raise primary_error
+    if cleanup_error is not None:
+        raise RuntimeError(f"AI-Bridge fallback session cleanup failed: {cleanup_error}") from cleanup_error
+    if result is None:
+        raise RuntimeError("AI-Bridge fallback tools/list produced no result")
+    return result
+
+
+def _main_channel(status: dict[str, Any], label: str) -> dict[str, Any]:
+    channels = status.get("channels")
+    if isinstance(channels, dict):
+        main = channels.get("main")
+    elif isinstance(channels, list):
+        matches = [
+            item
+            for item in channels
+            if isinstance(item, dict) and item.get("channel", item.get("name")) == "main"
+        ]
+        main = matches[0] if len(matches) == 1 else None
+    else:
+        main = None
+    if not isinstance(main, dict) or main.get("enabled") is not True or main.get("probe_status") != "ok":
+        raise RuntimeError(f"{label} main channel is not enabled with probe_status=ok")
+    return main
+
+
+def _event_timestamp(value: Any) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _verify_tunnel_operational(
+    layout: dict[str, Path],
+    *,
+    expected_tunnel_id: str,
+    started_at: float,
+) -> dict[str, Any]:
+    health_url, parsed = _read_loopback_url_file(
+        layout["tunnel_health_url"], "production tunnel health URL"
+    )
+    status_url = urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, "/api/status", "", "")
+    )
+    status = _request_json(
+        urllib.request.Request(status_url, method="GET", headers={"Accept": "application/json"}),
+        "production tunnel status",
+    )
+    if status.get("control_plane_tunnel_id") != expected_tunnel_id:
+        raise RuntimeError("production tunnel status control_plane_tunnel_id mismatch")
+    _main_channel(status, "production tunnel status")
+
+    _validate_private_source(layout["tunnel_log"], "production tunnel log")
+    polling_event: dict[str, Any] | None = None
+    for raw in layout["tunnel_log"].read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        observed_at = _event_timestamp(
+            event.get("timestamp", event.get("time", event.get("ts")))
+        )
+        message = " ".join(
+            str(event.get(key) or "")
+            for key in ("event", "message", "msg", "status", "component", "state")
+        ).lower()
+        if observed_at is not None and observed_at >= started_at and "polling" in message and "operational" in message:
+            polling_event = event
+            break
+    if polling_event is None:
+        raise RuntimeError("production tunnel log has no fresh polling operational event after started_at")
+    return {
+        "ok": True,
+        "health_url": health_url,
+        "control_plane_tunnel_id": expected_tunnel_id,
+        "polling_event": polling_event,
+    }
+
+
+def _verify_ai_bridge_fallback(health_url_file: Path) -> dict[str, Any]:
+    health_url, parsed_health = _read_loopback_url_file(
+        health_url_file, "AI-Bridge fallback health URL"
+    )
+    status_url = urllib.parse.urlunsplit(
+        (parsed_health.scheme, parsed_health.netloc, "/api/status", "", "")
+    )
+    status = _request_json(
+        urllib.request.Request(status_url, method="GET", headers={"Accept": "application/json"}),
+        "AI-Bridge fallback status",
+    )
+    main = _main_channel(status, "AI-Bridge fallback status")
+    compute_candidates: list[str] = []
+    for key in ("address", "url", "target_url", "mcp_server_url"):
+        value = main.get(key)
+        if isinstance(value, str) and value.strip():
+            compute_candidates.append(value.strip())
+    top_level_mcp_server_url = status.get("mcp_server_url")
+    if isinstance(top_level_mcp_server_url, str) and top_level_mcp_server_url.strip():
+        compute_candidates.append(top_level_mcp_server_url.strip())
+    details = main.get("details")
+    if isinstance(details, list):
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            key = (
+                str(detail.get("key") or "")
+                .strip()
+                .lower()
+                .replace("-", "_")
+                .replace(".", "_")
+            )
+            value = detail.get("value")
+            if key in {"address", "url", "target_url", "mcp_server_url", "server_url"} and isinstance(value, str) and value.strip():
+                compute_candidates.append(value.strip())
+    route_authorities: list[tuple[str, int]] = []
+    routes = main.get("mcp_routes", status.get("mcp_routes"))
+    if isinstance(routes, dict):
+        routes = list(routes.values())
+    if isinstance(routes, list):
+        for route in routes:
+            if not isinstance(route, dict):
+                continue
+            if route.get("channel", route.get("name", "main")) != "main":
+                continue
+            for key in ("target", "target_url", "address", "url", "mcp_server_url"):
+                value = route.get(key)
+                if isinstance(value, str) and value.strip():
+                    route_value = value.strip()
+                    parsed_route = urllib.parse.urlsplit(route_value)
+                    if parsed_route.scheme:
+                        compute_candidates.append(route_value)
+                        continue
+                    parsed_authority = urllib.parse.urlsplit(f"//{route_value}")
+                    try:
+                        route_address = ipaddress.ip_address(parsed_authority.hostname or "")
+                        route_port = parsed_authority.port
+                    except ValueError as error:
+                        raise RuntimeError("AI-Bridge fallback route target is not a loopback authority") from error
+                    if (
+                        not route_address.is_loopback
+                        or route_port is None
+                        or parsed_authority.username
+                        or parsed_authority.password
+                        or parsed_authority.path
+                        or parsed_authority.query
+                        or parsed_authority.fragment
+                    ):
+                        raise RuntimeError("AI-Bridge fallback route target is not a loopback authority")
+                    route_authorities.append((str(route_address), route_port))
+    normalized_compute_urls: dict[str, str] = {}
+    for candidate in compute_candidates:
+        parsed_candidate = urllib.parse.urlsplit(candidate)
+        try:
+            candidate_address = ipaddress.ip_address(parsed_candidate.hostname or "")
+            candidate_port = parsed_candidate.port
+        except ValueError as error:
+            raise RuntimeError("AI-Bridge fallback compute endpoint is not loopback") from error
+        if (
+            parsed_candidate.scheme != "http"
+            or not candidate_address.is_loopback
+            or candidate_port is None
+            or parsed_candidate.username
+            or parsed_candidate.password
+            or parsed_candidate.query
+            or parsed_candidate.fragment
+        ):
+            raise RuntimeError("AI-Bridge fallback compute endpoint is not loopback")
+        host = f"[{candidate_address}]" if candidate_address.version == 6 else str(candidate_address)
+        normalized = urllib.parse.urlunsplit(
+            ("http", f"{host}:{candidate_port}", parsed_candidate.path or "/", "", "")
+        )
+        normalized_compute_urls[normalized] = normalized
+    unique_compute_urls = set(normalized_compute_urls)
+    if len(unique_compute_urls) != 1:
+        raise RuntimeError("AI-Bridge fallback status has no main compute address")
+    compute_url = unique_compute_urls.pop()
+    parsed_compute = urllib.parse.urlsplit(compute_url)
+    try:
+        compute_address = ipaddress.ip_address(parsed_compute.hostname or "")
+        compute_port = parsed_compute.port
+    except ValueError as error:
+        raise RuntimeError("AI-Bridge fallback compute endpoint is not loopback") from error
+    if (
+        parsed_compute.scheme != "http"
+        or not compute_address.is_loopback
+        or compute_port is None
+        or parsed_compute.username
+        or parsed_compute.password
+        or parsed_compute.query
+        or parsed_compute.fragment
+    ):
+        raise RuntimeError("AI-Bridge fallback compute endpoint is not loopback")
+    compute_host = str(compute_address)
+    if any(authority != (compute_host, compute_port) for authority in route_authorities):
+        raise RuntimeError("AI-Bridge fallback route target does not match its compute endpoint")
+    if not _tcp_ready(compute_host, compute_port):
+        raise RuntimeError("AI-Bridge fallback compute endpoint is not listening")
+    tools_status = _mcp_streamable_tools_list(compute_url)
+    tools = sorted(
+        item.get("name")
+        for item in ((tools_status.get("result") or {}).get("tools") or [])
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    )
+    missing = sorted({"computer", "shell_command"}.difference(tools))
+    if missing:
+        raise RuntimeError("AI-Bridge fallback tools/list is missing: " + ", ".join(missing))
+    return {
+        "ready": True,
+        "health_url": health_url,
+        "compute_url": compute_url,
+        "compute_host": compute_host,
+        "compute_port": compute_port,
+        "tools": tools,
+        "status": status,
+    }
+
+
+def _validate_tunnel_profile(
+    profile_path: Path,
+    *,
+    profile_name: str,
+    expected_socket: Path,
+) -> dict[str, Any]:
+    _validate_private_source(profile_path, "tunnel profile")
+    try:
+        value = json.loads(profile_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise RuntimeError("tunnel profile is not valid JSON") from error
+    control = value.get("control_plane")
+    mcp = value.get("mcp")
+    if not isinstance(control, dict) or not isinstance(mcp, dict):
+        raise RuntimeError("tunnel profile is missing control_plane or mcp")
+    tunnel_id = control.get("tunnel_id")
+    if not isinstance(tunnel_id, str) or not tunnel_id.strip():
+        raise RuntimeError("tunnel profile tunnel_id is missing")
+    if control.get("base_url") != "https://api.openai.com":
+        raise RuntimeError("tunnel profile control plane is not canonical")
+    urls = mcp.get("server_urls")
+    if not isinstance(urls, list):
+        raise RuntimeError("tunnel profile mcp.server_urls is missing")
+    sockets = {
+        str(item.get("unix_socket"))
+        for item in urls
+        if isinstance(item, dict) and item.get("unix_socket")
+    }
+    if sockets != {str(expected_socket)}:
+        raise RuntimeError(f"{profile_name} tunnel profile is not bound exactly to its expected Bridge socket")
+    return {
+        "profile_dir": str(profile_path.parent),
+        "profile_path": str(profile_path),
+        "profile_name": profile_name,
+        "tunnel_id": tunnel_id.strip(),
+        "profile_sha256": _sha256_file(profile_path),
+    }
+
+
+def _tunnel_profile_path(profile_dir: Path, profile_name: str) -> Path:
+    return Path(profile_dir).expanduser() / f"{profile_name}.yaml"
+
+
+def _parse_verified_tunnel_process(
+    pid: int,
+    command: str,
+    *,
+    profile_dir: Path,
+    profile_name: str,
+    expected_socket: Path,
+) -> dict[str, Any] | None:
+    parsed = parse_tunnel_process(command)
+    if parsed is None:
+        return None
+    expected_dir = Path(profile_dir).expanduser().resolve()
+    if parsed["profile_dir"].resolve() != expected_dir or parsed["profile_name"] != profile_name:
+        return None
+    # The complete command must be only the tunnel-client invocation for this exact profile.
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    if argv != [str(Path(argv[0])), "run", "--profile-dir", str(expected_dir), "--profile", profile_name]:
+        return None
+    try:
+        identity = _capture_process_identity(pid, expected_argv=argv)
+    except RuntimeError:
+        return None
+    try:
+        profile = _validate_tunnel_profile(
+            _tunnel_profile_path(expected_dir, profile_name),
+            profile_name=profile_name,
+            expected_socket=expected_socket,
+        )
+    except RuntimeError:
+        return None
+    return {
+        "pid": pid,
+        "command": command,
+        "process_identity": identity,
+        "expected_socket": str(expected_socket),
+        **profile,
+    }
+
+
+def _discover_tunnel_processes(
+    *,
+    profile_dir: Path,
+    profile_name: str,
+    expected_socket: Path,
+) -> list[dict[str, Any]]:
+    completed = subprocess.run(
+        ["ps", "-ww", "-axo", "pid=,comm="], capture_output=True, text=True, check=False
+    )
+    if completed.returncode != 0:
+        return []
+    found: list[dict[str, Any]] = []
+    for raw in completed.stdout.splitlines():
+        pieces = raw.strip().split(None, 1)
+        if len(pieces) != 2 or Path(pieces[1]).name != "tunnel-client":
+            continue
+        try:
+            pid = int(pieces[0])
+        except ValueError:
+            continue
+        if not _pid_alive(pid):
+            continue
+        try:
+            argv = _process_argv(pid)
+        except RuntimeError:
+            continue
+        command = shlex.join(argv)
+        parsed = _parse_verified_tunnel_process(
+            pid,
+            command,
+            profile_dir=profile_dir,
+            profile_name=profile_name,
+            expected_socket=expected_socket,
+        )
+        if parsed is not None:
+            found.append(parsed)
+    return found
+
+
+_DIRECT_TUNNEL_VALUE_FLAGS = frozenset(
+    {
+        "--control-plane.tunnel-id",
+        "--control-plane.base-url",
+        "--control-plane.api-key",
+        "--mcp.server-url",
+        "--cloudflared.path",
+        "--health.listen-addr",
+        "--health.url-file",
+        "--health.unix-socket",
+        "--log.level",
+        "--log.file",
+        "--log.format",
+    }
+)
+
+
+def _direct_tunnel_options(argv: list[str]) -> dict[str, str] | None:
+    """Parse only the two observed direct-flag schemas; ambiguity is fatal."""
+    if len(argv) < 3 or Path(argv[0]).name != "tunnel-client" or argv[1] != "run":
+        return None
+    profile_flags = {"--config", "--profile", "--profile-dir", "--profile-file"}
+    options: dict[str, str] = {}
+    index = 2
+    while index < len(argv):
+        raw = argv[index]
+        if not raw.startswith("--"):
+            raise RuntimeError("cannot prove tunnel-id exclusivity for positional tunnel arguments")
+        if "=" in raw:
+            flag, value = raw.split("=", 1)
+            index += 1
+        else:
+            flag = raw
+            if index + 1 >= len(argv) or argv[index + 1].startswith("--"):
+                raise RuntimeError("cannot prove tunnel-id exclusivity for an empty tunnel flag")
+            value = argv[index + 1]
+            index += 2
+        if flag in profile_flags:
+            if options:
+                raise RuntimeError("cannot prove tunnel-id exclusivity for mixed profile and direct flags")
+            return None
+        if flag not in _DIRECT_TUNNEL_VALUE_FLAGS:
+            raise RuntimeError(f"cannot prove tunnel-id exclusivity for unsupported tunnel flag {flag}")
+        if not value.strip() or flag in options:
+            raise RuntimeError("cannot prove tunnel-id exclusivity for duplicate or empty tunnel flags")
+        options[flag] = value.strip()
+    if not options:
+        raise RuntimeError("cannot prove tunnel-id exclusivity for an empty direct tunnel command")
+    return options
+
+
+def _direct_mcp_unix_socket(server_url: str) -> Path | None:
+    if "=" not in server_url:
+        parsed = urllib.parse.urlsplit(server_url)
+        if parsed.scheme != "http":
+            raise RuntimeError("cannot prove direct tunnel MCP endpoint")
+        return None
+    values: dict[str, str] = {}
+    for raw in server_url.split(","):
+        if "=" not in raw:
+            raise RuntimeError("cannot prove direct tunnel MCP endpoint")
+        key, value = raw.split("=", 1)
+        key = key.strip().lower().replace("_", "-")
+        value = value.strip()
+        if key not in {"name", "url", "unix-socket"} or not value or key in values:
+            raise RuntimeError("cannot prove direct tunnel MCP endpoint")
+        values[key] = value
+    if "unix-socket" not in values:
+        url = values.get("url")
+        if not url or urllib.parse.urlsplit(url).scheme != "http":
+            raise RuntimeError("cannot prove direct tunnel MCP endpoint")
+        return None
+    raw_socket = Path(values["unix-socket"]).expanduser()
+    if not raw_socket.is_absolute():
+        raise RuntimeError("cannot prove direct tunnel MCP unix socket")
+    return raw_socket.resolve()
+
+
+def _direct_tunnel_id(options: dict[str, str]) -> str:
+    explicit = options.get("--control-plane.tunnel-id")
+    if explicit:
+        return explicit
+    raw_health_file = options.get("--health.url-file")
+    if not raw_health_file:
+        raise RuntimeError("cannot prove tunnel-id for a managed direct tunnel without health state")
+    health_file = Path(raw_health_file).expanduser()
+    if not health_file.is_absolute():
+        raise RuntimeError("cannot prove tunnel-id from a relative health URL file")
+    _, parsed = _read_loopback_url_file(health_file, "direct tunnel health URL")
+    status_url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "/api/status", "", ""))
+    status = _request_json(
+        urllib.request.Request(status_url, method="GET", headers={"Accept": "application/json"}),
+        "direct tunnel status",
+    )
+    observed = status.get("control_plane_tunnel_id")
+    if not isinstance(observed, str) or not observed.strip():
+        raise RuntimeError("cannot prove tunnel-id from direct tunnel status")
+    return observed.strip()
+
+
+def _discover_tunnels_by_id(
+    tunnel_id: str, *, expected_socket: Path | None = None
+) -> list[dict[str, Any]]:
+    completed = subprocess.run(
+        ["ps", "-ww", "-axo", "pid=,comm="], capture_output=True, text=True, check=False
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("cannot enumerate tunnel processes for duplicate tunnel-id fence")
+    found: list[dict[str, Any]] = []
+    for raw in completed.stdout.splitlines():
+        pieces = raw.strip().split(None, 1)
+        if len(pieces) != 2 or Path(pieces[1]).name != "tunnel-client":
+            continue
+        try:
+            pid = int(pieces[0])
+        except ValueError:
+            continue
+        try:
+            argv = _process_argv(pid)
+        except RuntimeError as error:
+            raise RuntimeError("cannot prove tunnel-id exclusivity because a process argv is unavailable") from error
+        command = shlex.join(argv)
+        if len(argv) < 2 or Path(argv[0]).name != "tunnel-client" or argv[1] != "run":
+            continue
+        parsed = parse_tunnel_process(command)
+        if parsed is None:
+            options = _direct_tunnel_options(argv)
+            if options is None:
+                raise RuntimeError("cannot prove tunnel-id exclusivity for a non-canonical profile command")
+            observed_id = _direct_tunnel_id(options)
+            if observed_id != tunnel_id:
+                continue
+            server_url = options.get("--mcp.server-url")
+            if server_url is None:
+                raise RuntimeError("cannot prove direct tunnel ownership without one MCP endpoint")
+            unix_socket = _direct_mcp_unix_socket(server_url)
+            endpoint_matches = expected_socket is None or bool(
+                unix_socket == Path(expected_socket).expanduser().resolve()
+                and options.get("--control-plane.base-url") == CANONICAL_CONTROL_PLANE_BASE_URL
+            )
+            try:
+                identity = _capture_process_identity(pid, expected_argv=argv)
+            except RuntimeError as error:
+                raise RuntimeError("cannot prove direct tunnel process identity") from error
+            found.append(
+                {
+                    "pid": pid,
+                    "command": command,
+                    "tunnel_id": observed_id,
+                    "process_identity": identity,
+                    "direct": True,
+                    "mcp_unix_socket": str(unix_socket) if unix_socket is not None else None,
+                    "expected_endpoint_matches": endpoint_matches,
+                }
+            )
+            continue
+        expected_dir = parsed["profile_dir"].resolve()
+        if argv != [str(Path(argv[0])), "run", "--profile-dir", str(expected_dir), "--profile", parsed["profile_name"]]:
+            raise RuntimeError("cannot prove tunnel-id exclusivity for a non-canonical tunnel command")
+        profile_path = _tunnel_profile_path(expected_dir, parsed["profile_name"])
+        try:
+            _validate_private_source(profile_path, "tunnel profile for duplicate tunnel-id fence")
+            profile_value = json.loads(profile_path.read_text(encoding="utf-8"))
+            observed_id = ((profile_value.get("control_plane") or {}).get("tunnel_id"))
+            identity = _capture_process_identity(pid, expected_argv=argv)
+        except (json.JSONDecodeError, RuntimeError) as error:
+            raise RuntimeError("cannot prove tunnel-id exclusivity for an unverified tunnel process") from error
+        if observed_id == tunnel_id:
+            profile_socket = None
+            urls = ((profile_value.get("mcp") or {}).get("server_urls") or [])
+            sockets = {
+                Path(str(item.get("unix_socket"))).expanduser().resolve()
+                for item in urls
+                if isinstance(item, dict) and item.get("unix_socket")
+            }
+            if len(sockets) == 1:
+                profile_socket = next(iter(sockets))
+            found.append({
+                "pid": pid,
+                "profile_dir": str(expected_dir),
+                "profile_name": parsed["profile_name"],
+                "profile_path": str(profile_path),
+                "profile_sha256": _sha256_file(profile_path),
+                "tunnel_id": observed_id,
+                "process_identity": identity,
+                "expected_endpoint_matches": expected_socket is None or profile_socket == Path(expected_socket).expanduser().resolve(),
+            })
+    return found
+
+
+def _require_exact_tunnel_id_owners(
+    tunnel_id: str, expected_pids: set[int], *, expected_socket: Path | None = None
+) -> None:
+    observed = _discover_tunnels_by_id(tunnel_id, expected_socket=expected_socket)
+    observed_pids = {item.get("pid") for item in observed}
+    if observed_pids != expected_pids:
+        raise RuntimeError(
+            "same tunnel-id ownership is not exclusive: "
+            f"expected {sorted(expected_pids)}, observed {sorted(value for value in observed_pids if isinstance(value, int))}"
+        )
+    if expected_socket is not None and any(
+        item.get("expected_endpoint_matches") is not True for item in observed
+    ):
+        raise RuntimeError("same tunnel-id owner does not match the exact expected MCP endpoint")
+
+
+def production_tunnel_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict[str, Any]:
+    _validate_manifest_contract(manifest)
+    try:
+        expected = _validate_tunnel_profile(
+            layout["tunnel_profile"],
+            profile_name=TUNNEL_PROFILE_NAME,
+            expected_socket=layout["bridge_socket"],
+        )
+    except RuntimeError as error:
+        return {"ready": False, "pid": None, "reason": str(error), "generation": None, "tunnel_id": None}
+    discovered = _discover_tunnel_processes(
+        profile_dir=layout["tunnel_dir"],
+        profile_name=TUNNEL_PROFILE_NAME,
+        expected_socket=layout["bridge_socket"],
+    )
+    if len(discovered) != 1:
+        return {
+            "ready": False,
+            "pid": None,
+            "reason": "multiple_active_tunnels" if len(discovered) > 1 else "tunnel_not_running",
+            "generation": None,
+            "tunnel_id": None,
+            "active_pids": sorted(item["pid"] for item in discovered),
+        }
+    item = discovered[0]
+    try:
+        owners = _discover_tunnels_by_id(
+            item["tunnel_id"], expected_socket=layout["bridge_socket"]
+        )
+    except RuntimeError as error:
+        return {
+            "ready": False,
+            "pid": item["pid"],
+            "reason": str(error),
+            "generation": None,
+            "tunnel_id": item["tunnel_id"],
+        }
+    if {owner.get("pid") for owner in owners} != {item["pid"]}:
+        return {
+            "ready": False,
+            "pid": item["pid"],
+            "reason": "same tunnel-id ownership is not globally exclusive",
+            "generation": None,
+            "tunnel_id": item["tunnel_id"],
+        }
+    state = _read_json_object(layout["runtime_state"])
+    started_at = state.get("tunnel_started_at")
+    recorded_identity = state.get("tunnel_process_identity")
+    canonical = (
+        state.get("release_revision") == manifest["release_revision"]
+        and state.get("endpoint_generation") == manifest["endpoint_generation"]
+        and state.get("tunnel_profile_name") == TUNNEL_PROFILE_NAME
+        and state.get("tunnel_pid") == item["pid"]
+        and state.get("tunnel_id") == item["tunnel_id"]
+        and state.get("tunnel_profile_sha256") == expected["profile_sha256"]
+        and isinstance(started_at, (int, float))
+        and not isinstance(started_at, bool)
+        and isinstance(recorded_identity, dict)
+        and item.get("process_identity") == recorded_identity
+    )
+    operational: dict[str, Any] | None = None
+    reason = None if canonical else "runtime_state_mismatch"
+    if canonical:
+        try:
+            operational = _verify_tunnel_operational(
+                layout,
+                expected_tunnel_id=item["tunnel_id"],
+                started_at=float(started_at),
+            )
+        except RuntimeError as error:
+            canonical = False
+            reason = str(error)
+    return {
+        "ready": canonical,
+        "pid": item["pid"],
+        "reason": reason,
+        "generation": manifest["endpoint_generation"] if canonical else None,
+        "tunnel_id": item["tunnel_id"],
+        "profile_dir": item["profile_dir"],
+        "profile_sha256": item["profile_sha256"],
+        "started_at": started_at,
+        "operational": operational,
+    }
+
+
+def parse_tunnel_process(command: str) -> dict[str, Any] | None:
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    if len(argv) < 6 or Path(argv[0]).name != "tunnel-client" or argv[1] != "run":
+        return None
+    if argv.count("--profile-dir") != 1 or argv.count("--profile") != 1:
+        return None
+    profile_dir_index = argv.index("--profile-dir")
+    profile_index = argv.index("--profile")
+    if profile_dir_index + 1 >= len(argv) or profile_index + 1 >= len(argv):
+        return None
+    profile_dir = Path(argv[profile_dir_index + 1]).expanduser()
+    profile_name = argv[profile_index + 1]
+    if not profile_dir.is_absolute() or not profile_name:
+        return None
+    return {"profile_dir": profile_dir, "profile_name": profile_name}
+
+
+def process_command_matches(
+    command: str,
+    executable: Path,
+    required_arguments: Iterable[str] = (),
+) -> bool:
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if not argv or Path(argv[0]) != Path(executable):
+        return False
+    required = list(required_arguments)
+    if not required:
+        return True
+    for index in range(0, len(argv) - len(required) + 1):
+        if argv[index : index + len(required)] == required:
+            return True
+    return False
+
+
+def find_verified_historical_m0_tunnel(
+    historical_profile_dir: Path, *, profile_name: str
+) -> dict[str, Any]:
+    """Find exactly one live M0 tunnel bound to its live profile, never by pid file."""
+    profile_dir = Path(historical_profile_dir).expanduser().resolve()
+    if profile_name not in HISTORICAL_TUNNEL_PROFILE_NAMES:
+        raise RuntimeError("refusing production activation: historical profile name is not explicitly allowed")
+    found = _discover_tunnel_processes(
+        profile_dir=profile_dir,
+        profile_name=profile_name,
+        expected_socket=HISTORICAL_M0_BRIDGE_SOCKET,
+    )
+    if len(found) != 1:
+        reason = "multiple matching M0 tunnels" if len(found) > 1 else "no matching M0 tunnel"
+        raise RuntimeError(f"refusing production activation: {reason} at {profile_dir}")
+    return found[0]
+
+
+def verified_historical_m0_bridge(runtime_state: Path) -> dict[str, Any]:
+    """Preflight the old Bridge identity; activation never stops or rewrites it."""
+    _validate_private_source(runtime_state, "historical M0 runtime state")
+    state = _read_json_object(runtime_state)
+    pid = state.get("bridge_pid")
+    if not isinstance(pid, int) or pid < 1:
+        raise RuntimeError("historical M0 runtime state has no valid bridge PID")
+    if state.get("socket") != str(HISTORICAL_M0_BRIDGE_SOCKET):
+        raise RuntimeError("historical M0 runtime state does not pin the expected old Bridge socket")
+    try:
+        info = HISTORICAL_M0_BRIDGE_SOCKET.lstat()
+    except FileNotFoundError as error:
+        raise RuntimeError("historical M0 Bridge socket is unavailable") from error
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid():
+        raise RuntimeError("historical M0 Bridge socket is unsafe")
+    command = _pid_command(pid)
+    try:
+        argv = shlex.split(command)
+        if len(argv) != 1 or Path(argv[0]).name != "local-tool-bridge":
+            raise RuntimeError("historical M0 Bridge command is not canonical")
+        identity = _capture_process_identity(pid, expected_argv=argv)
+    except (OSError, ValueError, RuntimeError) as error:
+        raise RuntimeError("historical M0 Bridge PID or complete command is not verifiable")
+    return {
+        "pid": pid,
+        "command": command,
+        "socket": str(HISTORICAL_M0_BRIDGE_SOCKET),
+        "process_identity": identity,
+    }
+
+
+def _stop_verified_tunnel(item: dict[str, Any]) -> None:
+    pid = item.get("pid")
+    if not isinstance(pid, int) or not _pid_alive(pid):
+        raise RuntimeError("refusing to stop unavailable tunnel process")
+    if not _process_identity_matches(item.get("process_identity", {})):
+        raise RuntimeError("refusing to stop tunnel whose command changed after verification")
+    command = shlex.join(item["process_identity"]["argv"])
+    _parse_verified_tunnel_process(
+        pid,
+        command,
+        profile_dir=Path(str(item["profile_dir"])),
+        profile_name=str(item["profile_name"]),
+        expected_socket=Path(str(item["expected_socket"])),
+    ) if "expected_socket" in item else None
+    # Always re-read the exact profile immediately before signaling.  Process
+    # identity alone does not fence a concurrent profile replacement.
+    expected_socket = Path(str(item.get("expected_socket") or (
+        HISTORICAL_M0_BRIDGE_SOCKET
+        if item.get("profile_name") in HISTORICAL_TUNNEL_PROFILE_NAMES
+        else PRODUCTION_BRIDGE_SOCKET
+    )))
+    profile = _validate_tunnel_profile(
+        Path(str(item["profile_path"])),
+        profile_name=str(item["profile_name"]),
+        expected_socket=expected_socket,
+    )
+    if profile["profile_sha256"] != item.get("profile_sha256"):
+        raise RuntimeError("refusing to stop tunnel whose profile hash changed after verification")
+    if profile["tunnel_id"] != item.get("tunnel_id"):
+        raise RuntimeError("refusing to stop tunnel whose tunnel id changed after verification")
+    _stop_verified_process_identity(item["process_identity"])
+
+
+def _restart_verified_historical_tunnel(item: dict[str, Any]) -> dict[str, Any]:
+    command = item.get("command")
+    if not isinstance(command, str):
+        raise RuntimeError("cannot roll back historical M0 tunnel without its verified command")
+    argv = shlex.split(command)
+    if len(argv) != 6:
+        raise RuntimeError("cannot roll back historical M0 tunnel with a non-canonical command")
+    profile = _validate_tunnel_profile(
+        Path(str(item["profile_path"])),
+        profile_name=str(item["profile_name"]),
+        expected_socket=HISTORICAL_M0_BRIDGE_SOCKET,
+    )
+    if profile["profile_sha256"] != item.get("profile_sha256"):
+        raise RuntimeError("cannot roll back historical M0 tunnel because its profile hash changed")
+    if profile["tunnel_id"] != item.get("tunnel_id"):
+        raise RuntimeError("cannot roll back historical M0 tunnel because its tunnel id changed")
+    if _discover_tunnels_by_id(
+        profile["tunnel_id"], expected_socket=HISTORICAL_M0_BRIDGE_SOCKET
+    ):
+        raise RuntimeError("cannot roll back historical M0 tunnel while the same tunnel id is already active")
+    process = _spawn_tunnel(argv, Path(str(item["profile_dir"])), "historical-m0-tunnel")
+    return _wait_for_tunnel(
+        process,
+        profile_dir=Path(str(item["profile_dir"])),
+        profile_name=str(item["profile_name"]),
+        expected_socket=HISTORICAL_M0_BRIDGE_SOCKET,
+    )
+
+
+def _find_tunnel_client(explicit: Path | None = None) -> Path:
+    raw_explicit = explicit or os.environ.get("LAB_PRODUCTION_TUNNEL_CLIENT")
+    if raw_explicit:
+        candidate = Path(raw_explicit).expanduser()
+        if candidate.is_file() and not candidate.is_symlink() and os.access(candidate, os.X_OK):
+            return candidate.resolve(strict=True)
+        raise RuntimeError("LAB_PRODUCTION_TUNNEL_CLIENT is not a regular file")
+    candidates = [
+        Path(value)
+        for value in glob.glob(str(Path.home() / ".local" / "share" / "aibridge-tunnel" / "*" / "tunnel-client"))
+    ]
+    candidates = [path for path in candidates if path.is_file() and not path.is_symlink()]
+    if not candidates:
+        raise RuntimeError("OpenAI tunnel-client is unavailable; set LAB_PRODUCTION_TUNNEL_CLIENT")
+    if len(candidates) != 1:
+        raise RuntimeError("multiple tunnel-client candidates are ambiguous; pass an explicit --tunnel-client")
+    return candidates[0].resolve(strict=True)
+
+
+def _spawn_tunnel(command: list[str], profile_dir: Path, log_name: str) -> subprocess.Popen[Any]:
+    log_dir = Path(profile_dir) / "logs"
+    _private_dir(log_dir)
+    return _spawn_logged(
+        command,
+        log_dir / f"{log_name}.out",
+        log_dir / f"{log_name}.err",
+        cwd=CANONICAL_PROJECT_ROOT,
+        env={"HOME": str(Path.home()), "PATH": os.environ.get("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")},
+    )
+
+
+def _wait_for_tunnel(
+    process: subprocess.Popen[Any],
+    *,
+    profile_dir: Path,
+    profile_name: str,
+    expected_socket: Path,
+) -> dict[str, Any]:
+    for _ in range(50):
+        if process.poll() is not None:
+            raise RuntimeError("tunnel-client exited during startup")
+        found = _discover_tunnel_processes(
+            profile_dir=profile_dir,
+            profile_name=profile_name,
+            expected_socket=expected_socket,
+        )
+        matching = [item for item in found if item["pid"] == process.pid]
+        if len(found) == 1 and len(matching) == 1:
+            return matching[0]
+        time.sleep(0.1)
+    raise RuntimeError("tunnel-client did not become uniquely observable with its exact profile")
+
+
+def _snapshot_runtime_state(path: Path) -> tuple[bytes, int] | None:
+    if not path.exists():
+        return None
+    _validate_private_source(path, "production runtime state")
+    return path.read_bytes(), stat.S_IMODE(path.stat().st_mode)
+
+
+def _restore_runtime_state(path: Path, snapshot: tuple[bytes, int] | None) -> None:
+    if snapshot is None:
+        if path.exists():
+            _validate_private_source(path, "failed production runtime state")
+            path.unlink()
+        return
+    try:
+        value = snapshot[0].decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RuntimeError("production runtime state snapshot is not UTF-8 JSON text") from error
+    _write_text_private(path, value, snapshot[1])
+
+
+def _start_production_tunnel(
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+    *,
+    tunnel_client: Path | None = None,
+) -> dict[str, Any]:
+    _validate_tunnel_profile(
+        layout["tunnel_profile"], profile_name=TUNNEL_PROFILE_NAME, expected_socket=layout["bridge_socket"]
+    )
+    resolved_client = _find_tunnel_client(tunnel_client)
+    command = [
+        str(resolved_client),
+        "run",
+        "--profile-dir",
+        str(layout["tunnel_dir"]),
+        "--profile",
+        TUNNEL_PROFILE_NAME,
+    ]
+    state_snapshot = _snapshot_runtime_state(layout["runtime_state"])
+    started_at = time.time()
+    process = _spawn_tunnel(
+        command,
+        layout["tunnel_dir"],
+        "production-tunnel",
+    )
+    identity: dict[str, Any] | None = None
+    try:
+        identity = _capture_process_identity(
+            process.pid,
+            expected_executable=resolved_client,
+            expected_argv=command,
+        )
+        item = _wait_for_tunnel(
+            process,
+            profile_dir=layout["tunnel_dir"],
+            profile_name=TUNNEL_PROFILE_NAME,
+            expected_socket=layout["bridge_socket"],
+        )
+        if item.get("process_identity") != identity:
+            raise RuntimeError("production tunnel identity changed during startup")
+        _record_production_tunnel(manifest, layout, item, started_at=started_at)
+        verified = production_tunnel_status(manifest, layout)
+        if verified.get("ready") is not True or verified.get("pid") != item["pid"]:
+            raise RuntimeError("production tunnel did not satisfy its post-start status fence")
+        return item
+    except Exception as error:
+        cleanup_errors: list[str] = []
+        try:
+            if identity is not None:
+                _stop_verified_process_identity(identity)
+            elif process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+        except Exception as stop_error:
+            cleanup_errors.append(f"spawned production tunnel stop failed: {stop_error}")
+        try:
+            _restore_runtime_state(layout["runtime_state"], state_snapshot)
+        except Exception as restore_error:
+            cleanup_errors.append(f"production tunnel state restore failed: {restore_error}")
+        if cleanup_errors:
+            raise RuntimeError(f"{error}; {'; '.join(cleanup_errors)}") from error
+        raise
+
+
+def _record_production_tunnel(
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+    item: dict[str, Any],
+    *,
+    started_at: float,
+) -> None:
+    state = _read_json_object(layout["runtime_state"])
+    if state.get("release_revision") != manifest["release_revision"] or state.get("endpoint_generation") != manifest["endpoint_generation"]:
+        raise RuntimeError("production local runtime state changed before tunnel activation")
+    state.update({
+        "tunnel_pid": item["pid"],
+        "tunnel_id": item["tunnel_id"],
+        "tunnel_profile_sha256": item["profile_sha256"],
+        "tunnel_profile_name": TUNNEL_PROFILE_NAME,
+        "tunnel_started_at": started_at,
+        "tunnel_process_identity": item["process_identity"],
+    })
+    _write_json_private(layout["runtime_state"], state)
+
+
+def _write_activation_rollback_receipt(
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+    *,
+    historical: dict[str, Any],
+    production: dict[str, Any],
+    historical_bridge: dict[str, Any],
+    historical_runtime_state: Path,
+) -> dict[str, Any]:
+    historical_state_path = Path(historical_runtime_state).expanduser().resolve()
+    _validate_private_source(historical_state_path, "historical M0 runtime state")
+    receipt = {
+        "schema_version": 1,
+        "status": "armed",
+        "connector_id": CONNECTOR_ID,
+        "contract_version": CONTRACT_VERSION,
+        "release_revision": manifest["release_revision"],
+        "endpoint_generation": manifest["endpoint_generation"],
+        "tunnel_id": production["tunnel_id"],
+        "historical": historical,
+        "production": production,
+        "historical_bridge": historical_bridge,
+        "historical_runtime_state": str(historical_state_path),
+        "historical_runtime_state_sha256": _sha256_file(historical_state_path),
+        "created_at": time.time(),
+    }
+    _write_json_private(layout["rollback_receipt"], receipt)
+    receipt_sha256 = _sha256_file(layout["rollback_receipt"])
+    state = _read_json_object(layout["runtime_state"])
+    if (
+        state.get("tunnel_pid") != production.get("pid")
+        or state.get("tunnel_process_identity") != production.get("process_identity")
+    ):
+        raise RuntimeError("production runtime state changed before rollback receipt was armed")
+    state.update(
+        {
+            "activation_rollback_receipt": str(layout["rollback_receipt"].resolve()),
+            "activation_rollback_receipt_sha256": receipt_sha256,
+        }
+    )
+    _write_json_private(layout["runtime_state"], state)
+    return {"path": str(layout["rollback_receipt"].resolve()), "sha256": receipt_sha256}
+
+
+def _validate_receipt_tunnel_profile(
+    item: dict[str, Any], *, expected_socket: Path, label: str
+) -> dict[str, Any]:
+    required = {
+        "pid", "command", "profile_dir", "profile_name", "profile_path", "profile_sha256",
+        "tunnel_id", "process_identity", "expected_socket",
+    }
+    if not isinstance(item, dict) or not required.issubset(item):
+        raise RuntimeError(f"{label} receipt is incomplete")
+    identity = _validate_process_identity_record(item["process_identity"])
+    try:
+        command_argv = shlex.split(str(item["command"]))
+    except ValueError as error:
+        raise RuntimeError(f"{label} receipt command is malformed") from error
+    if identity["pid"] != item["pid"] or identity["argv"] != command_argv:
+        raise RuntimeError(f"{label} receipt process identity mismatch")
+    profile_dir = Path(str(item["profile_dir"])).expanduser().resolve()
+    profile_path = Path(str(item["profile_path"])).expanduser().resolve()
+    if profile_path != _tunnel_profile_path(profile_dir, str(item["profile_name"])).resolve():
+        raise RuntimeError(f"{label} receipt profile path mismatch")
+    if Path(str(item["expected_socket"])).expanduser().resolve() != expected_socket.expanduser().resolve():
+        raise RuntimeError(f"{label} receipt socket mismatch")
+    profile = _validate_tunnel_profile(
+        profile_path,
+        profile_name=str(item["profile_name"]),
+        expected_socket=expected_socket,
+    )
+    if profile["profile_sha256"] != item["profile_sha256"] or profile["tunnel_id"] != item["tunnel_id"]:
+        raise RuntimeError(f"{label} profile changed after activation")
+    return profile
+
+
+def _record_historical_tunnel_restart(
+    layout: dict[str, Path], historical_state_path: Path, restarted: dict[str, Any]
+) -> None:
+    historical_state = _read_json_object(historical_state_path)
+    historical_state.update(
+        {
+            "tunnel_pid": restarted["pid"],
+            "tunnel_id": restarted["tunnel_id"],
+            "tunnel_profile_name": restarted["profile_name"],
+            "tunnel_profile_sha256": restarted["profile_sha256"],
+            "tunnel_process_identity": restarted["process_identity"],
+        }
+    )
+    _write_json_private(historical_state_path, historical_state)
+    production_state = _read_json_object(layout["runtime_state"])
+    for key in (
+        "tunnel_pid", "tunnel_id", "tunnel_profile_sha256", "tunnel_started_at",
+        "tunnel_process_identity",
+    ):
+        production_state.pop(key, None)
+    production_state.update(
+        {
+            "rollback_completed_at": time.time(),
+            "rollback_historical_tunnel_pid": restarted["pid"],
+            "rollback_historical_tunnel_id": restarted["tunnel_id"],
+            "rollback_historical_tunnel_process_identity": restarted["process_identity"],
+        }
+    )
+    _write_json_private(layout["runtime_state"], production_state)
+
+
+def _resume_rollback_tunnel_switch(
+    historical: dict[str, Any],
+    production: dict[str, Any],
+    *,
+    bridge_socket: Path,
+) -> dict[str, Any]:
+    historical_running = _discover_tunnel_processes(
+        profile_dir=Path(str(historical["profile_dir"])),
+        profile_name=str(historical["profile_name"]),
+        expected_socket=HISTORICAL_M0_BRIDGE_SOCKET,
+    )
+    production_running = _process_identity_matches(production.get("process_identity", {}))
+    if production_running:
+        if historical_running:
+            raise RuntimeError("rollback cannot proceed while production and historical tunnels both run")
+        _require_exact_tunnel_id_owners(
+            production["tunnel_id"], {production["pid"]}, expected_socket=bridge_socket
+        )
+        _stop_verified_tunnel(production)
+        _require_exact_tunnel_id_owners(
+            production["tunnel_id"], set(), expected_socket=bridge_socket
+        )
+        return _restart_verified_historical_tunnel(historical)
+    if len(historical_running) > 1:
+        raise RuntimeError("rollback found multiple historical tunnel processes")
+    if len(historical_running) == 1:
+        restarted = historical_running[0]
+        if restarted.get("tunnel_id") != historical.get("tunnel_id"):
+            raise RuntimeError("restarted historical tunnel id does not match rollback intent")
+        _validate_receipt_tunnel_profile(
+            restarted,
+            expected_socket=HISTORICAL_M0_BRIDGE_SOCKET,
+            label="restarted historical tunnel",
+        )
+        if not _process_identity_matches(restarted.get("process_identity", {})):
+            raise RuntimeError("restarted historical tunnel identity cannot be verified")
+        _require_exact_tunnel_id_owners(
+            restarted["tunnel_id"], {restarted["pid"]}, expected_socket=HISTORICAL_M0_BRIDGE_SOCKET
+        )
+        return restarted
+    _require_exact_tunnel_id_owners(
+        historical["tunnel_id"], set(), expected_socket=HISTORICAL_M0_BRIDGE_SOCKET
+    )
+    return _restart_verified_historical_tunnel(historical)
+
+
+def rollback_production_activation(
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+    *,
+    receipt_path: Path | None = None,
+) -> dict[str, Any]:
+    """Restore the exact pre-activation M0 tunnel from the canonical receipt."""
+    _validate_rollback_release(manifest, layout)
+    canonical_receipt = layout["rollback_receipt"].expanduser().resolve()
+    requested_receipt = Path(receipt_path or canonical_receipt).expanduser().resolve()
+    if requested_receipt != canonical_receipt:
+        raise RuntimeError("rollback receipt must be the canonical production receipt")
+    _validate_private_source(canonical_receipt, "production activation rollback receipt")
+    receipt = _read_json_object(canonical_receipt)
+    state = _read_json_object(layout["runtime_state"])
+    current_receipt_sha256 = _sha256_file(canonical_receipt)
+    pinned_receipt_sha256 = state.get("activation_rollback_receipt_sha256")
+    valid_pins = {current_receipt_sha256}
+    if receipt.get("status") == "rolling_back":
+        valid_pins.update(
+            value
+            for value in (
+                receipt.get("armed_receipt_sha256"),
+                receipt.get("completed_receipt_sha256"),
+            )
+            if isinstance(value, str)
+        )
+    if (
+        state.get("activation_rollback_receipt") != str(canonical_receipt)
+        or pinned_receipt_sha256 not in valid_pins
+    ):
+        raise RuntimeError("rollback receipt is not pinned by production runtime state")
+    if any(
+        receipt.get(key) != expected
+        for key, expected in (
+            ("schema_version", 1),
+            ("connector_id", CONNECTOR_ID),
+            ("contract_version", CONTRACT_VERSION),
+            ("release_revision", manifest["release_revision"]),
+            ("endpoint_generation", manifest["endpoint_generation"]),
+        )
+    ):
+        raise RuntimeError("rollback receipt does not match the requested production release")
+
+    historical = receipt.get("historical")
+    production = receipt.get("production")
+    if not isinstance(historical, dict) or not isinstance(production, dict):
+        raise RuntimeError("rollback receipt has no exact tunnel identities")
+    tunnel_id = receipt.get("tunnel_id")
+    if tunnel_id != historical.get("tunnel_id") or tunnel_id != production.get("tunnel_id"):
+        raise RuntimeError("rollback receipt tunnel id mismatch")
+    historical_state_path = Path(str(receipt.get("historical_runtime_state") or "")).expanduser()
+    if not historical_state_path.is_absolute():
+        raise RuntimeError("rollback receipt historical runtime state path is invalid")
+    historical_state_path = historical_state_path.resolve()
+
+    if receipt.get("status") == "rolled_back":
+        restarted = receipt.get("historical_restarted")
+        if not isinstance(restarted, dict) or not _process_identity_matches(restarted.get("process_identity", {})):
+            raise RuntimeError("completed rollback receipt no longer identifies the historical tunnel")
+        _validate_receipt_tunnel_profile(
+            restarted, expected_socket=HISTORICAL_M0_BRIDGE_SOCKET, label="restarted historical tunnel"
+        )
+        _require_exact_tunnel_id_owners(
+            str(tunnel_id), {int(restarted["pid"])}, expected_socket=HISTORICAL_M0_BRIDGE_SOCKET
+        )
+        historical_state = _read_json_object(historical_state_path)
+        if (
+            historical_state.get("tunnel_pid") != restarted.get("pid")
+            or historical_state.get("tunnel_process_identity") != restarted.get("process_identity")
+        ):
+            raise RuntimeError("completed rollback is not reflected in historical runtime state")
+        return {
+            "rolled_back": True,
+            "already_rolled_back": True,
+            "historical_tunnel_pid": restarted["pid"],
+            "production_tunnel_stopped": True,
+        }
+    if receipt.get("status") not in {"armed", "rolling_back"}:
+        raise RuntimeError("rollback receipt is neither armed nor recoverable")
+
+    _validate_private_source(historical_state_path, "historical M0 runtime state")
+    _validate_private_source(layout["runtime_state"], "production runtime state for rollback")
+    bridge = receipt.get("historical_bridge")
+    if not isinstance(bridge, dict) or not _process_identity_matches(bridge.get("process_identity", {})):
+        raise RuntimeError("historical M0 Bridge identity changed after activation")
+    _validate_receipt_tunnel_profile(
+        historical, expected_socket=HISTORICAL_M0_BRIDGE_SOCKET, label="historical tunnel"
+    )
+    _validate_receipt_tunnel_profile(
+        production, expected_socket=layout["bridge_socket"], label="production tunnel"
+    )
+    if receipt.get("status") == "armed":
+        if _sha256_file(historical_state_path) != receipt.get("historical_runtime_state_sha256"):
+            raise RuntimeError("historical M0 runtime state changed after activation")
+        receipt.update(
+            {
+                "status": "rolling_back",
+                "phase": "intent",
+                "armed_receipt_sha256": current_receipt_sha256,
+                "historical_runtime_state_before_sha256": _sha256_file(historical_state_path),
+                "production_runtime_state_before_sha256": _sha256_file(layout["runtime_state"]),
+                "rollback_started_at": time.time(),
+            }
+        )
+        _write_json_private(canonical_receipt, receipt)
+    else:
+        if receipt.get("phase") not in {"intent", "switched", "historical_written"}:
+            raise RuntimeError("rollback receipt journal phase is invalid")
+        for hash_key in (
+            "armed_receipt_sha256",
+            "historical_runtime_state_before_sha256",
+            "production_runtime_state_before_sha256",
+        ):
+            value = receipt.get(hash_key)
+            if not isinstance(value, str) or len(value) != 64:
+                raise RuntimeError("rollback receipt journal is missing an expected before hash")
+
+    if receipt["phase"] == "intent":
+        restarted = _resume_rollback_tunnel_switch(
+            historical, production, bridge_socket=layout["bridge_socket"]
+        )
+        _validate_receipt_tunnel_profile(
+            restarted, expected_socket=HISTORICAL_M0_BRIDGE_SOCKET, label="restarted historical tunnel"
+        )
+        _require_exact_tunnel_id_owners(
+            str(tunnel_id), {int(restarted["pid"])}, expected_socket=HISTORICAL_M0_BRIDGE_SOCKET
+        )
+        receipt.update({"phase": "switched", "historical_restarted": restarted})
+        _write_json_private(canonical_receipt, receipt)
+    else:
+        restarted = receipt.get("historical_restarted")
+        if not isinstance(restarted, dict):
+            raise RuntimeError("rollback receipt journal lost the restarted historical identity")
+        _validate_receipt_tunnel_profile(
+            restarted, expected_socket=HISTORICAL_M0_BRIDGE_SOCKET, label="restarted historical tunnel"
+        )
+        if not _process_identity_matches(restarted.get("process_identity", {})):
+            raise RuntimeError("rollback journal historical tunnel identity changed")
+        _require_exact_tunnel_id_owners(
+            str(tunnel_id), {int(restarted["pid"])}, expected_socket=HISTORICAL_M0_BRIDGE_SOCKET
+        )
+
+    historical_state = _read_json_object(historical_state_path)
+    historical_is_updated = bool(
+        historical_state.get("tunnel_pid") == restarted.get("pid")
+        and historical_state.get("tunnel_process_identity") == restarted.get("process_identity")
+        and historical_state.get("tunnel_id") == restarted.get("tunnel_id")
+    )
+    if not historical_is_updated:
+        if _sha256_file(historical_state_path) != receipt["historical_runtime_state_before_sha256"]:
+            raise RuntimeError("historical runtime state is neither before nor journaled rollback state")
+        historical_state.update(
+            {
+                "tunnel_pid": restarted["pid"],
+                "tunnel_id": restarted["tunnel_id"],
+                "tunnel_profile_name": restarted["profile_name"],
+                "tunnel_profile_sha256": restarted["profile_sha256"],
+                "tunnel_process_identity": restarted["process_identity"],
+            }
+        )
+        _write_json_private(historical_state_path, historical_state)
+    if receipt["phase"] != "historical_written":
+        receipt["phase"] = "historical_written"
+        _write_json_private(canonical_receipt, receipt)
+
+    rolled_back_at = receipt.get("rolled_back_at")
+    if not isinstance(rolled_back_at, (int, float)) or isinstance(rolled_back_at, bool):
+        rolled_back_at = time.time()
+        receipt["rolled_back_at"] = rolled_back_at
+    completed_receipt = dict(receipt)
+    completed_receipt.update({"status": "rolled_back", "phase": "completed"})
+    completed_receipt.pop("completed_receipt_sha256", None)
+    completed_receipt_sha256 = _json_private_sha256(completed_receipt)
+    if receipt.get("completed_receipt_sha256") != completed_receipt_sha256:
+        receipt["completed_receipt_sha256"] = completed_receipt_sha256
+        _write_json_private(canonical_receipt, receipt)
+
+    state = _read_json_object(layout["runtime_state"])
+    production_is_updated = bool(
+        state.get("rollback_historical_tunnel_pid") == restarted.get("pid")
+        and state.get("rollback_historical_tunnel_process_identity") == restarted.get("process_identity")
+        and state.get("activation_rollback_receipt_sha256") == completed_receipt_sha256
+        and "tunnel_pid" not in state
+    )
+    if not production_is_updated:
+        if _sha256_file(layout["runtime_state"]) != receipt["production_runtime_state_before_sha256"]:
+            raise RuntimeError("production runtime state is neither before nor journaled rollback state")
+        for key in (
+            "tunnel_pid", "tunnel_id", "tunnel_profile_sha256", "tunnel_started_at",
+            "tunnel_process_identity",
+        ):
+            state.pop(key, None)
+        state.update(
+            {
+                "rollback_completed_at": rolled_back_at,
+                "rollback_historical_tunnel_pid": restarted["pid"],
+                "rollback_historical_tunnel_id": restarted["tunnel_id"],
+                "rollback_historical_tunnel_process_identity": restarted["process_identity"],
+                "activation_rollback_receipt_sha256": completed_receipt_sha256,
+            }
+        )
+        _write_json_private(layout["runtime_state"], state)
+    _write_json_private(canonical_receipt, completed_receipt)
+    return {
+        "rolled_back": True,
+        "already_rolled_back": False,
+        "historical_tunnel_pid": restarted["pid"],
+        "production_tunnel_stopped": True,
+    }
+
+
+def activate_production_tunnel(
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+    *,
+    historical_profile_dir: Path,
+    historical_profile_name: str,
+    historical_runtime_state: Path = HISTORICAL_M0_RUNTIME_STATE,
+    home_dir: Path = Path.home(),
+    native_user_data_dirs: Iterable[Path] = (),
+    tunnel_client: Path | None = None,
+    fallback_health_url_file: Path = AI_BRIDGE_FALLBACK_HEALTH_URL_FILE,
+) -> dict[str, Any]:
+    """Cut over only the verified M0 tunnel while preserving its Bridge."""
+    validate_installed_release(layout)
+    if production_status(manifest, layout).get("local_runtime_ready") is not True:
+        raise RuntimeError("production local runtime is not ready; tunnel activation is fail-closed")
+    verify_caller_conversation_id_rejected(layout)
+    validate_native_messaging_manifests(
+        layout,
+        manifest,
+        home_dir=home_dir,
+        native_user_data_dirs=native_user_data_dirs,
+    )
+    fallback_before = _verify_ai_bridge_fallback(fallback_health_url_file)
+    historical = find_verified_historical_m0_tunnel(
+        historical_profile_dir, profile_name=historical_profile_name
+    )
+    old_bridge = verified_historical_m0_bridge(historical_runtime_state)
+    production_profile = _validate_tunnel_profile(
+        layout["tunnel_profile"], profile_name=TUNNEL_PROFILE_NAME, expected_socket=layout["bridge_socket"]
+    )
+    if historical["tunnel_id"] != production_profile["tunnel_id"]:
+        raise RuntimeError("historical M0 tunnel and production tunnel do not address the same private connector")
+
+    _require_exact_tunnel_id_owners(
+        historical["tunnel_id"], {historical["pid"]}, expected_socket=HISTORICAL_M0_BRIDGE_SOCKET
+    )
+    historical_stopped = False
+    production: dict[str, Any] | None = None
+    try:
+        _stop_verified_tunnel(historical)
+        historical_stopped = True
+        _require_exact_tunnel_id_owners(
+            historical["tunnel_id"], set(), expected_socket=HISTORICAL_M0_BRIDGE_SOCKET
+        )
+        production = _start_production_tunnel(
+            manifest, layout, tunnel_client=tunnel_client
+        )
+        _require_exact_tunnel_id_owners(
+            production["tunnel_id"], {production["pid"]}, expected_socket=layout["bridge_socket"]
+        )
+        fallback_after = _verify_ai_bridge_fallback(fallback_health_url_file)
+        for key in ("health_url", "compute_url", "compute_host", "compute_port", "tools"):
+            if fallback_after.get(key) != fallback_before.get(key):
+                raise RuntimeError("AI-Bridge fallback identity changed during production activation")
+        rollback_receipt = _write_activation_rollback_receipt(
+            manifest,
+            layout,
+            historical=historical,
+            production=production,
+            historical_bridge=old_bridge,
+            historical_runtime_state=historical_runtime_state,
+        )
+    except Exception as error:
+        rollback_errors: list[str] = []
+        if production is not None:
+            try:
+                _stop_verified_tunnel(production)
+            except Exception as stop_error:
+                rollback_errors.append(f"production stop failed: {stop_error}")
+        if historical_stopped:
+            try:
+                restarted = _restart_verified_historical_tunnel(historical)
+                _require_exact_tunnel_id_owners(
+                    restarted["tunnel_id"],
+                    {restarted["pid"]},
+                    expected_socket=HISTORICAL_M0_BRIDGE_SOCKET,
+                )
+                _record_historical_tunnel_restart(
+                    layout, Path(historical_runtime_state).expanduser().resolve(), restarted
+                )
+            except Exception as rollback_error:
+                rollback_errors.append(f"historical tunnel rollback failed: {rollback_error}")
+        if rollback_errors:
+            raise RuntimeError(f"{error}; {'; '.join(rollback_errors)}") from error
+        raise
+    return {
+        "activated": True,
+        "release_revision": manifest["release_revision"],
+        "endpoint_generation": manifest["endpoint_generation"],
+        "production_tunnel_pid": production["pid"],
+        "historical_tunnel_pid": historical["pid"],
+        "historical_bridge_pid": old_bridge["pid"],
+        "historical_bridge_preserved": True,
+        "personal_chat_live_e2e_required_before_historical_bridge_finalize": True,
+        "ai_bridge_fallback": fallback_after,
+        "rollback_receipt": rollback_receipt,
+    }
+
+
+def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict[str, Any]:
+    _validate_manifest_contract(manifest)
+    try:
+        installed = validate_installed_release(layout)
+        release_installed = True
+        release_error = None
+    except Exception as error:
+        installed = None
+        release_installed = False
+        release_error = str(error)
+    state = _read_json_object(layout["runtime_state"])
+    state_matches = bool(
+        state.get("release_revision") == manifest["release_revision"]
+        and state.get("endpoint_generation") == manifest["endpoint_generation"]
+        and state.get("workspace") == manifest["workspace"]
+        and state.get("tunnel_profile_name") == TUNNEL_PROFILE_NAME
+    )
+    catdesk_pid = state.get("catdesk_supervisor_pid") if state_matches else None
+    host_pid = state.get("host_pid") if state_matches else None
+    bridge_pid = state.get("bridge_pid") if state_matches else None
+    node = ((installed or {}).get("runtime_dependencies") or {}).get("node", {}).get("path")
+    catdesk_identity = state.get("catdesk_supervisor_process_identity") if state_matches else None
+    host_identity = state.get("host_process_identity") if state_matches else None
+    bridge_identity = state.get("bridge_process_identity") if state_matches else None
+    catdesk_process = bool(
+        isinstance(catdesk_pid, int)
+        and isinstance(catdesk_identity, dict)
+        and catdesk_identity.get("pid") == catdesk_pid
+        and _process_identity_matches(catdesk_identity)
+    )
+    host_process = bool(
+        node
+        and isinstance(host_pid, int)
+        and isinstance(host_identity, dict)
+        and host_identity.get("pid") == host_pid
+        and _process_identity_matches(host_identity)
+    )
+    bridge_process = bool(
+        isinstance(bridge_pid, int)
+        and isinstance(bridge_identity, dict)
+        and bridge_identity.get("pid") == bridge_pid
+        and _process_identity_matches(bridge_identity)
+    )
+    backend_ready = bool(catdesk_process and _tcp_ready("127.0.0.1", PRODUCTION_CATDESK_PORT))
+    host_ready = bool(host_process and _tcp_ready("127.0.0.1", PRODUCTION_HOST_MCP_PORT))
+    tools: list[str] = []
+    bridge_ready = False
+    if bridge_process and layout["bridge_socket"].exists():
+        try:
+            tools = smoke_tools(layout)
+            bridge_ready = True
+        except Exception:
+            pass
+    local_ready = bool(release_installed and state_matches and backend_ready and host_ready and bridge_ready)
+    tunnel = production_tunnel_status(manifest, layout)
+    return {
+        "connector_id": CONNECTOR_ID,
+        "contract_version": CONTRACT_VERSION,
+        "release_revision": manifest["release_revision"],
+        "endpoint_generation": manifest["endpoint_generation"],
+        "workspace": manifest["workspace"],
+        "runtime_root": str(layout["runtime_root"]),
+        "bridge_socket": str(layout["bridge_socket"]),
+        "tunnel_profile_name": TUNNEL_PROFILE_NAME,
+        "release_installed": release_installed,
+        "release_error": release_error,
+        "runtime_state_matches": state_matches,
+        "backend_ready": backend_ready,
+        "host_ready": host_ready,
+        "bridge_ready": bridge_ready,
+        "local_runtime_ready": local_ready,
+        "catdesk_supervisor_pid": catdesk_pid,
+        "host_pid": host_pid,
+        "bridge_pid": bridge_pid,
+        "tools": tools,
+        "manifest_has_artifacts": bool(installed and installed.get("artifacts_sha256")),
+        "tunnel_ready": tunnel.get("ready") is True,
+        "tunnel_pid": tunnel.get("pid"),
+        "tunnel_id": tunnel.get("tunnel_id"),
+        "tunnel_state_reason": tunnel.get("reason"),
+    }
+
+
+def _preserved_activation_state(
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+    prior: dict[str, Any],
+    *,
+    tunnel_ready: bool = False,
+) -> dict[str, Any]:
+    receipt_path_value = prior.get("activation_rollback_receipt")
+    receipt_hash = prior.get("activation_rollback_receipt_sha256")
+    if receipt_path_value is None and receipt_hash is None:
+        return {
+            key: value for key, value in prior.items() if key.startswith("tunnel_")
+        } if tunnel_ready else {}
+    if not isinstance(receipt_path_value, str) or not isinstance(receipt_hash, str):
+        raise RuntimeError("armed rollback receipt pin is incomplete")
+    canonical_receipt = layout["rollback_receipt"].expanduser().resolve()
+    if Path(receipt_path_value).expanduser().resolve() != canonical_receipt:
+        raise RuntimeError("armed rollback receipt path is not canonical")
+    _validate_private_source(canonical_receipt, "armed rollback receipt")
+    if _sha256_file(canonical_receipt) != receipt_hash:
+        raise RuntimeError("armed rollback receipt hash does not match its runtime pin")
+    receipt = _read_json_object(canonical_receipt)
+    if any(
+        receipt.get(key) != expected
+        for key, expected in (
+            ("schema_version", 1),
+            ("status", "armed"),
+            ("connector_id", CONNECTOR_ID),
+            ("contract_version", CONTRACT_VERSION),
+            ("release_revision", manifest["release_revision"]),
+            ("endpoint_generation", manifest["endpoint_generation"]),
+        )
+    ):
+        raise RuntimeError("armed rollback receipt does not match the production runtime")
+    production = receipt.get("production")
+    if not isinstance(production, dict) or receipt.get("tunnel_id") != production.get("tunnel_id"):
+        raise RuntimeError("armed rollback receipt production tunnel is incomplete")
+    _validate_receipt_tunnel_profile(
+        production, expected_socket=layout["bridge_socket"], label="armed production tunnel"
+    )
+    for state_key, item_key in (
+        ("tunnel_pid", "pid"),
+        ("tunnel_id", "tunnel_id"),
+        ("tunnel_profile_sha256", "profile_sha256"),
+        ("tunnel_process_identity", "process_identity"),
+    ):
+        if prior.get(state_key) != production.get(item_key):
+            raise RuntimeError("armed rollback receipt does not match production tunnel state")
+    if not _process_identity_matches(production["process_identity"]):
+        raise RuntimeError("armed production tunnel identity is no longer running")
+    _require_exact_tunnel_id_owners(
+        production["tunnel_id"], {production["pid"]}, expected_socket=layout["bridge_socket"]
+    )
+    return {
+        **{key: value for key, value in prior.items() if key.startswith("tunnel_")},
+        "activation_rollback_receipt": receipt_path_value,
+        "activation_rollback_receipt_sha256": receipt_hash,
+    }
+
+
+def start_local_runtime(manifest: dict[str, Any], layout: dict[str, Path]) -> dict[str, Any]:
+    validate_installed_release(layout)
+    current = production_status(manifest, layout)
+    if current["local_runtime_ready"]:
+        return current
+    prior = _read_json_object(layout["runtime_state"])
+    preserved_activation_state = _preserved_activation_state(
+        manifest,
+        layout,
+        prior,
+        tunnel_ready=current.get("tunnel_ready") is True,
+    )
+    if prior:
+        _stop_verified_local_runtime(prior, layout)
+    if _tcp_ready("127.0.0.1", PRODUCTION_CATDESK_PORT):
+        raise RuntimeError("production CatDesk port is occupied by an unverified process")
+    if _tcp_ready("127.0.0.1", PRODUCTION_HOST_MCP_PORT):
+        raise RuntimeError("production Host MCP port is occupied by an unverified process")
+    if layout["bridge_socket"].exists():
+        raise RuntimeError("production Bridge socket exists without a verified runtime owner")
+
+    _private_dir(layout["logs_dir"])
+    _private_dir(layout["bridge_state_dir"])
+    slug = _catdesk_slug(layout["catdesk_config"])
+    component_env = production_component_env(manifest, layout, catdesk_slug=slug)
+    base_env = {
+        "HOME": str(Path.home()),
+        "PATH": os.environ.get("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"),
+    }
+    started: list[tuple[subprocess.Popen[Any], dict[str, Any] | None, bool]] = []
+    try:
+        python = Path(sys.executable).resolve(strict=True)
+        catdesk_command = [str(python), str(layout["catdesk_runner"])]
+        catdesk = _spawn_logged(
+            catdesk_command,
+            layout["logs_dir"] / "catdesk-supervisor.out",
+            layout["logs_dir"] / "catdesk-supervisor.err",
+            cwd=layout["release_dir"],
+            env=base_env,
+        )
+        started.append((catdesk, None, True))
+        catdesk_identity = _capture_process_identity(
+            catdesk.pid, expected_executable=python, expected_argv=catdesk_command
+        )
+        started[-1] = (catdesk, catdesk_identity, True)
+        _wait_for_tcp(catdesk, PRODUCTION_CATDESK_PORT, "production CatDesk")
+
+        node = Path(_validate_runtime_dependencies(manifest)["node"]["path"])
+        host_command = [str(node), str(layout["host_mcp_adapter"])]
+        host = _spawn_logged(
+            host_command,
+            layout["logs_dir"] / "host.out",
+            layout["logs_dir"] / "host.err",
+            cwd=layout["host_dir"],
+            env={**base_env, **component_env["host"]},
+        )
+        started.append((host, None, False))
+        host_identity = _capture_process_identity(
+            host.pid, expected_executable=node, expected_argv=host_command
+        )
+        started[-1] = (host, host_identity, False)
+        _wait_for_tcp(host, PRODUCTION_HOST_MCP_PORT, "production Host MCP")
+
+        session_id = f"bridge-session-production-{uuid.uuid4()}"
+        capability_id = f"bridge-cap-production-{uuid.uuid4()}"
+        bridge_env = {
+            **base_env,
+            **component_env["bridge"],
+            "LAB_BRIDGE_EXECUTION_SESSION_ID": session_id,
+            "LAB_BRIDGE_CAPABILITY_ID": capability_id,
+            "LAB_BRIDGE_CAPABILITY_TTL_MS": "86400000",
+        }
+        bridge_binary = layout["bridge_binary"].resolve(strict=True)
+        bridge_command = [str(bridge_binary)]
+        bridge = _spawn_logged(
+            bridge_command,
+            layout["logs_dir"] / "bridge.out",
+            layout["logs_dir"] / "bridge.err",
+            cwd=Path(manifest["workspace"]),
+            env=bridge_env,
+        )
+        started.append((bridge, None, False))
+        bridge_identity = _capture_process_identity(
+            bridge.pid, expected_executable=bridge_binary, expected_argv=bridge_command
+        )
+        started[-1] = (bridge, bridge_identity, False)
+        tools = _wait_for_bridge(bridge, layout)
+
+        state = {
+            "schema_version": 1,
+            "connector_id": CONNECTOR_ID,
+            "contract_version": CONTRACT_VERSION,
+            "release_revision": manifest["release_revision"],
+            "endpoint_generation": manifest["endpoint_generation"],
+            "workspace": manifest["workspace"],
+            "tunnel_profile_name": TUNNEL_PROFILE_NAME,
+            "release_manifest": str(layout["release_manifest"]),
+            "catdesk_supervisor_pid": catdesk.pid,
+            "host_pid": host.pid,
+            "bridge_pid": bridge.pid,
+            "catdesk_supervisor_process_identity": catdesk_identity,
+            "host_process_identity": host_identity,
+            "bridge_process_identity": bridge_identity,
+            "bridge_execution_session_id": session_id,
+            "bridge_capability_id": capability_id,
+            "tools": tools,
+            **preserved_activation_state,
+        }
+        _write_json_private(layout["runtime_state"], state)
+        result = production_status(manifest, layout)
+        if not result["local_runtime_ready"]:
+            raise RuntimeError("production local runtime did not satisfy its post-start status contract")
+        return result
+    except Exception:
+        for process, identity, process_group in reversed(started):
+            try:
+                if identity is not None:
+                    _stop_verified_process_identity(identity, process_group=process_group)
+                elif process.poll() is None:
+                    if process_group:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    else:
+                        process.terminate()
+                    process.wait(timeout=5)
+            except Exception:
+                pass
+        try:
+            observed_state = _read_json_object(layout["runtime_state"])
+            if "state" in locals() and observed_state == state:
+                if preserved_activation_state:
+                    _write_json_private(
+                        layout["runtime_state"],
+                        {
+                            "schema_version": 1,
+                            "connector_id": CONNECTOR_ID,
+                            "contract_version": CONTRACT_VERSION,
+                            "release_revision": manifest["release_revision"],
+                            "endpoint_generation": manifest["endpoint_generation"],
+                            "workspace": manifest["workspace"],
+                            **preserved_activation_state,
+                        },
+                    )
+                else:
+                    layout["runtime_state"].unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
+def smoke_tools(layout: dict[str, Path]) -> list[str]:
+    status, response = _call_mcp(layout, "tools/list", {})
+    if status != 200 or "error" in response:
+        raise RuntimeError(f"production Bridge tools/list failed with HTTP {status}")
+    tools = ((response.get("result") or {}).get("tools") or [])
+    names = sorted(
+        tool.get("name") for tool in tools if isinstance(tool, dict) and isinstance(tool.get("name"), str)
+    )
+    validate_tool_surface(names)
+    return names
+
+
+def verify_caller_conversation_id_rejected(layout: dict[str, Path]) -> None:
+    status, response = _call_mcp(
+        layout,
+        "tools/call",
+        {
+            "name": "discover_current_entry",
+            "arguments": {
+                "target_generation": 1,
+                "ownership_generation": 1,
+                "conversation_id": "caller-supplied-must-be-rejected",
+            },
+        },
+        tool_name="discover_current_entry",
+    )
+    message = str(((response.get("error") or {}).get("message") or ""))
+    if status != 400 or "conversation_id" not in message:
+        raise RuntimeError("production Host did not reject caller-supplied conversation_id")
+
+
+def _call_mcp(
+    layout: dict[str, Path],
+    method: str,
+    params: dict[str, Any],
+    *,
+    tool_name: str = "",
+) -> tuple[int, dict[str, Any]]:
+    meta = {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {
+            "name": "local-agent-bridge-production-smoke",
+            "version": "1",
+        },
+    }
+    payload = {
+        "jsonrpc": "2.0",
+        "id": f"production-{uuid.uuid4().hex}",
+        "method": method,
+        "params": {**params, "_meta": meta},
+    }
+    command = [
+        "curl",
+        "--silent",
+        "--show-error",
+        "--unix-socket",
+        str(layout["bridge_socket"]),
+        "-H",
+        "content-type: application/json",
+        "-H",
+        f"mcp-method: {method}",
+        "-H",
+        "mcp-protocol-version: 2026-07-28",
+    ]
+    if tool_name:
+        command.extend(["-H", f"mcp-name: {tool_name}"])
+    command.extend(
+        [
+            "--data",
+            json.dumps(payload, separators=(",", ":")),
+            "--write-out",
+            "\n%{http_code}",
+            "http://localhost/mcp",
+        ]
+    )
+    completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=8)
+    if completed.returncode != 0:
+        raise RuntimeError(f"production Bridge MCP transport failed: {completed.stderr.strip()[:400]}")
+    body, separator, raw_status = completed.stdout.rpartition("\n")
+    if not separator or not raw_status.isdigit():
+        raise RuntimeError("production Bridge MCP response omitted HTTP status")
+    value = json.loads(body)
+    if not isinstance(value, dict):
+        raise RuntimeError("production Bridge MCP response must be a JSON object")
+    return int(raw_status), value
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _pid_command(pid: int) -> str:
+    if not _pid_alive(pid):
+        return ""
+    return shlex.join(_process_argv(pid))
+
+
+def _parse_macos_procargs2(raw: bytes) -> list[str]:
+    if len(raw) < struct.calcsize("=i"):
+        raise RuntimeError("macOS process argv is truncated before argc")
+    (argc,) = struct.unpack_from("=i", raw)
+    if argc <= 0 or argc > 4096:
+        raise RuntimeError("macOS process argv argc is invalid")
+    offset = struct.calcsize("=i")
+    executable_end = raw.find(b"\0", offset)
+    if executable_end <= offset:
+        raise RuntimeError("macOS process argv executable path is malformed or missing NUL")
+    offset = executable_end + 1
+    while offset < len(raw) and raw[offset] == 0:
+        offset += 1
+    argv: list[str] = []
+    for index in range(argc):
+        if offset >= len(raw):
+            raise RuntimeError("macOS process argv is truncated before declared argc")
+        end = raw.find(b"\0", offset)
+        if end < 0:
+            raise RuntimeError("macOS process argv entry is missing its NUL terminator")
+        value = os.fsdecode(raw[offset:end])
+        if index == 0 and not value:
+            raise RuntimeError("macOS process argv[0] is empty")
+        argv.append(value)
+        offset = end + 1
+    if len(argv) != argc:
+        raise RuntimeError("macOS process argv does not match declared argc")
+    return argv
+
+
+def _macos_process_argv(pid: int, *, libc: Any | None = None) -> list[str]:
+    library = libc if libc is not None else ctypes.CDLL(None, use_errno=True)
+    try:
+        sysctl_fn = library.sysctl
+    except AttributeError as error:
+        raise RuntimeError(f"cannot read process argv via macOS sysctl for PID {pid}") from error
+    try:
+        sysctl_fn.argtypes = [
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_uint,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        ]
+        sysctl_fn.restype = ctypes.c_int
+    except AttributeError:
+        # Test doubles and some ctypes wrappers do not expose signature slots.
+        pass
+    mib = (ctypes.c_int * 3)(1, 49, pid)
+    size = ctypes.c_size_t(0)
+    if sysctl_fn(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+        raise RuntimeError(f"cannot size process argv via macOS sysctl for PID {pid}")
+    if size.value < struct.calcsize("=i") + 2 or size.value > 16 * 1024 * 1024:
+        raise RuntimeError(f"macOS sysctl returned an invalid argv size for PID {pid}")
+    buffer = ctypes.create_string_buffer(size.value)
+    actual_size = ctypes.c_size_t(size.value)
+    if sysctl_fn(mib, 3, buffer, ctypes.byref(actual_size), None, 0) != 0:
+        raise RuntimeError(f"cannot read process argv via macOS sysctl for PID {pid}")
+    if actual_size.value > size.value:
+        raise RuntimeError(f"macOS sysctl process argv grew during capture for PID {pid}")
+    return _parse_macos_procargs2(bytes(buffer.raw[: actual_size.value]))
+
+
+def _process_argv(pid: int) -> list[str]:
+    if not isinstance(pid, int) or pid < 1:
+        raise RuntimeError("process argv PID is invalid")
+    if sys.platform == "darwin":
+        return _macos_process_argv(pid)
+    if sys.platform.startswith("linux"):
+        path = Path(f"/proc/{pid}/cmdline")
+        try:
+            raw = path.read_bytes()
+        except OSError as error:
+            raise RuntimeError(f"cannot read process argv for PID {pid}") from error
+        if not raw or not raw.endswith(b"\0"):
+            raise RuntimeError(f"process argv for PID {pid} is empty or missing final NUL")
+        values = raw[:-1].split(b"\0")
+        if not values or not values[0]:
+            raise RuntimeError(f"process argv[0] for PID {pid} is empty")
+        return [os.fsdecode(value) for value in values]
+    raise RuntimeError(f"cannot capture process argv for PID {pid} on this platform")
+
+
+PROCESS_IDENTITY_KEYS = frozenset(
+    {
+        "pid",
+        "uid",
+        "lstart",
+        "start_timestamp",
+        "pgid",
+        "exe_realpath",
+        "exe_inode",
+        "exe_sha256",
+        "argv",
+    }
+)
+
+
+def _validate_process_identity_record(identity: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(identity, dict) or not PROCESS_IDENTITY_KEYS.issubset(identity):
+        raise RuntimeError("process identity is missing required fields")
+    if not isinstance(identity["pid"], int) or identity["pid"] < 1:
+        raise RuntimeError("process identity PID is invalid")
+    if not isinstance(identity["uid"], int) or identity["uid"] < 0:
+        raise RuntimeError("process identity UID is invalid")
+    if not isinstance(identity["lstart"], str) or not identity["lstart"].strip():
+        raise RuntimeError("process identity lstart is invalid")
+    if not isinstance(identity["start_timestamp"], (int, float)) or isinstance(
+        identity["start_timestamp"], bool
+    ):
+        raise RuntimeError("process identity start timestamp is invalid")
+    if not isinstance(identity["pgid"], int) or identity["pgid"] < 1:
+        raise RuntimeError("process identity PGID is invalid")
+    path = identity["exe_realpath"]
+    if not isinstance(path, str) or not Path(path).is_absolute():
+        raise RuntimeError("process identity executable path is invalid")
+    if not isinstance(identity["exe_inode"], int) or identity["exe_inode"] < 1:
+        raise RuntimeError("process identity executable inode is invalid")
+    digest = identity["exe_sha256"]
+    if not isinstance(digest, str) or len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise RuntimeError("process identity executable hash is invalid")
+    argv = identity["argv"]
+    if not isinstance(argv, list) or not argv or any(not isinstance(value, str) for value in argv):
+        raise RuntimeError("process identity complete argv is invalid")
+    return identity
+
+
+def _ps_process_field(pid: int, field: str) -> str:
+    completed = subprocess.run(
+        ["ps", "-ww", "-p", str(pid), "-o", f"{field}="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    value = completed.stdout.strip()
+    if completed.returncode != 0 or not value or "\n" in value:
+        raise RuntimeError(f"cannot capture process identity field {field} for PID {pid}")
+    return value
+
+
+def _process_executable_realpath(pid: int) -> Path:
+    proc_exe = Path(f"/proc/{pid}/exe")
+    if proc_exe.exists():
+        try:
+            return proc_exe.resolve(strict=True)
+        except OSError as error:
+            raise RuntimeError(f"cannot capture process executable for PID {pid}") from error
+    if sys.platform == "darwin":
+        try:
+            library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            proc_pidpath = library.proc_pidpath
+            proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+            proc_pidpath.restype = ctypes.c_int
+            buffer = ctypes.create_string_buffer(4096)
+            length = proc_pidpath(pid, buffer, len(buffer))
+            if length <= 0:
+                raise OSError(ctypes.get_errno(), "proc_pidpath failed")
+            return Path(os.fsdecode(buffer.value)).resolve(strict=True)
+        except (AttributeError, OSError) as error:
+            raise RuntimeError(f"cannot capture process executable for PID {pid}") from error
+    raise RuntimeError(f"cannot capture process executable for PID {pid} on this platform")
+
+
+def _capture_process_identity(
+    pid: int,
+    *,
+    expected_executable: Path | None = None,
+    expected_argv: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    if not _pid_alive(pid):
+        raise RuntimeError(f"cannot capture identity for unavailable process {pid}")
+    try:
+        uid = int(_ps_process_field(pid, "uid"))
+        pgid = int(_ps_process_field(pid, "pgid"))
+    except ValueError as error:
+        raise RuntimeError(f"cannot capture numeric process identity for PID {pid}") from error
+    lstart = _ps_process_field(pid, "lstart")
+    try:
+        start_timestamp = time.mktime(time.strptime(lstart, "%a %b %d %H:%M:%S %Y"))
+    except ValueError as error:
+        raise RuntimeError(f"cannot parse process lstart for PID {pid}") from error
+    argv = _process_argv(pid)
+    executable = _process_executable_realpath(pid)
+    try:
+        executable_info = executable.stat()
+    except OSError as error:
+        raise RuntimeError(f"cannot stat process executable for PID {pid}") from error
+    if uid != os.geteuid() or os.getpgid(pid) != pgid:
+        raise RuntimeError(f"process identity owner or PGID mismatch for PID {pid}")
+    if Path(argv[0]).expanduser().resolve(strict=True) != executable:
+        raise RuntimeError(f"process identity executable does not match complete argv for PID {pid}")
+    if expected_executable is not None and Path(expected_executable).expanduser().resolve(strict=True) != executable:
+        raise RuntimeError(f"process executable mismatch for PID {pid}")
+    expected = list(expected_argv) if expected_argv is not None else None
+    if expected is not None and argv != expected:
+        raise RuntimeError(f"process complete argv mismatch for PID {pid}")
+    return _validate_process_identity_record(
+        {
+            "pid": pid,
+            "uid": uid,
+            "lstart": lstart,
+            "start_timestamp": start_timestamp,
+            "pgid": pgid,
+            "exe_realpath": str(executable),
+            "exe_inode": executable_info.st_ino,
+            "exe_sha256": _sha256_file(executable),
+            "argv": argv,
+        }
+    )
+
+
+def _process_identity_matches(identity: dict[str, Any]) -> bool:
+    try:
+        expected = _validate_process_identity_record(identity)
+        observed = _capture_process_identity(
+            expected["pid"],
+            expected_executable=Path(expected["exe_realpath"]),
+            expected_argv=expected["argv"],
+        )
+    except (OSError, RuntimeError):
+        return False
+    return observed == expected
+
+
+def _stop_verified_process_identity(
+    identity: dict[str, Any], *, process_group: bool = False
+) -> None:
+    expected = _validate_process_identity_record(identity)
+    pid = expected["pid"]
+    if not _process_identity_matches(expected):
+        raise RuntimeError(f"refusing to stop process {pid} whose exact identity changed")
+    if process_group:
+        if expected["pgid"] != pid or os.getpgid(pid) != pid:
+            raise RuntimeError(f"refusing to stop process group {pid}: identity is not group leader")
+        os.killpg(pid, signal.SIGTERM)
+    else:
+        os.kill(pid, signal.SIGTERM)
+    for _ in range(50):
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.1)
+    raise RuntimeError(f"verified process {pid} did not stop after SIGTERM")
+
+
+def _tcp_ready(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.35):
+            return True
+    except OSError:
+        return False
+
+
+def _catdesk_slug(config_path: Path) -> str:
+    _validate_private_source(config_path, "production CatDesk config")
+    with config_path.open("rb") as handle:
+        slug = tomllib.load(handle).get("mcpSlug")
+    if not isinstance(slug, str) or not slug.strip() or "/" in slug:
+        raise RuntimeError("production CatDesk mcpSlug is missing or invalid")
+    return slug.strip()
+
+
+def _spawn_logged(
+    command: list[str],
+    stdout_path: Path,
+    stderr_path: Path,
+    *,
+    cwd: Path,
+    env: dict[str, str],
+) -> subprocess.Popen[Any]:
+    _private_dir(stdout_path.parent)
+    with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            cwd=cwd,
+            env=env,
+            start_new_session=True,
+            close_fds=True,
+        )
+    stdout_path.chmod(0o600)
+    stderr_path.chmod(0o600)
+    return process
+
+
+def _wait_for_tcp(process: subprocess.Popen[Any], port: int, label: str) -> None:
+    for _ in range(100):
+        if process.poll() is not None:
+            raise RuntimeError(f"{label} exited during startup")
+        if _tcp_ready("127.0.0.1", port):
+            return
+        time.sleep(0.1)
+    raise RuntimeError(f"{label} did not become ready")
+
+
+def _wait_for_bridge(process: subprocess.Popen[Any], layout: dict[str, Path]) -> list[str]:
+    for _ in range(100):
+        if process.poll() is not None:
+            raise RuntimeError("production Bridge exited during startup")
+        if layout["bridge_socket"].exists():
+            try:
+                return smoke_tools(layout)
+            except Exception:
+                pass
+        time.sleep(0.1)
+    raise RuntimeError("production Bridge did not become ready")
+
+
+def _stop_verified_local_runtime(state: dict[str, Any], layout: dict[str, Path]) -> None:
+    targets: list[tuple[dict[str, Any], bool]] = []
+    for pid_key, identity_key, process_group in (
+        ("bridge_pid", "bridge_process_identity", False),
+        ("host_pid", "host_process_identity", False),
+        ("catdesk_supervisor_pid", "catdesk_supervisor_process_identity", True),
+    ):
+        pid = state.get(pid_key)
+        if not isinstance(pid, int):
+            continue
+        identity = state.get(identity_key)
+        if not isinstance(identity, dict) or identity.get("pid") != pid:
+            raise RuntimeError(f"cannot stop production runtime without exact {identity_key}")
+        _validate_process_identity_record(identity)
+        if not _process_identity_matches(identity):
+            raise RuntimeError(f"cannot stop production runtime because {identity_key} changed")
+        targets.append((identity, process_group))
+    for identity, process_group in targets:
+        _stop_verified_process_identity(identity, process_group=process_group)
+    if layout["bridge_socket"].exists():
+        info = layout["bridge_socket"].lstat()
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid():
+            raise RuntimeError("refusing to remove unsafe production Bridge socket")
+        layout["bridge_socket"].unlink()
+
+
+def _validate_manifest_contract(manifest: dict[str, Any]) -> None:
+    _validate_manifest_identity(manifest)
+    _validate_runtime_dependencies(manifest)
+
+
+def _private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = path.lstat()
+    if path.is_symlink() or not path.is_dir() or info.st_uid != os.geteuid():
+        raise RuntimeError(f"private production path is unsafe: {path}")
+    path.chmod(0o700)
+
+
+def _validate_private_source(path: Path, label: str) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError as error:
+        raise RuntimeError(f"{label} is missing: {path}") from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"{label} must be a regular non-symlink file")
+    if info.st_uid != os.geteuid():
+        raise RuntimeError(f"{label} owner mismatch")
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        raise RuntimeError(f"{label} permissions must be 0600 or stricter")
+
+
+def _copy_owned_file(source: Path, destination: Path, mode: int) -> None:
+    source = Path(source)
+    info = source.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"release source must be a regular non-symlink file: {source}")
+    if info.st_uid != os.geteuid():
+        raise RuntimeError(f"release source owner mismatch: {source}")
+    _private_dir(destination.parent)
+    shutil.copyfile(source, destination)
+    destination.chmod(mode)
+
+
+def _copy_owned_tree(source: Path, destination: Path) -> None:
+    source = Path(source)
+    if source.is_symlink() or not source.is_dir() or source.stat().st_uid != os.geteuid():
+        raise RuntimeError(f"release source tree is unsafe: {source}")
+    for item in source.rglob("*"):
+        if item.is_symlink() or item.stat().st_uid != os.geteuid():
+            raise RuntimeError(f"release source tree member is unsafe: {item}")
+    shutil.copytree(source, destination)
+    for item in destination.rglob("*"):
+        if item.is_dir():
+            item.chmod(0o700)
+        elif item.is_file():
+            item.chmod(0o700 if os.access(item, os.X_OK) else 0o600)
+
+
+def _write_json_private(
+    path: Path, value: Any, *, private_parent: bool = True
+) -> None:
+    _write_text_private(
+        path,
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        0o600,
+        private_parent=private_parent,
+    )
+
+
+def _json_private_sha256(value: Any) -> str:
+    encoded = (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _write_text_private(
+    path: Path, value: str, mode: int, *, private_parent: bool = True
+) -> None:
+    path = Path(path)
+    if private_parent:
+        _private_dir(path.parent)
+    else:
+        parent = path.parent
+        parent_info = parent.lstat()
+        if parent.is_symlink() or not parent.is_dir() or parent_info.st_uid != os.geteuid():
+            raise RuntimeError(f"private write parent is unsafe: {parent}")
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and (
+        stat.S_ISLNK(existing.st_mode)
+        or not stat.S_ISREG(existing.st_mode)
+        or existing.st_uid != os.geteuid()
+    ):
+        raise RuntimeError(f"private write target is unsafe: {path}")
+
+    temp = path.parent / f".{path.name}.{secrets.token_hex(12)}.tmp"
+    open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    open_flags |= getattr(os, "O_CLOEXEC", 0)
+    open_flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory_fd: int | None = None
+    temp_fd: int | None = None
+    handle: Any | None = None
+    replaced = False
+    try:
+        directory_fd = os.open(path.parent, directory_flags)
+        temp_fd = os.open(temp, open_flags, mode)
+        try:
+            handle = os.fdopen(temp_fd, "w", encoding="utf-8", newline="")
+            temp_fd = None
+        except Exception:
+            os.close(temp_fd)
+            temp_fd = None
+            raise
+        written = handle.write(value)
+        if written != len(value):
+            raise OSError("private temporary file write was incomplete")
+        handle.flush()
+        os.fsync(handle.fileno())
+        os.fchmod(handle.fileno(), mode)
+        # Persist the exact permission metadata as well as the payload before rename.
+        os.fsync(handle.fileno())
+        handle.close()
+        handle = None
+        os.replace(temp, path)
+        replaced = True
+        try:
+            os.fsync(directory_fd)
+        except OSError as error:
+            raise RuntimeError(
+                "private write replaced target but directory fsync failed; persistence state is unknown"
+            ) from error
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        if temp_fd is not None:
+            try:
+                os.close(temp_fd)
+            except OSError:
+                pass
+        if not replaced:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+        if directory_fd is not None:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _node_runtime_dependency(node_executable: Path | None = None) -> dict[str, str]:
+    raw = str(node_executable) if node_executable is not None else shutil.which("node")
+    if not raw:
+        raise RuntimeError("Node.js is required for the production release")
+    try:
+        path = Path(raw).expanduser().resolve(strict=True)
+    except FileNotFoundError as error:
+        raise RuntimeError("production Node.js executable is unavailable") from error
+    if not path.is_absolute() or not path.is_file() or path.is_symlink():
+        raise RuntimeError("production Node.js executable must resolve to a regular absolute file")
+    return {"path": str(path), "sha256": _sha256_file(path)}
+
+
+def _validate_runtime_dependencies(manifest: dict[str, Any]) -> dict[str, dict[str, str]]:
+    dependencies = manifest.get("runtime_dependencies")
+    node = dependencies.get("node") if isinstance(dependencies, dict) else None
+    if not isinstance(node, dict):
+        raise RuntimeError("production release manifest is missing the Node.js runtime dependency")
+    raw_path = node.get("path")
+    expected_sha256 = node.get("sha256")
+    if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+        raise RuntimeError("production Node.js runtime path is not absolute")
+    if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
+        raise RuntimeError("production Node.js runtime hash is invalid")
+    path = Path(raw_path)
+    try:
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise RuntimeError("production Node.js runtime is unavailable") from error
+    if resolved != path or path.is_symlink() or not path.is_file():
+        raise RuntimeError("production Node.js runtime path is not immutable and canonical")
+    if _sha256_file(path) != expected_sha256:
+        raise RuntimeError("production Node.js runtime hash mismatch")
+    return {"node": {"path": raw_path, "sha256": expected_sha256}}
+
+
+def _catdesk_runner_source(manifest: dict[str, Any], layout: dict[str, Path]) -> str:
+    return f"""#!/usr/bin/env python3
+import fcntl, os, pty, select, struct, subprocess, termios, time
+from pathlib import Path
+binary = Path({str(layout['catdesk_binary'])!r})
+home = Path({str(layout['catdesk_home'])!r})
+workspace = Path({str(manifest['workspace'])!r})
+log_path = Path({str(layout['logs_dir'] / 'catdesk.log')!r})
+pid_path = Path({str(layout['runtime_root'] / 'catdesk-child.pid')!r})
+log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+master, slave = pty.openpty()
+fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 120, 0, 0))
+env = os.environ.copy()
+env.update({{'HOME': str(home), 'WORKSPACE_ROOT': str(workspace), 'PORT': {str(PRODUCTION_CATDESK_PORT)!r}, 'CATDESK_SKIP_MACOS_TERMINAL_PROFILE': '1', 'TERM': 'xterm-256color', 'CATDESK_LOCAL_BACKEND_KEY_FILE': str(home / '.catdesk/backend.key'), 'CATDESK_REQUIRE_LOCAL_BACKEND_AUTH': '1'}})
+with log_path.open('ab', buffering=0) as log:
+    proc = subprocess.Popen([str(binary)], stdin=slave, stdout=slave, stderr=slave, cwd=str(workspace), env=env)
+    pid_path.write_text(str(proc.pid), encoding='utf-8')
+    pid_path.chmod(0o600)
+    os.close(slave)
+    started = time.time(); next_send = started + 3.0
+    while proc.poll() is None:
+        now = time.time()
+        if now >= next_send and now - started < 25:
+            os.write(master, b'1'); next_send = now + 1.0
+        readable, _, _ = select.select([master], [], [], 0.2)
+        if readable:
+            try: log.write(os.read(master, 65536))
+            except OSError: break
+try: os.close(master)
+except OSError: pass
+raise SystemExit(proc.wait())
+"""
+
+
+def validate_workspace(path: Path) -> Path:
+    raw = str(path.expanduser())
+    if any(marker in raw for marker in LEGACY_CANDIDATE_MARKERS):
+        raise RuntimeError("production workspace points at legacy candidate workspace")
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+    except FileNotFoundError as error:
+        raise RuntimeError(f"production workspace does not exist: {path}") from error
+    if not resolved.is_dir():
+        raise RuntimeError(f"production workspace is not a directory: {resolved}")
+    resolved_text = str(resolved)
+    if any(marker in resolved_text for marker in LEGACY_CANDIDATE_MARKERS):
+        raise RuntimeError("production workspace resolves into legacy candidate workspace")
+    return resolved
+
+
+def validate_tool_surface(tools: Iterable[str]) -> set[str]:
+    observed = {str(value) for value in tools if isinstance(value, str)}
+    missing = sorted(REQUIRED_TOOLS.difference(observed))
+    if missing:
+        raise RuntimeError(
+            "stale or incomplete production tool surface; missing required tools: "
+            + ", ".join(missing)
+        )
+    return observed
+
+
+def _version_tuple(value: str) -> tuple[int, ...]:
+    parts = value.split(".")
+    if not parts or any(not part.isdigit() for part in parts):
+        raise RuntimeError(f"invalid numeric version: {value}")
+    return tuple(int(part) for part in parts)
+
+
+def _release_revision(value: str) -> str:
+    text = str(value or "").strip().lower()
+    if len(text) != 40 or any(ch not in "0123456789abcdef" for ch in text):
+        raise RuntimeError("production release revision must be a full 40-character Git SHA")
+    return text
+
+
+def _endpoint_generation(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise RuntimeError("production endpoint generation must be a positive integer")
+    return value
+
+
+def release_manifest(
+    workspace: Path | None = None,
+    *,
+    release_revision: str,
+    endpoint_generation: int,
+    node_executable: Path | None = None,
+) -> dict[str, Any]:
+    root = validate_workspace(workspace or canonical_workspace())
+    revision = _release_revision(release_revision)
+    generation = _endpoint_generation(endpoint_generation)
+    return {
+        "schema_version": 1,
+        "connector_id": CONNECTOR_ID,
+        "connector_display_name": CONNECTOR_DISPLAY_NAME,
+        "lifecycle": "production",
+        "contract_version": CONTRACT_VERSION,
+        "release_revision": revision,
+        "endpoint_generation": generation,
+        "fail_closed": True,
+        "silent_legacy_fallback_allowed": False,
+        "historical_connectors_forbidden": list(HISTORICAL_CONNECTOR_NAMES),
+        "workspace": str(root),
+        "required_tools": sorted(REQUIRED_TOOLS),
+        "runtime_dependencies": {"node": _node_runtime_dependency(node_executable)},
+        "tunnel": {
+            "profile_name": TUNNEL_PROFILE_NAME,
+            "legacy_profile_names_forbidden": list(HISTORICAL_TUNNEL_PROFILE_NAMES),
+        },
+        "bridge": {
+            "contract_version": CONTRACT_VERSION,
+            "release_revision": revision,
+            "endpoint_generation": generation,
+        },
+        "host": {
+            "tool": "discover_current_entry",
+            "accepts_caller_conversation_id": False,
+            "entry_scope": "runtime_invocation",
+            "machine_source": "host_invocation_context_v1",
+            "provenance": "runtime_host_current_entry_v1",
+            "secure_origin": "https://chatgpt.com",
+            "extension_id": HOST_EXTENSION_ID,
+            "minimum_extension_version": MIN_HOST_EXTENSION_VERSION,
+            "contract_version": CONTRACT_VERSION,
+            "release_revision": revision,
+            "endpoint_generation": generation,
+        },
+    }
+
+
+def validate_release_handshake(manifest: dict[str, Any], observed: dict[str, Any]) -> None:
+    if manifest.get("connector_id") != CONNECTOR_ID:
+        raise RuntimeError("release manifest connector identity mismatch")
+    if manifest.get("contract_version") != CONTRACT_VERSION or not manifest.get("fail_closed"):
+        raise RuntimeError("release manifest is not the canonical fail-closed production contract")
+    expected_revision = _release_revision(str(manifest.get("release_revision") or ""))
+    expected_generation = _endpoint_generation(manifest.get("endpoint_generation"))
+
+    if observed.get("connector_id") != manifest["connector_id"]:
+        raise RuntimeError("production connector identity mismatch")
+    if observed.get("contract_version") != manifest["contract_version"]:
+        raise RuntimeError("production connector contract version mismatch; stale surface rejected")
+    if observed.get("release_revision") != expected_revision:
+        raise RuntimeError("production connector release revision mismatch")
+    if observed.get("endpoint_generation") != expected_generation:
+        raise RuntimeError("production connector endpoint generation mismatch")
+
+    expected_workspace = validate_workspace(Path(manifest["workspace"]))
+    actual_workspace = validate_workspace(Path(str(observed.get("workspace") or "")))
+    if actual_workspace != expected_workspace:
+        raise RuntimeError(
+            f"production connector workspace mismatch: expected {expected_workspace}, got {actual_workspace}"
+        )
+
+    validate_tool_surface(observed.get("tools") or [])
+
+    tunnel = manifest["tunnel"]
+    if observed.get("tunnel_profile_name") != tunnel["profile_name"]:
+        raise RuntimeError("production tunnel profile mismatch; historical candidate rejected")
+    if observed.get("tunnel_endpoint_generation") != expected_generation:
+        raise RuntimeError("production tunnel endpoint generation mismatch")
+
+    bridge = manifest["bridge"]
+    if observed.get("bridge_release_revision") != bridge["release_revision"]:
+        raise RuntimeError("production Bridge release revision mismatch")
+    if observed.get("bridge_contract_version") != bridge["contract_version"]:
+        raise RuntimeError("production Bridge contract version mismatch")
+    if observed.get("bridge_endpoint_generation") != bridge["endpoint_generation"]:
+        raise RuntimeError("production Bridge endpoint generation mismatch")
+
+    host = manifest["host"]
+    if observed.get("host_extension_id") != host["extension_id"]:
+        raise RuntimeError("production Host extension identity mismatch")
+    actual_version = str(observed.get("host_extension_version") or "")
+    if _version_tuple(actual_version) < _version_tuple(host["minimum_extension_version"]):
+        raise RuntimeError("production Host extension version is stale")
+    if observed.get("host_native_manifest_release") != host["release_revision"]:
+        raise RuntimeError("production Native Messaging manifest release mismatch")
+    if observed.get("host_contract_version") != host["contract_version"]:
+        raise RuntimeError("production Host contract version mismatch")
+    if observed.get("host_endpoint_generation") != host["endpoint_generation"]:
+        raise RuntimeError("production Host endpoint generation mismatch")
+
+
+def _require_clean_build_repo(repo_root: Path) -> None:
+    completed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("cannot inspect full production build repository status")
+    for line in completed.stdout.splitlines():
+        if len(line) < 4:
+            raise RuntimeError("production build repository status is not parseable")
+        status_code = line[:2]
+        path = line[3:]
+        if status_code != "??":
+            raise RuntimeError(
+                "refusing to build a production release from tracked dirty changes"
+            )
+        allowed = (
+            path.startswith("scripts/__pycache__/")
+            or path.startswith("tests/__pycache__/")
+            or path in ALLOWED_BUILD_UNTRACKED
+        )
+        if not allowed:
+            raise RuntimeError(
+                f"refusing to build with unknown untracked input: {path}"
+            )
+
+
+def _export_git_snapshot(repo_root: Path, revision: str, destination: Path) -> Path:
+    revision = _release_revision(revision)
+    destination = Path(destination)
+    if destination.exists():
+        raise RuntimeError("Git snapshot destination already exists")
+    destination.mkdir(parents=True, mode=0o700)
+    archive_path = destination.parent / f".{destination.name}.{secrets.token_hex(12)}.tar"
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "archive",
+                "--format=tar",
+                f"--output={archive_path}",
+                revision,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError("cannot export exact production Git revision")
+        archive_path.chmod(0o600)
+        with tarfile.open(archive_path, mode="r:") as archive:
+            archive.extractall(destination, filter="data")
+    finally:
+        if archive_path.exists():
+            archive_path.unlink()
+    return destination
+
+
+def install_production_release(
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+    *,
+    build_repo: Path,
+    sources: dict[str, Path] | None = None,
+) -> dict[str, Path]:
+    """Build a pinned Bridge then copy all components into one immutable bundle."""
+    repo = Path(build_repo).expanduser().resolve()
+    require_exact_git_head(str(manifest["release_revision"]), repo)
+    _require_clean_build_repo(repo)
+    with tempfile.TemporaryDirectory(prefix="lab-production-source-") as raw_snapshot_parent:
+        snapshot = Path(raw_snapshot_parent) / "source"
+        _export_git_snapshot(repo, str(manifest["release_revision"]), snapshot)
+        completed = subprocess.run(
+            ["cargo", "build", "--release"],
+            cwd=snapshot / "crates" / "local-tool-bridge",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(f"production Bridge release build failed: {completed.stderr.strip()[-600:]}")
+        resolved_sources = dict(sources or default_release_sources(snapshot))
+        resolved_sources["bridge_binary"] = snapshot / "crates" / "local-tool-bridge" / "target" / "release" / "local-tool-bridge"
+        resolved_sources["host_source_dir"] = snapshot / "experiments" / "web-host-attestation"
+        return install_release_bundle(manifest, layout, resolved_sources)
+
+
+def _rollback_request_manifest(release_revision: str, endpoint_generation: int) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "connector_id": CONNECTOR_ID,
+        "contract_version": CONTRACT_VERSION,
+        "release_revision": _release_revision(release_revision),
+        "endpoint_generation": _endpoint_generation(endpoint_generation),
+        "fail_closed": True,
+        "workspace": str(canonical_workspace()),
+        "tunnel": {"profile_name": TUNNEL_PROFILE_NAME},
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Local Agent Bridge production connector contract")
+    parser.add_argument(
+        "action",
+        choices=("manifest", "validate-handshake", "install", "start-local", "status", "smoke", "install-native", "activate-tunnel", "rollback-tunnel"),
+    )
+    parser.add_argument("--release-revision", required=True)
+    parser.add_argument("--endpoint-generation", required=True, type=int)
+    parser.add_argument("--observed", type=Path)
+    parser.add_argument("--runtime-root", type=Path, default=PRODUCTION_RUNTIME_ROOT)
+    parser.add_argument("--bridge-socket", type=Path, default=PRODUCTION_BRIDGE_SOCKET)
+    parser.add_argument("--build-repo", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--historical-profile-dir", type=Path)
+    parser.add_argument("--historical-profile-name")
+    parser.add_argument("--historical-runtime-state", type=Path, default=HISTORICAL_M0_RUNTIME_STATE)
+    parser.add_argument("--tunnel-client", type=Path)
+    parser.add_argument("--native-user-data-dir", action="append", type=Path, default=[])
+    parser.add_argument("--fallback-health-url-file", type=Path, default=AI_BRIDGE_FALLBACK_HEALTH_URL_FILE)
+    parser.add_argument("--rollback-receipt", type=Path)
+    args = parser.parse_args(argv)
+
+    manifest = (
+        _rollback_request_manifest(args.release_revision, args.endpoint_generation)
+        if args.action == "rollback-tunnel"
+        else release_manifest(
+            release_revision=args.release_revision,
+            endpoint_generation=args.endpoint_generation,
+        )
+    )
+    if args.action == "manifest":
+        print(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.action == "validate-handshake":
+        if args.observed is None:
+            raise SystemExit("--observed is required for validate-handshake")
+        observed = json.loads(args.observed.read_text(encoding="utf-8"))
+        validate_release_handshake(manifest, observed)
+        print(json.dumps({
+            "ok": True,
+            "connector_id": CONNECTOR_ID,
+            "contract_version": CONTRACT_VERSION,
+            "release_revision": manifest["release_revision"],
+            "endpoint_generation": manifest["endpoint_generation"],
+        }))
+        return 0
+
+    layout = production_layout(
+        manifest, runtime_root=args.runtime_root.expanduser(), bridge_socket=args.bridge_socket.expanduser()
+    )
+    if args.action == "install":
+        result: dict[str, Any] = {str(key): str(value) for key, value in install_production_release(
+            manifest, layout, build_repo=args.build_repo
+        ).items()}
+    elif args.action == "start-local":
+        result = start_local_runtime(manifest, layout)
+    elif args.action == "status":
+        result = production_status(manifest, layout)
+    elif args.action == "smoke":
+        result = {"ok": True, "tools": smoke_tools(layout)}
+    elif args.action == "install-native":
+        validate_installed_release(layout)
+        result = {key: str(value) for key, value in install_native_messaging_manifests(
+            layout,
+            manifest,
+            native_user_data_dirs=args.native_user_data_dir,
+        ).items()}
+    elif args.action == "rollback-tunnel":
+        result = rollback_production_activation(
+            manifest,
+            layout,
+            receipt_path=args.rollback_receipt,
+        )
+    else:
+        if args.historical_profile_dir is None or not args.historical_profile_name:
+            raise SystemExit("--historical-profile-dir and --historical-profile-name are required for activate-tunnel; do not guess the live M0 profile")
+        result = activate_production_tunnel(
+            manifest,
+            layout,
+            historical_profile_dir=args.historical_profile_dir,
+            historical_profile_name=args.historical_profile_name,
+            historical_runtime_state=args.historical_runtime_state,
+            native_user_data_dirs=args.native_user_data_dir,
+            tunnel_client=args.tunnel_client,
+            fallback_health_url_file=args.fallback_health_url_file,
+        )
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    if args.action == "status":
+        return 0 if (
+            result.get("local_runtime_ready") is True
+            and result.get("tunnel_ready") is True
+        ) else 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

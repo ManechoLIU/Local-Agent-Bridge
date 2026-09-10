@@ -6,13 +6,35 @@ use axum::{
     routing::post,
 };
 use bridge_security_core::{Capability, CapabilityAuthority, CapabilityGrant, ExecutionContext};
-use local_tool_bridge::BridgeIngress;
+use local_tool_bridge::{BridgeIngress, ProductionReleaseFence};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
 
 const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
 const BACKEND_KEY: &str = "backend-0123456789abcdef0123456789abcdef0123456789abcdef";
+const REVISION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+fn production_fence() -> ProductionReleaseFence {
+    ProductionReleaseFence {
+        contract_version: "lab-production-connector-v1".into(),
+        release_revision: REVISION.into(),
+        endpoint_generation: 7,
+        workspace: "/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge".into(),
+        tunnel_profile_name: "local-agent-bridge-production".into(),
+    }
+}
+
+fn host_fence_json(revision: &str) -> serde_json::Value {
+    serde_json::json!({
+        "connector_id": "local-agent-bridge-production",
+        "contract_version": "lab-production-connector-v1",
+        "release_revision": revision,
+        "endpoint_generation": 7,
+        "workspace": "/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge",
+        "tunnel_profile_name": "local-agent-bridge-production"
+    })
+}
 
 #[derive(Clone, Default)]
 struct Capture(Arc<Mutex<Option<(HeaderMap, Bytes)>>>);
@@ -373,6 +395,29 @@ async fn json_backend(
             .into_iter()
             .map(|name| serde_json::json!({"name":name,"inputSchema":{"type":"object"}}))
             .collect()
+        } else if kind.starts_with("host") {
+            let revision = if kind == "host-stale" {
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            } else {
+                REVISION
+            };
+            let mut host_tools = vec![serde_json::json!({
+                "name":"discover_current_entry",
+                "inputSchema":{
+                    "type":"object",
+                    "required":["target_generation","ownership_generation"],
+                    "properties":{
+                        "target_generation":{"type":"integer","minimum":1},
+                        "ownership_generation":{"type":"integer","minimum":1}
+                    },
+                    "additionalProperties":false
+                },
+                "_meta":{"local-agent-bridge/production-fence":host_fence_json(revision)}
+            })];
+            if kind == "host-extra" {
+                host_tools.push(serde_json::json!({"name":"read","inputSchema":{"type":"object"}}));
+            }
+            host_tools
         } else {
             vec![serde_json::json!({"name":"read","inputSchema":{"type":"object"}})]
         };
@@ -381,9 +426,17 @@ async fn json_backend(
             axum::Json(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"tools":tools}})),
         );
     }
+    let mut result = serde_json::json!({"backend":kind});
+    if kind.starts_with("host") {
+        result["_meta"] = serde_json::json!({
+            "local-agent-bridge/production-fence": host_fence_json(
+                if kind == "host-stale" { "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } else { REVISION }
+            )
+        });
+    }
     (
         StatusCode::OK,
-        axum::Json(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"backend":kind}})),
+        axum::Json(serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})),
     )
 }
 
@@ -527,4 +580,162 @@ async fn computer_tool_without_computer_capability_fails_before_computer_backend
     let response = app.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert!(computer_capture.0.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn host_attestation_tool_is_capability_gated_routed_and_merged_into_tools_list() {
+    let default_capture = JsonCapture::default();
+    let host_capture = JsonCapture::default();
+    let default_url = json_backend_server(default_capture.clone(), "default").await;
+    let host_url = json_backend_server(host_capture.clone(), "host").await;
+    let app = bridge(
+        &default_url,
+        vec![Capability::Discovery, Capability::HostAttestation],
+    )
+    .with_host_backend(&host_url, BACKEND_KEY, production_fence())
+    .unwrap()
+    .router();
+
+    let list_body = r#"{"jsonrpc":"2.0","id":"list-host","method":"tools/list","params":{}}"#;
+    let list_request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header("mcp-method", "tools/list")
+        .header("x-lab-ingress-key", KEY)
+        .body(Body::from(list_body))
+        .unwrap();
+    let list_response = app.clone().oneshot(list_request).await.unwrap();
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let list_bytes = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_json: serde_json::Value = serde_json::from_slice(&list_bytes).unwrap();
+    let names: Vec<_> = list_json["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(names.contains(&"read"));
+    assert!(names.contains(&"discover_current_entry"));
+
+    let body = r#"{"jsonrpc":"2.0","id":"host","method":"tools/call","params":{"name":"discover_current_entry","arguments":{"target_generation":8,"ownership_generation":8}}}"#;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header("mcp-method", "tools/call")
+        .header("mcp-name", "discover_current_entry")
+        .header("x-lab-ingress-key", KEY)
+        .body(Body::from(body))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(host_capture.0.lock().await.iter().any(|(_, body)| {
+        body.get("params")
+            .and_then(|v| v.get("name"))
+            .and_then(serde_json::Value::as_str)
+            == Some("discover_current_entry")
+    }));
+    assert!(!default_capture.0.lock().await.iter().any(|(_, body)| {
+        body.get("params")
+            .and_then(|v| v.get("name"))
+            .and_then(serde_json::Value::as_str)
+            == Some("discover_current_entry")
+    }));
+}
+
+#[tokio::test]
+async fn host_attestation_tool_without_capability_fails_before_host_backend() {
+    let default_capture = JsonCapture::default();
+    let host_capture = JsonCapture::default();
+    let default_url = json_backend_server(default_capture, "default").await;
+    let host_url = json_backend_server(host_capture.clone(), "host").await;
+    let app = bridge(&default_url, vec![Capability::Discovery])
+        .with_host_backend(&host_url, BACKEND_KEY, production_fence())
+        .unwrap()
+        .router();
+    let body = r#"{"jsonrpc":"2.0","id":"host-denied","method":"tools/call","params":{"name":"discover_current_entry","arguments":{"target_generation":8,"ownership_generation":8}}}"#;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header("mcp-method", "tools/call")
+        .header("mcp-name", "discover_current_entry")
+        .header("x-lab-ingress-key", KEY)
+        .body(Body::from(body))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(host_capture.0.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn host_backend_fence_mismatch_is_rejected_for_tools_list_and_call() {
+    let default_capture = JsonCapture::default();
+    let host_capture = JsonCapture::default();
+    let default_url = json_backend_server(default_capture, "default").await;
+    let host_url = json_backend_server(host_capture, "host-stale").await;
+    let app = bridge(
+        &default_url,
+        vec![Capability::Discovery, Capability::HostAttestation],
+    )
+    .with_host_backend(&host_url, BACKEND_KEY, production_fence())
+    .unwrap()
+    .router();
+
+    let list_request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header("mcp-method", "tools/list")
+        .header("x-lab-ingress-key", KEY)
+        .body(Body::from(
+            r#"{"jsonrpc":"2.0","id":"stale-list","method":"tools/list","params":{}}"#,
+        ))
+        .unwrap();
+    let list_response = app.clone().oneshot(list_request).await.unwrap();
+    assert_eq!(list_response.status(), StatusCode::BAD_GATEWAY);
+
+    let call_request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header("mcp-method", "tools/call")
+        .header("mcp-name", "discover_current_entry")
+        .header("x-lab-ingress-key", KEY)
+        .body(Body::from(
+            r#"{"jsonrpc":"2.0","id":"stale-call","method":"tools/call","params":{"name":"discover_current_entry","arguments":{"target_generation":8,"ownership_generation":8}}}"#,
+        ))
+        .unwrap();
+    let call_response = app.oneshot(call_request).await.unwrap();
+    assert_eq!(call_response.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn dedicated_host_backend_rejects_unexpected_extra_tools() {
+    let default_url = json_backend_server(JsonCapture::default(), "default").await;
+    let host_url = json_backend_server(JsonCapture::default(), "host-extra").await;
+    let app = bridge(
+        &default_url,
+        vec![Capability::Discovery, Capability::HostAttestation],
+    )
+    .with_host_backend(&host_url, BACKEND_KEY, production_fence())
+    .unwrap()
+    .router();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header("mcp-method", "tools/list")
+        .header("x-lab-ingress-key", KEY)
+        .body(Body::from(
+            r#"{"jsonrpc":"2.0","id":"extra-host-tool","method":"tools/list","params":{}}"#,
+        ))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(request).await.unwrap().status(),
+        StatusCode::BAD_GATEWAY
+    );
 }
