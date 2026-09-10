@@ -96,6 +96,22 @@ SelfAlone is a separate project. It may be used only as an external E2E target /
 
 Whenever machine-verifiable registration, ownership, target generation, session attestation, or capability verification exists, those machine facts override prompt claims and historical assumptions. Ambiguous ownership must fail closed for Controller-only actions rather than silently forking or impersonating a Controller.
 
+### 1.5.1 Cross-project repair ownership and no-duplicate-work rule
+
+The LAB Controller owns diagnosis, dependency tracking, acceptance criteria, routing, review, integration, and release decisions for LAB. It must **not** implement a competing fix inside Adaptive Agent Runtime or another external infrastructure repository when a dedicated repair session/worktree already owns that defect.
+
+When LAB is blocked by an external Runtime/Host-infrastructure defect:
+
+1. fresh-read the external defect owner, worktree/branch, candidate and terminal state;
+2. record the blocker and exact acceptance criteria in LAB governance facts;
+3. send/route evidence to the existing repair owner instead of opening a competing implementation;
+4. continue any independent LAB READY work that does not violate the blocker;
+5. after the repair owner produces an immutable candidate, LAB may independently review, integrate/accept, install, and run LAB-specific Live-E2E gates.
+
+LAB may take over implementation only when the user explicitly reassigns it, or machine facts prove that the prior repair owner is terminal/abandoned and the Runtime performs a canonical reassignment. A critical path blocker alone is **not** permission for the Controller to steal the repair task.
+
+This rule does not prevent the Controller from reading external source or reproducing a failure when needed to produce precise evidence; it prevents duplicate implementation ownership.
+
 ### 1.6 Safety-check-friendly execution discipline
 
 When using Local Agent Bridge or another high-privilege local execution surface, prefer **natural engineering steps with clear, bounded side effects** instead of packing unrelated high-impact actions into one opaque tool call.
