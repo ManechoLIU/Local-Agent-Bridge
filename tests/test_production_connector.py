@@ -676,6 +676,75 @@ class ProductionConnectorContractTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "NUL|argv|malformed"):
                 pc._process_argv(123)
 
+    def test_kernel_python_executable_prefers_trusted_macos_framework_app_and_fails_closed(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            prefix = root / "Python.framework" / "Versions" / "3.11"
+            framework_python = prefix / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+            framework_python.parent.mkdir(parents=True)
+            framework_python.write_bytes(b"framework-python")
+            framework_python.chmod(0o755)
+            base_python = root / "bin" / "python-base"
+            base_python.parent.mkdir()
+            base_python.write_bytes(b"base-python")
+            base_python.chmod(0o755)
+            clt_versions = root / "CommandLineTools" / "Python3.framework" / "Versions"
+            clt_python = clt_versions / "3.9" / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+            clt_python.parent.mkdir(parents=True)
+            clt_python.write_bytes(b"clt-python")
+            clt_python.chmod(0o755)
+            (clt_versions / "Current").symlink_to("3.9", target_is_directory=True)
+            clt_current = clt_versions / "Current" / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+
+            with patch.object(pc.sys, "platform", "darwin"), patch.object(
+                pc.sys, "prefix", str(prefix)
+            ), patch.object(
+                pc, "MACOS_CLT_PYTHON_CURRENT", clt_current
+            ), patch.object(pc.sys, "_base_executable", str(base_python), create=True):
+                self.assertEqual(pc._kernel_python_executable(), framework_python)
+
+            framework_python.chmod(0o775)
+            with patch.object(pc.sys, "platform", "darwin"), patch.object(
+                pc.sys, "prefix", str(prefix)
+            ), patch.object(
+                pc, "MACOS_CLT_PYTHON_CURRENT", clt_current
+            ), patch.object(pc.sys, "_base_executable", str(base_python), create=True):
+                self.assertEqual(pc._kernel_python_executable(), clt_python.resolve())
+
+            framework_python.unlink()
+            framework_python.symlink_to(base_python)
+            with patch.object(pc.sys, "platform", "darwin"), patch.object(
+                pc.sys, "prefix", str(prefix)
+            ), patch.object(
+                pc, "MACOS_CLT_PYTHON_CURRENT", root / "missing-clt-python"
+            ), patch.object(pc.sys, "_base_executable", str(base_python), create=True):
+                with self.assertRaisesRegex(RuntimeError, "trusted macOS Python|Framework|CLT"):
+                    pc._kernel_python_executable()
+
+            framework_python.unlink()
+            framework_python.write_bytes(b"framework-python")
+            framework_python.chmod(0o775)
+            clt_python.chmod(0o775)
+            with patch.object(pc.sys, "platform", "darwin"), patch.object(
+                pc.sys, "prefix", str(prefix)
+            ), patch.object(
+                pc, "MACOS_CLT_PYTHON_CURRENT", clt_current
+            ), patch.object(pc.sys, "_base_executable", str(base_python), create=True):
+                with self.assertRaisesRegex(RuntimeError, "trusted macOS Python|Framework|CLT"):
+                    pc._kernel_python_executable()
+
+            with patch.object(pc.sys, "platform", "linux"), patch.object(
+                pc.sys, "prefix", str(prefix)
+            ), patch.object(pc.sys, "_base_executable", str(base_python), create=True):
+                self.assertEqual(pc._kernel_python_executable(), base_python.resolve())
+
+            base_python.chmod(0o777)
+            with patch.object(pc.sys, "platform", "linux"), patch.object(
+                pc.sys, "_base_executable", str(base_python), create=True
+            ):
+                with self.assertRaisesRegex(RuntimeError, "base Python.*trusted|writable|unsafe"):
+                    pc._kernel_python_executable()
+
     def test_global_tunnel_id_discovery_covers_direct_flags_and_rejects_unknown_forms(self):
         direct_argv = [
             "/opt/tunnel-client",
@@ -1778,6 +1847,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
             node = root / "node"
             node.write_text("node", encoding="utf-8")
             node.chmod(0o700)
+            kernel_python = root / "kernel-python"
             processes = [MagicMock(pid=801), MagicMock(pid=802), MagicMock(pid=803)]
             identities = [
                 self._identity(process.pid, [f"/private/process-{process.pid}"])
@@ -1795,10 +1865,12 @@ class ProductionConnectorContractTests(unittest.TestCase):
             ), patch.object(pc, "_catdesk_slug", return_value="private"), patch.object(
                 pc, "production_component_env", return_value={"host": {}, "bridge": {}}
             ), patch.object(
-                pc, "_spawn_logged", side_effect=processes
+                pc, "_kernel_python_executable", return_value=kernel_python
             ), patch.object(
+                pc, "_spawn_logged", side_effect=processes
+            ) as spawn, patch.object(
                 pc, "_capture_process_identity", side_effect=identities
-            ), patch.object(pc, "_wait_for_tcp"), patch.object(
+            ) as capture, patch.object(pc, "_wait_for_tcp"), patch.object(
                 pc, "_wait_for_bridge", return_value=sorted(pc.REQUIRED_TOOLS)
             ), patch.object(
                 pc, "_validate_runtime_dependencies", return_value={"node": {"path": str(node)}}
@@ -1806,6 +1878,13 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "post-start status"):
                     pc.start_local_runtime(manifest, layout)
             self.assertEqual(stop.call_count, 3)
+            self.assertEqual(spawn.call_args_list[0].args[0][0], str(kernel_python))
+            self.assertEqual(
+                capture.call_args_list[0].kwargs["expected_executable"], kernel_python
+            )
+            self.assertEqual(
+                capture.call_args_list[0].kwargs["expected_argv"][0], str(kernel_python)
+            )
             state = json.loads(layout["runtime_state"].read_text(encoding="utf-8"))
             self.assertEqual(state["tunnel_pid"], 717)
             self.assertEqual(state["tunnel_process_identity"], prior["tunnel_process_identity"])

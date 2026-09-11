@@ -58,6 +58,10 @@ AI_BRIDGE_FALLBACK_HEALTH_URL_FILE = (
     / "managed-tunnel"
     / "health-url"
 )
+MACOS_CLT_PYTHON_CURRENT = Path(
+    "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/"
+    "Versions/Current/Resources/Python.app/Contents/MacOS/Python"
+)
 DEFAULT_NATIVE_USER_DATA_DIR_NAMES = (
     "chrome-profile",
     "chrome-for-testing-profile",
@@ -2480,7 +2484,7 @@ def start_local_runtime(manifest: dict[str, Any], layout: dict[str, Path]) -> di
     }
     started: list[tuple[subprocess.Popen[Any], dict[str, Any] | None, bool]] = []
     try:
-        python = Path(sys.executable).resolve(strict=True)
+        python = _kernel_python_executable()
         catdesk_command = [str(python), str(layout["catdesk_runner"])]
         catdesk = _spawn_logged(
             catdesk_command,
@@ -2794,6 +2798,63 @@ def _process_argv(pid: int) -> list[str]:
             raise RuntimeError(f"process argv[0] for PID {pid} is empty")
         return [os.fsdecode(value) for value in values]
     raise RuntimeError(f"cannot capture process argv for PID {pid} on this platform")
+
+
+def _validate_trusted_python_binary(path: Path, label: str) -> Path:
+    path = Path(path).expanduser()
+    if not path.is_absolute():
+        raise RuntimeError(f"{label} path is not absolute")
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise RuntimeError(f"{label} is unavailable") from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"{label} is an unsafe symlink or non-regular file")
+    if info.st_uid not in {0, os.geteuid()}:
+        raise RuntimeError(f"{label} is not owned by a trusted uid")
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        raise RuntimeError(f"{label} is group/world writable and not trusted")
+    if not os.access(path, os.X_OK):
+        raise RuntimeError(f"{label} is not executable")
+    return path
+
+
+def _kernel_python_executable() -> Path:
+    """Choose argv[0] that the kernel reports as the Python executable."""
+    if sys.platform == "darwin":
+        framework_python = (
+            Path(sys.prefix)
+            / "Resources"
+            / "Python.app"
+            / "Contents"
+            / "MacOS"
+            / "Python"
+        )
+        try:
+            return _validate_trusted_python_binary(
+                framework_python, "macOS Framework Python app binary"
+            )
+        except RuntimeError as framework_error:
+            try:
+                clt_python = MACOS_CLT_PYTHON_CURRENT.expanduser().resolve(strict=True)
+                return _validate_trusted_python_binary(
+                    clt_python, "macOS CLT Python app binary"
+                )
+            except (OSError, RuntimeError) as clt_error:
+                raise RuntimeError(
+                    "no trusted macOS Python executable is available: "
+                    f"Framework candidate rejected ({framework_error}); "
+                    f"CLT candidate rejected ({clt_error})"
+                ) from clt_error
+
+    raw_base = getattr(sys, "_base_executable", None)
+    if not isinstance(raw_base, str) or not raw_base:
+        raise RuntimeError("base Python executable is unavailable")
+    try:
+        base_python = Path(raw_base).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError("base Python executable is unavailable") from error
+    return _validate_trusted_python_binary(base_python, "base Python executable")
 
 
 PROCESS_IDENTITY_KEYS = frozenset(
