@@ -13,7 +13,9 @@ import glob
 import hashlib
 import ipaddress
 import json
+import math
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -677,6 +679,219 @@ def _request_json(request: urllib.request.Request, label: str) -> dict[str, Any]
         raise RuntimeError(f"{label} request failed") from error
 
 
+MAX_TUNNEL_HEALTH_BODY_BYTES = 1024 * 1024
+TUNNEL_HEALTH_FUTURE_TOLERANCE_SECONDS = 2.0
+TUNNEL_POLL_STATUS_MAX_AGE_SECONDS = 60.0
+TUNNEL_POLL_STARTUP_TIMEOUT_SECONDS = 5.0
+TUNNEL_POLL_RETRY_INTERVAL_SECONDS = 0.1
+
+
+class _TransientTunnelReadinessError(RuntimeError):
+    """A valid startup observation that can become ready without identity changes."""
+
+
+class _TransientTunnelMetricsError(_TransientTunnelReadinessError):
+    """A valid poller snapshot that can become ready without identity changes."""
+
+
+class _TransientTunnelStartupEventError(_TransientTunnelReadinessError):
+    """A valid but incomplete startup event chain."""
+
+
+class _NoTunnelHealthRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        request: urllib.request.Request,
+        file_pointer: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        new_url: str,
+    ) -> None:
+        return None
+
+
+TUNNEL_HEALTH_PROXY_HANDLER = urllib.request.ProxyHandler({})
+TUNNEL_HEALTH_OPENER = urllib.request.build_opener(
+    TUNNEL_HEALTH_PROXY_HANDLER,
+    _NoTunnelHealthRedirect(),
+)
+
+
+def _request_tunnel_health_bytes(
+    request: urllib.request.Request, label: str
+) -> tuple[bytes, str | None]:
+    try:
+        with TUNNEL_HEALTH_OPENER.open(request, timeout=3.0) as response:
+            if getattr(response, "status", None) != 200:
+                raise RuntimeError(
+                    f"{label} returned HTTP {getattr(response, 'status', 'unknown')}"
+                )
+            if response.geturl() != request.full_url:
+                raise RuntimeError(f"{label} redirected away from its private loopback URL")
+            raw = response.read(MAX_TUNNEL_HEALTH_BODY_BYTES + 1)
+            if len(raw) > MAX_TUNNEL_HEALTH_BODY_BYTES:
+                raise RuntimeError(f"{label} response body is too large")
+            content_type = response.headers.get("Content-Type")
+            return raw, content_type if isinstance(content_type, str) else None
+    except urllib.error.HTTPError as error:
+        if 300 <= error.code < 400:
+            raise RuntimeError(f"{label} refused an HTTP redirect") from error
+        raise RuntimeError(f"{label} returned HTTP {error.code}") from error
+    except RuntimeError:
+        raise
+    except Exception as error:
+        raise RuntimeError(f"{label} request failed") from error
+
+
+def _parse_prometheus_labels(raw: str, label: str) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    offset = 0
+    token = re.compile(r'\s*([A-Za-z_][A-Za-z0-9_]*)="((?:\\.|[^"\\])*)"\s*(,|$)')
+    while offset < len(raw):
+        match = token.match(raw, offset)
+        if match is None:
+            raise RuntimeError(f"{label} has malformed Prometheus labels")
+        key, encoded, separator = match.groups()
+        if key in labels:
+            raise RuntimeError(f"{label} has duplicate Prometheus labels")
+        try:
+            value = json.loads(f'"{encoded}"')
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"{label} has malformed Prometheus label escaping") from error
+        labels[key] = value
+        offset = match.end()
+        if separator == "":
+            break
+        if offset == len(raw):
+            raise RuntimeError(f"{label} has a trailing Prometheus label separator")
+    return labels
+
+
+def _parse_controlplane_poll_metrics(
+    raw: bytes,
+    *,
+    started_at: float,
+    now: float,
+    max_age_seconds: float = TUNNEL_POLL_STATUS_MAX_AGE_SECONDS,
+) -> dict[str, float]:
+    if (
+        isinstance(started_at, bool)
+        or not isinstance(started_at, (int, float))
+        or not math.isfinite(float(started_at))
+        or isinstance(now, bool)
+        or not isinstance(now, (int, float))
+        or not math.isfinite(float(now))
+        or isinstance(max_age_seconds, bool)
+        or not isinstance(max_age_seconds, (int, float))
+        or not math.isfinite(float(max_age_seconds))
+        or max_age_seconds <= 0
+    ):
+        raise RuntimeError("production tunnel metrics time bounds must be finite")
+    if started_at > now + TUNNEL_HEALTH_FUTURE_TOLERANCE_SECONDS:
+        raise RuntimeError("production tunnel metrics started_at is in the future")
+    expected_content: dict[str, list[tuple[dict[str, str], float]]] = {
+        "commands_poll_cycles_total": [],
+        "commands_poll_last_successful_timestamp_seconds": [],
+    }
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RuntimeError("production tunnel metrics returned non-UTF-8 data") from error
+    sample = re.compile(
+        r"^([A-Za-z_:][A-Za-z0-9_:]*)(?:\{(.*)\})?\s+(\S+)(?:\s+\d+)?$"
+    )
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        metric_name = stripped.split("{", 1)[0].split(None, 1)[0]
+        if metric_name not in expected_content:
+            continue
+        match = sample.fullmatch(stripped)
+        if match is None or match.group(1) != metric_name:
+            raise RuntimeError(f"production tunnel metrics sample {metric_name} is malformed")
+        raw_labels = match.group(2)
+        if raw_labels is None:
+            raise RuntimeError(f"production tunnel metrics sample {metric_name} has no labels")
+        labels = _parse_prometheus_labels(raw_labels, f"production tunnel metrics {metric_name}")
+        if "otel_scope_name" not in labels:
+            raise RuntimeError(
+                f"production tunnel metrics sample {metric_name} has no otel_scope_name label"
+            )
+        if labels["otel_scope_name"] != "controlplane":
+            continue
+        if "service_name" in labels and labels["service_name"] != "tunnel-client":
+            raise RuntimeError(
+                f"production tunnel metrics sample {metric_name} service_name mismatch"
+            )
+        try:
+            value = float(match.group(3))
+        except ValueError as error:
+            raise RuntimeError(
+                f"production tunnel metrics sample {metric_name} is not numeric"
+            ) from error
+        if not math.isfinite(value):
+            raise RuntimeError(f"production tunnel metrics sample {metric_name} is not finite")
+        expected_content[metric_name].append((labels, value))
+    for metric_name, values in expected_content.items():
+        if not values:
+            raise _TransientTunnelMetricsError(
+                f"production tunnel metrics are missing controlplane sample {metric_name}"
+            )
+        if len(values) != 1:
+            raise RuntimeError(
+                f"production tunnel metrics require one unique controlplane sample for {metric_name}"
+            )
+    cycles_labels, cycles = expected_content["commands_poll_cycles_total"][0]
+    success_labels, last_success = expected_content[
+        "commands_poll_last_successful_timestamp_seconds"
+    ][0]
+    if cycles_labels != success_labels:
+        raise RuntimeError("production tunnel controlplane poll metric labels do not match")
+    if cycles == 0:
+        raise _TransientTunnelMetricsError(
+            "production tunnel controlplane poll cycles have not started"
+        )
+    if cycles < 0 or not cycles.is_integer():
+        raise RuntimeError("production tunnel controlplane poll cycles are not a positive integer")
+    if last_success < 0:
+        raise RuntimeError("production tunnel controlplane poll success timestamp is negative")
+    if last_success < math.floor(started_at):
+        raise _TransientTunnelMetricsError(
+            "production tunnel controlplane poll success is not fresh for this startup"
+        )
+    if last_success < now - max_age_seconds:
+        raise _TransientTunnelMetricsError(
+            "production tunnel controlplane poll success is stale"
+        )
+    if last_success > now + TUNNEL_HEALTH_FUTURE_TOLERANCE_SECONDS:
+        raise RuntimeError("production tunnel controlplane poll success is in the future")
+    return {"cycles": cycles, "last_successful_timestamp": last_success}
+
+
+def _validate_prometheus_content_type(value: str | None) -> None:
+    if not isinstance(value, str):
+        raise RuntimeError("production tunnel metrics omitted Content-Type")
+    parts = [part.strip().lower() for part in value.split(";")]
+    if not parts or parts[0] != "text/plain":
+        raise RuntimeError("production tunnel metrics returned an unsupported Content-Type")
+    parameters: dict[str, str] = {}
+    for raw in parts[1:]:
+        if "=" not in raw:
+            raise RuntimeError("production tunnel metrics returned an invalid Content-Type")
+        key, parameter = (item.strip() for item in raw.split("=", 1))
+        if not key or not parameter or key in parameters:
+            raise RuntimeError("production tunnel metrics returned an invalid Content-Type")
+        parameters[key] = parameter
+    if parameters != {
+        "version": "0.0.4",
+        "charset": "utf-8",
+        "escaping": "underscores",
+    }:
+        raise RuntimeError("production tunnel metrics returned an unsupported Content-Type")
+
+
 MCP_STREAMABLE_PROTOCOL_VERSION = "2025-03-26"
 MCP_STREAMABLE_ACCEPT = "application/json, text/event-stream"
 
@@ -928,6 +1143,36 @@ def _main_channel(status: dict[str, Any], label: str) -> dict[str, Any]:
     return main
 
 
+def _production_tunnel_main_channel(status: dict[str, Any]) -> dict[str, Any]:
+    channels = status.get("channels")
+    if isinstance(channels, dict):
+        main = channels.get("main")
+    elif isinstance(channels, list):
+        matches = [
+            item
+            for item in channels
+            if isinstance(item, dict) and item.get("channel", item.get("name")) == "main"
+        ]
+        main = matches[0] if len(matches) == 1 else None
+    else:
+        main = None
+    if not isinstance(main, dict):
+        raise RuntimeError("production tunnel status has no unique main channel")
+    enabled = main.get("enabled")
+    probe_status = main.get("probe_status")
+    if enabled is True and probe_status == "ok":
+        return main
+    if enabled is True and probe_status in {"pending", "probing", "starting"}:
+        raise _TransientTunnelReadinessError(
+            f"production tunnel status main channel is still {probe_status}"
+        )
+    if enabled is False:
+        raise RuntimeError("production tunnel status main channel is disabled")
+    if probe_status == "failed":
+        raise RuntimeError("production tunnel status main channel probe failed")
+    raise RuntimeError("production tunnel status main channel readiness is unknown")
+
+
 def _event_timestamp(value: Any) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
@@ -947,29 +1192,31 @@ def _event_timestamp(value: Any) -> float | None:
     return parsed.timestamp()
 
 
-def _verify_tunnel_operational(
-    layout: dict[str, Path],
+def _read_tunnel_startup_event_chain(
+    log_path: Path,
     *,
     expected_tunnel_id: str,
     started_at: float,
-) -> dict[str, Any]:
-    health_url, parsed = _read_loopback_url_file(
-        layout["tunnel_health_url"], "production tunnel health URL"
+    verification_time: float,
+) -> list[dict[str, Any]]:
+    try:
+        log_path.lstat()
+    except FileNotFoundError as error:
+        raise _TransientTunnelStartupEventError(
+            "production tunnel log has not been created yet"
+        ) from error
+    _validate_private_source(log_path, "production tunnel log")
+    expected_events = (
+        ("mcp session initialized", "mcpclient"),
+        ("tunnel metadata fetched", "controlplane"),
+        ("🟢 tunnel-client started", None),
     )
-    status_url = urllib.parse.urlunsplit(
-        (parsed.scheme, parsed.netloc, "/api/status", "", "")
-    )
-    status = _request_json(
-        urllib.request.Request(status_url, method="GET", headers={"Accept": "application/json"}),
-        "production tunnel status",
-    )
-    if status.get("control_plane_tunnel_id") != expected_tunnel_id:
-        raise RuntimeError("production tunnel status control_plane_tunnel_id mismatch")
-    _main_channel(status, "production tunnel status")
-
-    _validate_private_source(layout["tunnel_log"], "production tunnel log")
-    polling_event: dict[str, Any] | None = None
-    for raw in layout["tunnel_log"].read_text(encoding="utf-8", errors="replace").splitlines():
+    event_names = tuple(item[0] for item in expected_events)
+    operational_events: list[dict[str, Any]] = []
+    client_instance_id: str | None = None
+    tunnel_name: str | None = None
+    last_event_at: float | None = None
+    for raw in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
             event = json.loads(raw)
         except json.JSONDecodeError:
@@ -979,20 +1226,186 @@ def _verify_tunnel_operational(
         observed_at = _event_timestamp(
             event.get("timestamp", event.get("time", event.get("ts")))
         )
-        message = " ".join(
-            str(event.get(key) or "")
-            for key in ("event", "message", "msg", "status", "component", "state")
-        ).lower()
-        if observed_at is not None and observed_at >= started_at and "polling" in message and "operational" in message:
-            polling_event = event
-            break
-    if polling_event is None:
-        raise RuntimeError("production tunnel log has no fresh polling operational event after started_at")
+        if observed_at is not None and not math.isfinite(observed_at):
+            raise RuntimeError("production tunnel structured event timestamp is not finite")
+        if observed_at is None or observed_at < started_at:
+            continue
+        if observed_at > verification_time + TUNNEL_HEALTH_FUTURE_TOLERANCE_SECONDS:
+            raise RuntimeError("production tunnel structured event timestamp is in the future")
+        fields = event.get("fields")
+        nested = fields if isinstance(fields, dict) else {}
+
+        def event_value(key: str) -> Any:
+            return event[key] if key in event else nested.get(key)
+
+        event_name = event_value("msg")
+        if event_name is None:
+            event_name = event_value("message")
+        if event_name is None:
+            event_name = event_value("event")
+        if not isinstance(event_name, str) or event_name not in event_names:
+            continue
+        stage = event_names.index(event_name)
+        if stage == 0:
+            operational_events = []
+            client_instance_id = None
+            tunnel_name = None
+            last_event_at = None
+        elif stage != len(operational_events):
+            raise RuntimeError("production tunnel structured event chain is out of order")
+
+        if event_value("tunnel_id") != expected_tunnel_id:
+            raise RuntimeError("production tunnel structured event tunnel_id mismatch")
+        if event_value("component") != expected_events[stage][1]:
+            raise RuntimeError("production tunnel structured event component mismatch")
+        observed_instance = event_value("client_instance_id")
+        if not isinstance(observed_instance, str) or not observed_instance.strip():
+            raise RuntimeError("production tunnel structured event client_instance_id is missing")
+        if client_instance_id is None:
+            client_instance_id = observed_instance
+        elif observed_instance != client_instance_id:
+            raise RuntimeError("production tunnel structured event client_instance_id mismatch")
+        if last_event_at is not None and observed_at < last_event_at:
+            raise RuntimeError("production tunnel structured event timestamps are out of order")
+        last_event_at = observed_at
+        if stage == 0:
+            if event_value("server_name") != "catdesk":
+                raise RuntimeError("production tunnel MCP init event server_name mismatch")
+            protocol_version = event_value("protocol_version")
+            if not isinstance(protocol_version, str) or not protocol_version.strip():
+                raise RuntimeError("production tunnel MCP init event protocol_version is missing")
+        elif stage == 1:
+            observed_name = event_value("name")
+            if not isinstance(observed_name, str) or not observed_name.strip():
+                raise RuntimeError("production tunnel metadata event name is missing")
+            tunnel_name = observed_name
+        else:
+            if event_value("name") != tunnel_name:
+                raise RuntimeError("production tunnel started event name mismatch")
+            observed_version = event_value("version")
+            if not isinstance(observed_version, str) or not observed_version.strip():
+                raise RuntimeError("production tunnel started event version is missing")
+        operational_events.append(event)
+        if len(operational_events) == len(expected_events):
+            return operational_events
+    raise _TransientTunnelStartupEventError(
+        "production tunnel log has no fresh structured operational event chain"
+    )
+
+
+def _verify_tunnel_operational(
+    layout: dict[str, Path],
+    *,
+    expected_tunnel_id: str,
+    started_at: float,
+    retry_transient_metrics: bool = False,
+    expected_process_identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if (
+        isinstance(started_at, bool)
+        or not isinstance(started_at, (int, float))
+        or not math.isfinite(float(started_at))
+    ):
+        raise RuntimeError("production tunnel started_at must be finite")
+    deadline = (
+        time.monotonic() + TUNNEL_POLL_STARTUP_TIMEOUT_SECONDS
+        if retry_transient_metrics
+        else None
+    )
+    health_url: str | None = None
+    operational_events: list[dict[str, Any]] | None = None
+
+    def wait_for_transient(error: _TransientTunnelReadinessError, label: str) -> None:
+        if not retry_transient_metrics:
+            raise error
+        if deadline is None or time.monotonic() >= deadline:
+            raise RuntimeError(f"production tunnel {label} retry deadline expired") from error
+        time.sleep(TUNNEL_POLL_RETRY_INTERVAL_SECONDS)
+
+    def read_health_url() -> tuple[str, urllib.parse.SplitResult]:
+        try:
+            layout["tunnel_health_url"].lstat()
+        except FileNotFoundError as error:
+            if health_url is not None:
+                raise RuntimeError("production tunnel health URL disappeared after pinning") from error
+            raise _TransientTunnelReadinessError(
+                "production tunnel health URL has not been created yet"
+            ) from error
+        return _read_loopback_url_file(
+            layout["tunnel_health_url"], "production tunnel health URL"
+        )
+
+    while True:
+        if expected_process_identity is not None and not _process_identity_matches(
+            expected_process_identity
+        ):
+            raise RuntimeError("production tunnel process identity drifted during startup")
+        try:
+            observed_health_url, parsed = read_health_url()
+        except _TransientTunnelReadinessError as error:
+            wait_for_transient(error, "health URL readiness")
+            continue
+        if health_url is None:
+            health_url = observed_health_url
+        elif observed_health_url != health_url:
+            raise RuntimeError("production tunnel health URL drifted after pinning")
+        status_url = urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, "/api/status", "", "")
+        )
+        status_request = urllib.request.Request(
+            status_url, method="GET", headers={"Accept": "application/json"}
+        )
+        status_raw, _ = _request_tunnel_health_bytes(
+            status_request, "production tunnel status"
+        )
+        status = _decode_json_or_sse(status_raw, "production tunnel status")
+        if status.get("control_plane_tunnel_id") != expected_tunnel_id:
+            raise RuntimeError("production tunnel status control_plane_tunnel_id mismatch")
+        try:
+            _production_tunnel_main_channel(status)
+            if operational_events is None:
+                operational_events = _read_tunnel_startup_event_chain(
+                    layout["tunnel_log"],
+                    expected_tunnel_id=expected_tunnel_id,
+                    started_at=float(started_at),
+                    verification_time=time.time(),
+                )
+        except _TransientTunnelReadinessError as error:
+            wait_for_transient(error, "startup readiness")
+            continue
+        metrics_url = urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, "/metrics", "", "")
+        )
+        metrics_request = urllib.request.Request(
+            metrics_url, method="GET", headers={"Accept": "text/plain"}
+        )
+        metrics_raw, metrics_content_type = _request_tunnel_health_bytes(
+            metrics_request, "production tunnel metrics"
+        )
+        _validate_prometheus_content_type(metrics_content_type)
+        try:
+            poll_metrics = _parse_controlplane_poll_metrics(
+                metrics_raw, started_at=started_at, now=time.time()
+            )
+        except _TransientTunnelMetricsError as error:
+            wait_for_transient(error, "controlplane poll readiness")
+            continue
+        if expected_process_identity is not None and not _process_identity_matches(
+            expected_process_identity
+        ):
+            raise RuntimeError("production tunnel process identity drifted before readiness")
+        final_health_url, _ = read_health_url()
+        if final_health_url != health_url:
+            raise RuntimeError("production tunnel health URL drifted before readiness")
+        break
+    if health_url is None:
+        raise RuntimeError("production tunnel health URL was not pinned")
     return {
         "ok": True,
         "health_url": health_url,
         "control_plane_tunnel_id": expected_tunnel_id,
-        "polling_event": polling_event,
+        "startup_operational_events": operational_events,
+        "controlplane_poll_metrics": poll_metrics,
     }
 
 
@@ -1464,7 +1877,12 @@ def _require_exact_tunnel_id_owners(
         raise RuntimeError("same tunnel-id owner does not match the exact expected MCP endpoint")
 
 
-def production_tunnel_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict[str, Any]:
+def production_tunnel_status(
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+    *,
+    retry_transient_metrics: bool = False,
+) -> dict[str, Any]:
     _validate_manifest_contract(manifest)
     try:
         expected = _validate_tunnel_profile(
@@ -1532,6 +1950,8 @@ def production_tunnel_status(manifest: dict[str, Any], layout: dict[str, Path]) 
                 layout,
                 expected_tunnel_id=item["tunnel_id"],
                 started_at=float(started_at),
+                retry_transient_metrics=retry_transient_metrics,
+                expected_process_identity=recorded_identity,
             )
         except RuntimeError as error:
             canonical = False
@@ -1814,7 +2234,9 @@ def _start_production_tunnel(
         if item.get("process_identity") != identity:
             raise RuntimeError("production tunnel identity changed during startup")
         _record_production_tunnel(manifest, layout, item, started_at=started_at)
-        verified = production_tunnel_status(manifest, layout)
+        verified = production_tunnel_status(
+            manifest, layout, retry_transient_metrics=True
+        )
         if verified.get("ready") is not True or verified.get("pid") != item["pid"]:
             raise RuntimeError("production tunnel did not satisfy its post-start status fence")
         return item
@@ -1822,7 +2244,7 @@ def _start_production_tunnel(
         cleanup_errors: list[str] = []
         try:
             if identity is not None:
-                _stop_verified_process_identity(identity)
+                _stop_verified_process_identity(identity, process=process)
             elif process.poll() is None:
                 process.terminate()
                 process.wait(timeout=5)
@@ -2588,7 +3010,9 @@ def start_local_runtime(manifest: dict[str, Any], layout: dict[str, Path]) -> di
         for process, identity, process_group in reversed(started):
             try:
                 if identity is not None:
-                    _stop_verified_process_identity(identity, process_group=process_group)
+                    _stop_verified_process_identity(
+                        identity, process_group=process_group, process=process
+                    )
                 elif process.poll() is None:
                     if process_group:
                         os.killpg(process.pid, signal.SIGTERM)
@@ -2736,6 +3160,43 @@ def _pid_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _process_is_running(pid: int) -> bool:
+    if not _pid_alive(pid):
+        return False
+    try:
+        state = _ps_process_field(pid, "state")
+    except RuntimeError:
+        # An existing process whose state cannot be proven is still treated as
+        # running; callers must not infer safe termination from missing data.
+        return True
+    return not state.startswith("Z")
+
+
+def _process_group_has_running_members(pgid: int) -> bool:
+    completed = subprocess.run(
+        ["ps", "-ww", "-axo", "pid=,pgid=,state="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("cannot enumerate process group members")
+    for raw in completed.stdout.splitlines():
+        pieces = raw.strip().split()
+        if len(pieces) != 3:
+            raise RuntimeError("cannot parse process group member enumeration")
+        try:
+            observed_pid = int(pieces[0])
+            observed_pgid = int(pieces[1])
+        except ValueError:
+            raise RuntimeError("cannot parse process group member enumeration")
+        if observed_pid < 1 or observed_pgid < 1:
+            raise RuntimeError("cannot parse process group member enumeration")
+        if observed_pgid == pgid and not pieces[2].startswith("Z"):
+            return True
+    return False
 
 
 def _pid_command(pid: int) -> str:
@@ -3029,20 +3490,45 @@ def _process_identity_matches(identity: dict[str, Any]) -> bool:
 
 
 def _stop_verified_process_identity(
-    identity: dict[str, Any], *, process_group: bool = False
+    identity: dict[str, Any],
+    *,
+    process_group: bool = False,
+    process: subprocess.Popen[Any] | None = None,
 ) -> None:
     expected = _validate_process_identity_record(identity)
     pid = expected["pid"]
-    if not _process_identity_matches(expected):
-        raise RuntimeError(f"refusing to stop process {pid} whose exact identity changed")
-    if process_group:
-        if expected["pgid"] != pid or os.getpgid(pid) != pid:
+    if process is not None and process.pid != pid:
+        raise RuntimeError("spawned process handle PID does not match verified identity")
+    process_exited = process is not None and process.poll() is not None
+    if process_exited:
+        if not process_group:
+            return
+        if expected["pgid"] != pid:
             raise RuntimeError(f"refusing to stop process group {pid}: identity is not group leader")
-        os.killpg(pid, signal.SIGTERM)
+        if not _process_group_has_running_members(pid):
+            return
+        raise RuntimeError(
+            f"refusing to stop process group {pid}: leader exited while members remain; "
+            "cannot exclude process-group ID reuse"
+        )
     else:
-        os.kill(pid, signal.SIGTERM)
+        if not _process_identity_matches(expected):
+            raise RuntimeError(f"refusing to stop process {pid} whose exact identity changed")
+        if process_group:
+            if expected["pgid"] != pid or os.getpgid(pid) != pid:
+                raise RuntimeError(f"refusing to stop process group {pid}: identity is not group leader")
+            os.killpg(pid, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
     for _ in range(50):
-        if not _pid_alive(pid):
+        running = (
+            _process_group_has_running_members(pid)
+            if process_group
+            else _process_is_running(pid)
+        )
+        if not running:
+            if process is not None and not process_exited:
+                process.wait(timeout=5)
             return
         time.sleep(0.1)
     raise RuntimeError(f"verified process {pid} did not stop after SIGTERM")

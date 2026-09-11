@@ -1123,7 +1123,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
             self.assertFalse(status["ready"])
             self.assertEqual(status["reason"], "multiple_active_tunnels")
 
-    def test_tunnel_operational_gate_requires_loopback_exact_status_and_fresh_polling_log(self):
+    def test_tunnel_operational_gate_requires_loopback_exact_status_and_fresh_structured_event_chain(self):
         manifest = self._manifest()
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
@@ -1137,7 +1137,37 @@ class ProductionConnectorContractTests(unittest.TestCase):
             layout["tunnel_health_url"].chmod(0o600)
             layout["tunnel_log"].parent.mkdir(parents=True)
             layout["tunnel_log"].write_text(
-                json.dumps({"timestamp": 1001.0, "message": "control-plane polling operational"}) + "\n",
+                "\n".join(
+                    json.dumps(event)
+                    for event in (
+                        {
+                            "timestamp": 1001.0,
+                            "component": "mcpclient",
+                            "msg": "mcp session initialized",
+                            "tunnel_id": "tunnel-production",
+                            "client_instance_id": "instance-production-1",
+                            "server_name": "catdesk",
+                            "protocol_version": "2026-07-28",
+                        },
+                        {
+                            "timestamp": 1002.0,
+                            "component": "controlplane",
+                            "msg": "tunnel metadata fetched",
+                            "tunnel_id": "tunnel-production",
+                            "client_instance_id": "instance-production-1",
+                            "name": "Production Connector",
+                        },
+                        {
+                            "timestamp": 1003.0,
+                            "msg": "🟢 tunnel-client started",
+                            "tunnel_id": "tunnel-production",
+                            "client_instance_id": "instance-production-1",
+                            "name": "Production Connector",
+                            "version": "0.0.14+test",
+                        },
+                    )
+                )
+                + "\n",
                 encoding="utf-8",
             )
             layout["tunnel_log"].chmod(0o600)
@@ -1147,18 +1177,50 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 "control_plane_tunnel_id": "tunnel-production",
                 "channels": {"main": {"enabled": True, "probe_status": "ok"}},
             }).encode("utf-8")
+            response.geturl.return_value = "http://127.0.0.1:49152/api/status"
             response.__enter__.return_value = response
-            with patch.object(pc.urllib.request, "urlopen", return_value=response) as urlopen:
-                observed = pc._verify_tunnel_operational(
-                    layout,
-                    expected_tunnel_id="tunnel-production",
-                    started_at=1000.0,
-                )
+            metrics_response = MagicMock()
+            metrics_response.status = 200
+            metrics_response.read.return_value = (
+                'commands_poll_cycles_total{otel_scope_name="controlplane",service_name="tunnel-client"} 21\n'
+                'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane",service_name="tunnel-client"} 1002.5\n'
+            ).encode("utf-8")
+            metrics_response.geturl.return_value = "http://127.0.0.1:49152/metrics"
+            metrics_response.headers.get.return_value = (
+                "text/plain; version=0.0.4; charset=utf-8; escaping=underscores"
+            )
+            metrics_response.__enter__.return_value = metrics_response
+            with patch.object(
+                pc.TUNNEL_HEALTH_OPENER, "open", side_effect=[response, metrics_response]
+            ) as open_request:
+                try:
+                    with patch.object(pc.time, "time", return_value=1003.0):
+                        observed = pc._verify_tunnel_operational(
+                            layout,
+                            expected_tunnel_id="tunnel-production",
+                            started_at=1000.0,
+                        )
+                except RuntimeError as error:
+                    self.fail(f"real tunnel startup event chain was rejected: {error}")
             self.assertTrue(observed["ok"])
-            self.assertEqual(urlopen.call_args.args[0].full_url, "http://127.0.0.1:49152/api/status")
+            self.assertEqual(
+                [event["msg"] for event in observed["startup_operational_events"]],
+                [
+                    "mcp session initialized",
+                    "tunnel metadata fetched",
+                    "🟢 tunnel-client started",
+                ],
+            )
+            self.assertEqual(
+                [call.args[0].full_url for call in open_request.call_args_list],
+                [
+                    "http://127.0.0.1:49152/api/status",
+                    "http://127.0.0.1:49152/metrics",
+                ],
+            )
 
             layout["tunnel_health_url"].write_text("https://api.openai.com/health\n", encoding="utf-8")
-            with patch.object(pc.urllib.request, "urlopen") as forbidden_request:
+            with patch.object(pc.TUNNEL_HEALTH_OPENER, "open") as forbidden_request:
                 with self.assertRaisesRegex(RuntimeError, "loopback"):
                     pc._verify_tunnel_operational(
                         layout,
@@ -1167,18 +1229,833 @@ class ProductionConnectorContractTests(unittest.TestCase):
                     )
             forbidden_request.assert_not_called()
 
-            layout["tunnel_health_url"].write_text("http://127.0.0.1:49152\n", encoding="utf-8")
+    def test_tunnel_startup_chain_rejects_future_or_incomplete_mcp_init_events(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest, runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
+            )
+            layout["tunnel_health_url"].parent.mkdir(parents=True)
+            layout["tunnel_health_url"].write_text(
+                "http://127.0.0.1:49152\n", encoding="utf-8"
+            )
+            layout["tunnel_health_url"].chmod(0o600)
+            layout["tunnel_log"].parent.mkdir(parents=True)
+            status_response = MagicMock()
+            status_response.status = 200
+            status_response.read.return_value = json.dumps({
+                "control_plane_tunnel_id": "tunnel-production",
+                "channels": {"main": {"enabled": True, "probe_status": "ok"}},
+            }).encode("utf-8")
+            status_response.geturl.return_value = "http://127.0.0.1:49152/api/status"
+            status_response.__enter__.return_value = status_response
+            base_events = [
+                {
+                    "timestamp": 1001.0,
+                    "component": "mcpclient",
+                    "msg": "mcp session initialized",
+                    "tunnel_id": "tunnel-production",
+                    "client_instance_id": "instance-production-1",
+                    "server_name": "catdesk",
+                    "protocol_version": "2026-07-28",
+                },
+                {
+                    "timestamp": 1002.0,
+                    "component": "controlplane",
+                    "msg": "tunnel metadata fetched",
+                    "tunnel_id": "tunnel-production",
+                    "client_instance_id": "instance-production-1",
+                    "name": "Production Connector",
+                },
+                {
+                    "timestamp": 1003.0,
+                    "msg": "🟢 tunnel-client started",
+                    "tunnel_id": "tunnel-production",
+                    "client_instance_id": "instance-production-1",
+                    "name": "Production Connector",
+                    "version": "0.0.14+test",
+                },
+            ]
+            variants = {
+                "future": [{**event, "timestamp": event["timestamp"] + 100.0} for event in base_events],
+                "nan_timestamp": [{**base_events[0], "timestamp": float("nan")}, *base_events[1:]],
+                "positive_infinite_timestamp": [
+                    {**base_events[0], "timestamp": float("inf")}, *base_events[1:]
+                ],
+                "negative_infinite_timestamp": [
+                    {**base_events[0], "timestamp": float("-inf")}, *base_events[1:]
+                ],
+                "missing_server": [
+                    {key: value for key, value in base_events[0].items() if key != "server_name"},
+                    *base_events[1:],
+                ],
+                "missing_protocol": [
+                    {key: value for key, value in base_events[0].items() if key != "protocol_version"},
+                    *base_events[1:],
+                ],
+                "fuzzy_legacy_message": [{
+                    "timestamp": 1001.0,
+                    "message": "control-plane polling operational",
+                    "tunnel_id": "tunnel-production",
+                }],
+                "wrong_tunnel": [
+                    base_events[0],
+                    {**base_events[1], "tunnel_id": "tunnel-other"},
+                    base_events[2],
+                ],
+                "mismatched_instance": [
+                    *base_events[:2],
+                    {**base_events[2], "client_instance_id": "instance-production-2"},
+                ],
+                "mismatched_name": [
+                    *base_events[:2],
+                    {**base_events[2], "name": "Different Connector"},
+                ],
+                "missing_version": [
+                    *base_events[:2],
+                    {key: value for key, value in base_events[2].items() if key != "version"},
+                ],
+            }
+            for name, events in variants.items():
+                with self.subTest(name=name):
+                    layout["tunnel_log"].write_text(
+                        "\n".join(json.dumps(event) for event in events) + "\n",
+                        encoding="utf-8",
+                    )
+                    layout["tunnel_log"].chmod(0o600)
+                    with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                        pc.TUNNEL_HEALTH_OPENER, "open", return_value=status_response
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            "finite|future|server_name|protocol_version|event chain|tunnel.?id|instance|name|version",
+                        ):
+                            pc._verify_tunnel_operational(
+                                layout,
+                                expected_tunnel_id="tunnel-production",
+                                started_at=1000.0,
+                            )
+
+            metrics_response = MagicMock()
+            metrics_response.status = 200
+            metrics_response.read.return_value = (
+                'commands_poll_cycles_total{otel_scope_name="controlplane"} 1\n'
+                'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 1002\n'
+            ).encode("utf-8")
+            metrics_response.geturl.return_value = "http://127.0.0.1:49152/metrics"
+            metrics_response.headers.get.return_value = (
+                "text/plain; version=0.0.4; charset=utf-8; escaping=underscores"
+            )
+            metrics_response.__enter__.return_value = metrics_response
             layout["tunnel_log"].write_text(
-                json.dumps({"timestamp": 999.0, "message": "control-plane polling operational"}) + "\n",
+                "\n".join(json.dumps(event) for event in base_events[:2]) + "\n",
                 encoding="utf-8",
             )
-            with patch.object(pc.urllib.request, "urlopen", return_value=response):
-                with self.assertRaisesRegex(RuntimeError, "started_at|fresh|polling"):
+            calls = 0
+
+            def complete_log_after_retry(*_args, **_kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    layout["tunnel_log"].write_text(
+                        "\n".join(json.dumps(event) for event in base_events) + "\n",
+                        encoding="utf-8",
+                    )
+                    layout["tunnel_log"].chmod(0o600)
+                return status_response if calls <= 2 else metrics_response
+
+            with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                pc.time, "monotonic", side_effect=[0.0, 0.0]
+            ), patch.object(pc.time, "sleep") as readiness_sleep, patch.object(
+                pc.TUNNEL_HEALTH_OPENER, "open", side_effect=complete_log_after_retry
+            ) as readiness_open:
+                pc._verify_tunnel_operational(
+                    layout,
+                    expected_tunnel_id="tunnel-production",
+                    started_at=1000.0,
+                    retry_transient_metrics=True,
+                )
+            self.assertEqual(readiness_open.call_count, 3)
+            readiness_sleep.assert_called_once()
+
+            layout["tunnel_log"].write_text(
+                "\n".join(json.dumps(event) for event in base_events[:2]) + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                pc.time, "monotonic", side_effect=[0.0, 0.0, 6.0]
+            ), patch.object(pc.time, "sleep") as readiness_sleep, patch.object(
+                pc.TUNNEL_HEALTH_OPENER,
+                "open",
+                side_effect=[status_response, status_response],
+            ) as readiness_open:
+                with self.assertRaisesRegex(RuntimeError, "deadline|event chain"):
                     pc._verify_tunnel_operational(
                         layout,
                         expected_tunnel_id="tunnel-production",
                         started_at=1000.0,
+                        retry_transient_metrics=True,
                     )
+            self.assertEqual(readiness_open.call_count, 2)
+            readiness_sleep.assert_called_once()
+
+            layout["tunnel_log"].write_text(
+                "\n".join(
+                    json.dumps(event)
+                    for event in [
+                        base_events[0],
+                        {**base_events[1], "component": "wrong"},
+                        base_events[2],
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                pc.time, "monotonic", return_value=0.0
+            ), patch.object(pc.time, "sleep") as readiness_sleep, patch.object(
+                pc.TUNNEL_HEALTH_OPENER, "open", return_value=status_response
+            ) as readiness_open:
+                with self.assertRaisesRegex(RuntimeError, "component"):
+                    pc._verify_tunnel_operational(
+                        layout,
+                        expected_tunnel_id="tunnel-production",
+                        started_at=1000.0,
+                        retry_transient_metrics=True,
+                    )
+            readiness_open.assert_called_once()
+            readiness_sleep.assert_not_called()
+
+    def test_tunnel_activation_retry_preserves_identity_origin_and_error_classification(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest, runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
+            )
+            layout["tunnel_health_url"].parent.mkdir(parents=True)
+            layout["tunnel_log"].parent.mkdir(parents=True, exist_ok=True)
+            events = [
+                {
+                    "timestamp": 1001.0,
+                    "component": "mcpclient",
+                    "msg": "mcp session initialized",
+                    "tunnel_id": "tunnel-production",
+                    "client_instance_id": "instance-1",
+                    "server_name": "catdesk",
+                    "protocol_version": "2026-07-28",
+                },
+                {
+                    "timestamp": 1002.0,
+                    "component": "controlplane",
+                    "msg": "tunnel metadata fetched",
+                    "tunnel_id": "tunnel-production",
+                    "client_instance_id": "instance-1",
+                    "name": "Production Connector",
+                },
+                {
+                    "timestamp": 1003.0,
+                    "msg": "🟢 tunnel-client started",
+                    "tunnel_id": "tunnel-production",
+                    "client_instance_id": "instance-1",
+                    "name": "Production Connector",
+                    "version": "0.0.14+test",
+                },
+            ]
+            event_text = "\n".join(json.dumps(event) for event in events) + "\n"
+
+            def response(url: str, body: bytes, content_type: str = "application/json"):
+                observed = MagicMock()
+                observed.status = 200
+                observed.read.return_value = body
+                observed.geturl.return_value = url
+                observed.headers.get.return_value = content_type
+                observed.__enter__.return_value = observed
+                return observed
+
+            status_body = json.dumps({
+                "control_plane_tunnel_id": "tunnel-production",
+                "channels": {"main": {"enabled": True, "probe_status": "ok"}},
+            }).encode("utf-8")
+            ready_status = response("http://127.0.0.1:49152/api/status", status_body)
+            fresh_metrics_body = (
+                'commands_poll_cycles_total{otel_scope_name="controlplane"} 1\n'
+                'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 1002\n'
+            ).encode("utf-8")
+            stale_metrics_body = fresh_metrics_body.replace(b" 1\n", b" 0\n", 1)
+            fresh_metrics = response(
+                "http://127.0.0.1:49152/metrics",
+                fresh_metrics_body,
+                "text/plain; version=0.0.4; charset=utf-8; escaping=underscores",
+            )
+            stale_metrics = response(
+                "http://127.0.0.1:49152/metrics",
+                stale_metrics_body,
+                "text/plain; version=0.0.4; charset=utf-8; escaping=underscores",
+            )
+            identity = self._identity(303, ["/opt/tunnel-client", "run"])
+
+            materialize_count = 0
+
+            def materialize_missing_readiness(_seconds):
+                nonlocal materialize_count
+                materialize_count += 1
+                if materialize_count == 1:
+                    layout["tunnel_health_url"].write_text(
+                        "http://127.0.0.1:49152\n", encoding="utf-8"
+                    )
+                    layout["tunnel_health_url"].chmod(0o600)
+                else:
+                    layout["tunnel_log"].write_text(event_text, encoding="utf-8")
+                    layout["tunnel_log"].chmod(0o600)
+
+            with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                pc.time, "monotonic", side_effect=[0.0, 0.0, 0.0]
+            ), patch.object(
+                pc.time, "sleep", side_effect=materialize_missing_readiness
+            ) as readiness_sleep, patch.object(
+                pc, "_process_identity_matches", return_value=True
+            ) as identity_check, patch.object(
+                pc.TUNNEL_HEALTH_OPENER,
+                "open",
+                side_effect=[ready_status, ready_status, fresh_metrics],
+            ):
+                pc._verify_tunnel_operational(
+                    layout,
+                    expected_tunnel_id="tunnel-production",
+                    started_at=1000.0,
+                    retry_transient_metrics=True,
+                    expected_process_identity=identity,
+                )
+            self.assertEqual(readiness_sleep.call_count, 2)
+            self.assertEqual(identity_check.call_count, 4)
+
+            pending_status = response(
+                "http://127.0.0.1:49152/api/status",
+                json.dumps({
+                    "control_plane_tunnel_id": "tunnel-production",
+                    "channels": {"main": {"enabled": True, "probe_status": "probing"}},
+                }).encode("utf-8"),
+            )
+            with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                pc.time, "monotonic", side_effect=[0.0, 0.0]
+            ), patch.object(pc.time, "sleep") as pending_sleep, patch.object(
+                pc.TUNNEL_HEALTH_OPENER,
+                "open",
+                side_effect=[pending_status, ready_status, fresh_metrics],
+            ):
+                pc._verify_tunnel_operational(
+                    layout,
+                    expected_tunnel_id="tunnel-production",
+                    started_at=1000.0,
+                    retry_transient_metrics=True,
+                )
+            pending_sleep.assert_called_once()
+
+            with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                pc.time, "monotonic", side_effect=[0.0, 0.0, 6.0]
+            ), patch.object(pc.time, "sleep") as pending_sleep, patch.object(
+                pc.TUNNEL_HEALTH_OPENER, "open", side_effect=[pending_status, pending_status]
+            ):
+                with self.assertRaisesRegex(RuntimeError, "deadline|status"):
+                    pc._verify_tunnel_operational(
+                        layout,
+                        expected_tunnel_id="tunnel-production",
+                        started_at=1000.0,
+                        retry_transient_metrics=True,
+                    )
+            pending_sleep.assert_called_once()
+
+            with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                pc.time, "monotonic", return_value=0.0
+            ), patch.object(pc.time, "sleep") as forbidden_sleep, patch.object(
+                pc, "_process_identity_matches", side_effect=[True, False]
+            ), patch.object(
+                pc.TUNNEL_HEALTH_OPENER, "open", side_effect=[ready_status, fresh_metrics]
+            ):
+                with self.assertRaisesRegex(RuntimeError, "identity"):
+                    pc._verify_tunnel_operational(
+                        layout,
+                        expected_tunnel_id="tunnel-production",
+                        started_at=1000.0,
+                        retry_transient_metrics=True,
+                        expected_process_identity=identity,
+                    )
+            forbidden_sleep.assert_not_called()
+
+            def drift_health_url(_seconds):
+                layout["tunnel_health_url"].write_text(
+                    "http://127.0.0.1:49153\n", encoding="utf-8"
+                )
+
+            with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                pc.time, "monotonic", side_effect=[0.0, 0.0]
+            ), patch.object(pc.time, "sleep", side_effect=drift_health_url), patch.object(
+                pc.TUNNEL_HEALTH_OPENER,
+                "open",
+                side_effect=[ready_status, stale_metrics, ready_status, fresh_metrics],
+            ) as drift_open:
+                with self.assertRaisesRegex(RuntimeError, "health URL|drift"):
+                    pc._verify_tunnel_operational(
+                        layout,
+                        expected_tunnel_id="tunnel-production",
+                        started_at=1000.0,
+                        retry_transient_metrics=True,
+                    )
+            self.assertEqual(drift_open.call_count, 2)
+
+            layout["tunnel_health_url"].write_text(
+                "http://127.0.0.1:49152\n", encoding="utf-8"
+            )
+            duplicate_metrics = response(
+                "http://127.0.0.1:49152/metrics",
+                fresh_metrics_body
+                + b'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 1002\n',
+                "text/plain; version=0.0.4; charset=utf-8; escaping=underscores",
+            )
+            with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                pc.time, "monotonic", return_value=0.0
+            ), patch.object(pc.time, "sleep") as forbidden_sleep, patch.object(
+                pc.TUNNEL_HEALTH_OPENER,
+                "open",
+                side_effect=[ready_status, duplicate_metrics],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "unique|duplicate"):
+                    pc._verify_tunnel_operational(
+                        layout,
+                        expected_tunnel_id="tunnel-production",
+                        started_at=1000.0,
+                        retry_transient_metrics=True,
+                    )
+            forbidden_sleep.assert_not_called()
+
+            wrong_id_status = response(
+                "http://127.0.0.1:49152/api/status",
+                status_body.replace(b"tunnel-production", b"tunnel-other"),
+            )
+            with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                pc.time, "monotonic", side_effect=[0.0, 0.0]
+            ), patch.object(pc.time, "sleep") as one_sleep, patch.object(
+                pc.TUNNEL_HEALTH_OPENER,
+                "open",
+                side_effect=[ready_status, stale_metrics, wrong_id_status],
+            ) as id_drift_open:
+                with self.assertRaisesRegex(RuntimeError, "tunnel_id mismatch"):
+                    pc._verify_tunnel_operational(
+                        layout,
+                        expected_tunnel_id="tunnel-production",
+                        started_at=1000.0,
+                        retry_transient_metrics=True,
+                    )
+            one_sleep.assert_called_once()
+            self.assertEqual(id_drift_open.call_count, 3)
+
+            with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                pc.time, "monotonic", side_effect=[0.0, 0.0]
+            ), patch.object(pc.time, "sleep") as one_sleep, patch.object(
+                pc, "_process_identity_matches", side_effect=[True, False]
+            ), patch.object(
+                pc.TUNNEL_HEALTH_OPENER, "open", side_effect=[ready_status, stale_metrics]
+            ) as identity_drift_open:
+                with self.assertRaisesRegex(RuntimeError, "identity"):
+                    pc._verify_tunnel_operational(
+                        layout,
+                        expected_tunnel_id="tunnel-production",
+                        started_at=1000.0,
+                        retry_transient_metrics=True,
+                        expected_process_identity=identity,
+                    )
+            one_sleep.assert_called_once()
+            self.assertEqual(identity_drift_open.call_count, 2)
+
+            for enabled, probe_status in ((False, "pending"), (True, "failed"), (True, "mystery")):
+                with self.subTest(enabled=enabled, probe_status=probe_status):
+                    invalid_status = response(
+                        "http://127.0.0.1:49152/api/status",
+                        json.dumps({
+                            "control_plane_tunnel_id": "tunnel-production",
+                            "channels": {
+                                "main": {"enabled": enabled, "probe_status": probe_status}
+                            },
+                        }).encode("utf-8"),
+                    )
+                    with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                        pc.time, "monotonic", return_value=0.0
+                    ), patch.object(pc.time, "sleep") as forbidden_sleep, patch.object(
+                        pc.TUNNEL_HEALTH_OPENER, "open", return_value=invalid_status
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "disabled|failed|unknown"
+                        ):
+                            pc._verify_tunnel_operational(
+                                layout,
+                                expected_tunnel_id="tunnel-production",
+                                started_at=1000.0,
+                                retry_transient_metrics=True,
+                            )
+                    forbidden_sleep.assert_not_called()
+
+            layout["tunnel_health_url"].write_text(
+                "https://api.openai.com/health\n", encoding="utf-8"
+            )
+            with patch.object(pc.time, "monotonic", return_value=0.0), patch.object(
+                pc.time, "sleep"
+            ) as forbidden_sleep, patch.object(
+                pc.TUNNEL_HEALTH_OPENER, "open"
+            ) as forbidden_open:
+                with self.assertRaisesRegex(RuntimeError, "loopback"):
+                    pc._verify_tunnel_operational(
+                        layout,
+                        expected_tunnel_id="tunnel-production",
+                        started_at=1000.0,
+                        retry_transient_metrics=True,
+                    )
+            forbidden_sleep.assert_not_called()
+            forbidden_open.assert_not_called()
+
+    def test_tunnel_poll_metrics_require_unique_finite_fresh_controlplane_samples(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest, runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
+            )
+            layout["tunnel_health_url"].parent.mkdir(parents=True)
+            layout["tunnel_health_url"].write_text(
+                "http://127.0.0.1:49152\n", encoding="utf-8"
+            )
+            layout["tunnel_health_url"].chmod(0o600)
+            layout["tunnel_log"].parent.mkdir(parents=True)
+            layout["tunnel_log"].write_text(
+                "\n".join(json.dumps(event) for event in (
+                    {
+                        "timestamp": 1001.0,
+                        "component": "mcpclient",
+                        "msg": "mcp session initialized",
+                        "tunnel_id": "tunnel-production",
+                        "client_instance_id": "instance-production-1",
+                        "server_name": "catdesk",
+                        "protocol_version": "2026-07-28",
+                    },
+                    {
+                        "timestamp": 1002.0,
+                        "component": "controlplane",
+                        "msg": "tunnel metadata fetched",
+                        "tunnel_id": "tunnel-production",
+                        "client_instance_id": "instance-production-1",
+                        "name": "Production Connector",
+                    },
+                    {
+                        "timestamp": 1003.0,
+                        "msg": "🟢 tunnel-client started",
+                        "tunnel_id": "tunnel-production",
+                        "client_instance_id": "instance-production-1",
+                        "name": "Production Connector",
+                        "version": "0.0.14+test",
+                    },
+                )) + "\n",
+                encoding="utf-8",
+            )
+            layout["tunnel_log"].chmod(0o600)
+            status_response = MagicMock()
+            status_response.status = 200
+            status_response.read.return_value = json.dumps({
+                "control_plane_tunnel_id": "tunnel-production",
+                "channels": {"main": {"enabled": True, "probe_status": "ok"}},
+            }).encode("utf-8")
+            status_response.geturl.return_value = "http://127.0.0.1:49152/api/status"
+            status_response.__enter__.return_value = status_response
+            bad_metrics = {
+                "missing": 'commands_poll_cycles_total{otel_scope_name="controlplane"} 2\n',
+                "duplicate": (
+                    'commands_poll_cycles_total{otel_scope_name="controlplane"} 2\n'
+                    'commands_poll_cycles_total{otel_scope_name="controlplane",copy="two"} 3\n'
+                    'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 1002\n'
+                ),
+                "duplicate_last_success": (
+                    'commands_poll_cycles_total{otel_scope_name="controlplane"} 2\n'
+                    'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 1002\n'
+                    'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane",copy="two"} 1002\n'
+                ),
+                "mismatched_series_labels": (
+                    'commands_poll_cycles_total{otel_scope_name="controlplane",instance="one"} 2\n'
+                    'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane",instance="two"} 1002\n'
+                ),
+                "wrong_service": (
+                    'commands_poll_cycles_total{otel_scope_name="controlplane",service_name="other"} 2\n'
+                    'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 1002\n'
+                ),
+                "non_numeric": (
+                    'commands_poll_cycles_total{otel_scope_name="controlplane"} nope\n'
+                    'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 1002\n'
+                ),
+                "nan": (
+                    'commands_poll_cycles_total{otel_scope_name="controlplane"} NaN\n'
+                    'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 1002\n'
+                ),
+                "infinite": (
+                    'commands_poll_cycles_total{otel_scope_name="controlplane"} +Inf\n'
+                    'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 1002\n'
+                ),
+                "negative_infinite_cycles": (
+                    'commands_poll_cycles_total{otel_scope_name="controlplane"} -Inf\n'
+                    'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 1002\n'
+                ),
+                "nan_last_success": (
+                    'commands_poll_cycles_total{otel_scope_name="controlplane"} 2\n'
+                    'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} NaN\n'
+                ),
+                "positive_infinite_last_success": (
+                    'commands_poll_cycles_total{otel_scope_name="controlplane"} 2\n'
+                    'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} +Inf\n'
+                ),
+                "negative_infinite_last_success": (
+                    'commands_poll_cycles_total{otel_scope_name="controlplane"} 2\n'
+                    'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} -Inf\n'
+                ),
+                "negative_last_success": (
+                    'commands_poll_cycles_total{otel_scope_name="controlplane"} 2\n'
+                    'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} -1\n'
+                ),
+                "zero_cycles": (
+                    'commands_poll_cycles_total{otel_scope_name="controlplane"} 0\n'
+                    'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 1002\n'
+                ),
+                "fractional_cycles": (
+                    'commands_poll_cycles_total{otel_scope_name="controlplane"} 1.5\n'
+                    'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 1002\n'
+                ),
+                "old": (
+                    'commands_poll_cycles_total{otel_scope_name="controlplane"} 2\n'
+                    'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 999\n'
+                ),
+                "future": (
+                    'commands_poll_cycles_total{otel_scope_name="controlplane"} 2\n'
+                    'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 1100\n'
+                ),
+            }
+            for name, metrics in bad_metrics.items():
+                with self.subTest(name=name):
+                    metrics_response = MagicMock()
+                    metrics_response.status = 200
+                    metrics_response.read.return_value = metrics.encode("utf-8")
+                    metrics_response.geturl.return_value = "http://127.0.0.1:49152/metrics"
+                    metrics_response.headers.get.return_value = (
+                        "text/plain; version=0.0.4; charset=utf-8; escaping=underscores"
+                    )
+                    metrics_response.__enter__.return_value = metrics_response
+                    with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                        pc.TUNNEL_HEALTH_OPENER,
+                        "open",
+                        side_effect=[status_response, metrics_response],
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "metrics|sample|finite|cycles|success|future|fresh|labels"
+                        ):
+                            pc._verify_tunnel_operational(
+                                layout,
+                                expected_tunnel_id="tunnel-production",
+                                started_at=1000.0,
+                            )
+
+            same_second_metrics = MagicMock()
+            same_second_metrics.status = 200
+            same_second_metrics.read.return_value = (
+                'commands_poll_cycles_total{otel_scope_name="controlplane"} 1\n'
+                'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 1000\n'
+            ).encode("utf-8")
+            same_second_metrics.geturl.return_value = "http://127.0.0.1:49152/metrics"
+            same_second_metrics.headers.get.return_value = (
+                "text/plain; version=0.0.4; charset=utf-8; escaping=underscores"
+            )
+            same_second_metrics.__enter__.return_value = same_second_metrics
+            with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                pc.TUNNEL_HEALTH_OPENER,
+                "open",
+                side_effect=[status_response, same_second_metrics],
+            ):
+                try:
+                    same_second = pc._verify_tunnel_operational(
+                        layout,
+                        expected_tunnel_id="tunnel-production",
+                        started_at=1000.9,
+                    )
+                except RuntimeError as error:
+                    self.fail(f"same-second integer poll metric was rejected: {error}")
+            self.assertEqual(
+                same_second["controlplane_poll_metrics"]["last_successful_timestamp"],
+                1000.0,
+            )
+            valid_metric_bytes = (
+                'commands_poll_cycles_total{otel_scope_name="controlplane"} 1\n'
+                'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 1000\n'
+            ).encode("utf-8")
+            for name, started_at, now in (
+                ("nonfinite_started_at", float("nan"), 1003.0),
+                ("nonfinite_now", 1000.0, float("inf")),
+                ("future_started_at", 1006.0, 1003.0),
+            ):
+                with self.subTest(time_bound=name):
+                    with self.assertRaisesRegex(RuntimeError, "finite|future"):
+                        pc._parse_controlplane_poll_metrics(
+                            valid_metric_bytes, started_at=started_at, now=now
+                        )
+            future_boundary_metrics = valid_metric_bytes.replace(b" 1000\n", b" 1005\n")
+            try:
+                pc._parse_controlplane_poll_metrics(
+                    future_boundary_metrics, started_at=1000.0, now=1003.0
+                )
+            except RuntimeError as error:
+                self.fail(f"exact +2 second metrics boundary was rejected: {error}")
+
+            stale_metrics_response = MagicMock()
+            stale_metrics_response.status = 200
+            stale_metrics_response.read.return_value = (
+                'commands_poll_cycles_total{otel_scope_name="controlplane"} 0\n'
+                'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 999\n'
+            ).encode("utf-8")
+            stale_metrics_response.geturl.return_value = "http://127.0.0.1:49152/metrics"
+            stale_metrics_response.headers.get.return_value = (
+                "text/plain; version=0.0.4; charset=utf-8; escaping=underscores"
+            )
+            stale_metrics_response.__enter__.return_value = stale_metrics_response
+            fresh_metrics_response = MagicMock()
+            fresh_metrics_response.status = 200
+            fresh_metrics_response.read.return_value = valid_metric_bytes
+            fresh_metrics_response.geturl.return_value = "http://127.0.0.1:49152/metrics"
+            fresh_metrics_response.headers.get.return_value = (
+                "text/plain; version=0.0.4; charset=utf-8; escaping=underscores"
+            )
+            fresh_metrics_response.__enter__.return_value = fresh_metrics_response
+            with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                pc.time, "monotonic", side_effect=[0.0, 0.0]
+            ), patch.object(pc.time, "sleep") as retry_sleep, patch.object(
+                pc.TUNNEL_HEALTH_OPENER,
+                "open",
+                side_effect=[
+                    status_response,
+                    stale_metrics_response,
+                    status_response,
+                    fresh_metrics_response,
+                ],
+            ) as retry_open:
+                pc._verify_tunnel_operational(
+                    layout,
+                    expected_tunnel_id="tunnel-production",
+                    started_at=1000.0,
+                    retry_transient_metrics=True,
+                )
+            self.assertEqual(retry_open.call_count, 4)
+            retry_sleep.assert_called_once()
+
+            with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                pc.time, "monotonic", side_effect=[0.0, 0.0, 6.0]
+            ), patch.object(pc.time, "sleep") as retry_sleep, patch.object(
+                pc.TUNNEL_HEALTH_OPENER,
+                "open",
+                side_effect=[
+                    status_response,
+                    stale_metrics_response,
+                    status_response,
+                    stale_metrics_response,
+                ],
+            ) as retry_open:
+                with self.assertRaisesRegex(RuntimeError, "poll|fresh|cycles"):
+                    pc._verify_tunnel_operational(
+                        layout,
+                        expected_tunnel_id="tunnel-production",
+                        started_at=1000.0,
+                        retry_transient_metrics=True,
+                    )
+            self.assertEqual(retry_open.call_count, 4)
+            retry_sleep.assert_called_once()
+
+            now_stale_metrics = valid_metric_bytes.replace(b" 1000\n", b" 940\n")
+            with self.assertRaisesRegex(RuntimeError, "stale|fresh"):
+                pc._parse_controlplane_poll_metrics(
+                    now_stale_metrics, started_at=900.0, now=1003.0
+                )
+
+            valid_metrics = (
+                'commands_poll_cycles_total{otel_scope_name="controlplane"} 2\n'
+                'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 1002\n'
+            )
+            redirect_handler = pc._NoTunnelHealthRedirect()
+            self.assertIsNone(
+                redirect_handler.redirect_request(
+                    pc.urllib.request.Request("http://127.0.0.1:49152/api/status"),
+                    None,
+                    302,
+                    "Found",
+                    {},
+                    "http://127.0.0.1:49153/api/status",
+                )
+            )
+            self.assertIsInstance(
+                pc.TUNNEL_HEALTH_PROXY_HANDLER, pc.urllib.request.ProxyHandler
+            )
+            self.assertEqual(pc.TUNNEL_HEALTH_PROXY_HANDLER.proxies, {})
+            redirect_cases = (
+                ("status", "http://127.0.0.1:49153/api/status", None),
+                ("metrics", "http://127.0.0.1:49152/api/status", "http://127.0.0.1:49153/metrics"),
+            )
+            for name, status_url, metrics_url in redirect_cases:
+                with self.subTest(redirect=name):
+                    status_response.geturl.return_value = status_url
+                    metrics_response = MagicMock()
+                    metrics_response.status = 200
+                    metrics_response.read.return_value = valid_metrics.encode("utf-8")
+                    metrics_response.geturl.return_value = metrics_url
+                    metrics_response.headers.get.return_value = (
+                        "text/plain; version=0.0.4; charset=utf-8; escaping=underscores"
+                    )
+                    metrics_response.__enter__.return_value = metrics_response
+                    responses = [status_response]
+                    if metrics_url is not None:
+                        responses.append(metrics_response)
+                    with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                        pc.TUNNEL_HEALTH_OPENER, "open", side_effect=responses
+                    ) as open_request, patch.object(pc.time, "sleep") as forbidden_sleep:
+                        with self.assertRaisesRegex(RuntimeError, "redirect|URL"):
+                            pc._verify_tunnel_operational(
+                                layout,
+                                expected_tunnel_id="tunnel-production",
+                                started_at=1000.0,
+                                retry_transient_metrics=True,
+                            )
+                    self.assertEqual(open_request.call_count, 1 if name == "status" else 2)
+                    forbidden_sleep.assert_not_called()
+            status_response.geturl.return_value = "http://127.0.0.1:49152/api/status"
+
+            for name, content_type, body in (
+                ("content_type", "text/html", valid_metrics.encode("utf-8")),
+                (
+                    "oversized",
+                    "text/plain; version=0.0.4; charset=utf-8; escaping=underscores",
+                    (valid_metrics + "#" * (1024 * 1024)).encode("utf-8"),
+                ),
+            ):
+                with self.subTest(response=name):
+                    metrics_response = MagicMock()
+                    metrics_response.status = 200
+                    metrics_response.read.return_value = body
+                    metrics_response.geturl.return_value = "http://127.0.0.1:49152/metrics"
+                    metrics_response.headers.get.return_value = content_type
+                    metrics_response.__enter__.return_value = metrics_response
+                    with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                        pc.TUNNEL_HEALTH_OPENER,
+                        "open",
+                        side_effect=[status_response, metrics_response],
+                    ), patch.object(pc.time, "sleep") as forbidden_sleep:
+                        with self.assertRaisesRegex(RuntimeError, "Content-Type|body|large"):
+                            pc._verify_tunnel_operational(
+                                layout,
+                                expected_tunnel_id="tunnel-production",
+                                started_at=1000.0,
+                                retry_transient_metrics=True,
+                            )
+                    forbidden_sleep.assert_not_called()
 
     def test_ai_bridge_fallback_guard_is_read_only_loopback_and_compute_ready(self):
         with tempfile.TemporaryDirectory() as raw_root:
@@ -1363,8 +2240,87 @@ class ProductionConnectorContractTests(unittest.TestCase):
             ) as stop:
                 with self.assertRaisesRegex(RuntimeError, "status failed"):
                     pc._start_production_tunnel(manifest, layout)
-            stop.assert_called_once_with(identity)
+            stop.assert_called_once_with(identity, process=process)
             self.assertEqual(json.loads(layout["runtime_state"].read_text(encoding="utf-8")), original)
+
+    def test_zombie_is_not_running_and_spawned_process_is_reaped_after_verified_signal(self):
+        identity = self._identity(303, ["/opt/tunnel-client", "run"])
+        with patch.object(pc.os, "kill"), patch.object(
+            pc, "_ps_process_field", return_value="Z+"
+        ):
+            self.assertFalse(getattr(pc, "_process_is_running", pc._pid_alive)(303))
+        with patch.object(pc.os, "kill"), patch.object(
+            pc, "_ps_process_field", return_value="S+"
+        ):
+            self.assertTrue(getattr(pc, "_process_is_running", pc._pid_alive)(303))
+
+        process = MagicMock(pid=303)
+        process.poll.return_value = None
+        with patch.object(pc, "_process_identity_matches", return_value=True), patch.object(
+            pc.os, "kill"
+        ) as signal_process, patch.object(pc, "_pid_alive", return_value=False):
+            try:
+                pc._stop_verified_process_identity(identity, process=process)
+            except TypeError as error:
+                self.fail(f"spawned process cannot be reaped: {error}")
+        signal_process.assert_called_once_with(303, pc.signal.SIGTERM)
+        process.wait.assert_called_once_with(timeout=5)
+
+    def test_process_group_waits_until_no_non_zombie_members_and_fails_closed_on_unknown_ps(self):
+        running_group = subprocess.CompletedProcess(
+            [], 0, stdout="303 303 Z+\n304 303 S+\n", stderr=""
+        )
+        all_zombies = subprocess.CompletedProcess(
+            [], 0, stdout="303 303 Z+\n304 303 Z+\n", stderr=""
+        )
+        ps_failure = subprocess.CompletedProcess([], 1, stdout="", stderr="denied")
+        group_running = getattr(
+            pc, "_process_group_has_running_members", lambda _pgid: False
+        )
+        with patch.object(pc.subprocess, "run", return_value=running_group):
+            self.assertTrue(group_running(303))
+        with patch.object(pc.subprocess, "run", return_value=all_zombies):
+            self.assertFalse(group_running(303))
+        with patch.object(pc.subprocess, "run", return_value=ps_failure):
+            with self.assertRaisesRegex(RuntimeError, "enumerate|process group|ps"):
+                group_running(303)
+
+        identity = self._identity(303, ["/opt/python", "runner.py"])
+        process = MagicMock(pid=303)
+        process.poll.return_value = None
+        with patch.object(pc, "_process_identity_matches", return_value=True), patch.object(
+            pc.os, "getpgid", return_value=303
+        ), patch.object(pc.os, "killpg"), patch.object(
+            pc, "_process_is_running", return_value=False
+        ), patch.object(
+            pc,
+            "_process_group_has_running_members",
+            create=True,
+            side_effect=[True, False],
+        ) as group_check, patch.object(pc.time, "sleep"):
+            pc._stop_verified_process_identity(
+                identity, process_group=True, process=process
+            )
+        self.assertEqual(group_check.call_count, 2)
+        process.wait.assert_called_once_with(timeout=5)
+
+        exited_leader = MagicMock(pid=303)
+        exited_leader.poll.return_value = 0
+        with patch.object(pc, "_process_identity_matches") as identity_check, patch.object(
+            pc.os, "getpgid"
+        ) as getpgid, patch.object(pc.os, "killpg") as signal_group, patch.object(
+            pc,
+            "_process_group_has_running_members",
+            return_value=True,
+        ) as group_check, patch.object(pc.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "leader exited|ID reuse"):
+                pc._stop_verified_process_identity(
+                    identity, process_group=True, process=exited_leader
+                )
+        identity_check.assert_not_called()
+        getpgid.assert_not_called()
+        signal_group.assert_not_called()
+        group_check.assert_called_once_with(303)
 
     def test_historical_rollback_rechecks_profile_and_refuses_duplicate_tunnel_id(self):
         item = {
