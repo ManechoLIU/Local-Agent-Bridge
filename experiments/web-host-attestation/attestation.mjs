@@ -579,6 +579,36 @@ function loadPrivateState(path) {
   }
 }
 
+function withPrivateStateLock(path, callback) {
+  if (!path) return callback();
+  const dir = dirname(path);
+  const lockPath = `${path}.lock`;
+  assertPrivateDirectory(dir);
+  let fd = null;
+  try {
+    try {
+      fd = openSync(lockPath, "wx", 0o600);
+      chmodSync(lockPath, 0o600);
+      fsyncSync(fd);
+    } catch (error) {
+      if (error && error.code === "EEXIST") {
+        assertPrivateStateFile(lockPath);
+        throw new Error("receipt journal state lock is held");
+      }
+      throw error;
+    }
+    return callback();
+  } finally {
+    if (fd != null) {
+      closeSync(fd);
+      try { unlinkSync(lockPath); } finally {
+        const dirFd = openSync(dir, "r");
+        try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+      }
+    }
+  }
+}
+
 function digest(value, name) {
   const text = nonEmpty(value, name);
   if (!/^[0-9a-f]{64}$/.test(text)) throw new Error(`${name} must be a SHA-256 hex digest`);
@@ -609,15 +639,38 @@ function normalizeReceiptMachineContext(input) {
 }
 
 function normalizeReceiptBinding(input) {
-  return {
+  const binding = {
     bridge_call_id: receiptText(input?.bridge_call_id, "bridge_call_id", "bc_"),
+    bridge_challenge_nonce: receiptText(input?.bridge_challenge_nonce, "bridge_challenge_nonce"),
     transport_binding_id: receiptText(input?.transport_binding_id, "transport_binding_id", "tb_"),
+    workspace: receiptText(input?.workspace, "workspace"),
+    production_release_revision: receiptText(input?.production_release_revision, "production_release_revision"),
+    production_endpoint_generation: positiveInteger(input?.production_endpoint_generation, "production_endpoint_generation"),
+    bridge_principal_id: receiptText(input?.bridge_principal_id, "bridge_principal_id"),
+    bridge_execution_session_id: receiptText(input?.bridge_execution_session_id, "bridge_execution_session_id"),
+    bridge_capability_id: receiptText(input?.bridge_capability_id, "bridge_capability_id"),
+    bridge_workspace_id: receiptText(input?.bridge_workspace_id, "bridge_workspace_id"),
     tool_name: receiptText(input?.tool_name, "tool_name"),
     outer_request_sha256: digest(input?.outer_request_sha256, "outer_request_sha256"),
     forwarded_request_sha256: digest(input?.forwarded_request_sha256, "forwarded_request_sha256"),
     normalized_request_sha256: digest(input?.normalized_request_sha256, "normalized_request_sha256"),
     ...normalizeReceiptMachineContext(input?.machine_context)
   };
+  if (!/^[0-9a-f]{40}$/.test(binding.production_release_revision)) {
+    throw new Error("production_release_revision must be a 40-hex revision");
+  }
+  if (binding.tool_name !== "run_command") throw new Error("tool_name is unsupported");
+  return binding;
+}
+
+function validateBridgeBindingContract(binding) {
+  if (binding.workspace !== "/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge") {
+    throw new Error("workspace must be the canonical Local Agent Bridge workspace");
+  }
+  if (binding.bridge_workspace_id !== "local-agent-bridge-production") {
+    throw new Error("bridge_workspace_id is invalid");
+  }
+  return binding;
 }
 
 function bindingFromSignedReceipt(receipt) {
@@ -649,7 +702,13 @@ export class ToolInvocationReceiptJournal {
     this.clock = clock;
     this.capabilityTtlMs = positiveInteger(capabilityTtlMs, "capabilityTtlMs");
     this.statePath = statePath;
-    const persisted = loadPrivateState(statePath);
+    this.records = new Map();
+    this.#reload();
+  }
+
+  #reload() {
+    if (!this.statePath) return;
+    const persisted = loadPrivateState(this.statePath);
     if (persisted && persisted.schema_version !== 1) throw new Error("receipt journal state schema is unsupported");
     this.records = new Map(Array.isArray(persisted?.records) ? persisted.records : []);
   }
@@ -658,99 +717,107 @@ export class ToolInvocationReceiptJournal {
     savePrivateState(this.statePath, { schema_version: 1, records: [...this.records.entries()] });
   }
 
-  issueCapability(input) {
-    const binding = normalizeReceiptBinding(input);
-    const issuedAt = nowMs(this.clock);
-    const capability = signedReceipt(this.secret, {
-      schema_version: 1,
-      provenance: "lab_host_invocation_capability_v1",
-      capability_id: `hic_${randomUUID()}`,
-      ...binding,
-      issued_at_unix_ms: issuedAt,
-      expires_at_unix_ms: issuedAt + this.capabilityTtlMs
+  #mutate(callback) {
+    return withPrivateStateLock(this.statePath, () => {
+      this.#reload();
+      const result = callback();
+      this.#persist();
+      return result;
     });
-    this.records.set(capability.capability_id, { state: "ISSUED", binding, capability, pre: null, terminal: null });
-    this.#persist();
-    return structuredClone(capability);
+  }
+
+  issueCapability(input) {
+    const binding = validateBridgeBindingContract(normalizeReceiptBinding(input));
+    return this.#mutate(() => {
+      const issuedAt = nowMs(this.clock);
+      const capability = signedReceipt(this.secret, {
+        schema_version: 1,
+        provenance: "lab_host_invocation_capability_v1",
+        capability_id: `hic_${randomUUID()}`,
+        ...binding,
+        issued_at_unix_ms: issuedAt,
+        expires_at_unix_ms: issuedAt + this.capabilityTtlMs
+      });
+      this.records.set(capability.capability_id, { state: "ISSUED", binding, capability, pre: null, terminal: null });
+      return structuredClone(capability);
+    });
   }
 
   consumeCapability(input) {
     const capability = authenticateReceipt(this.secret, input?.capability, "lab_host_invocation_capability_v1");
-    const record = this.records.get(receiptText(capability.capability_id, "capability_id", "hic_"));
-    if (!record) throw new Error("capability replay or unknown capability");
-    if (record.state !== "ISSUED") throw new Error("capability replayed");
     const binding = normalizeReceiptBinding(input);
-    if (!sameReceiptBinding(record.binding, binding) ||
-        !sameReceiptBinding(bindingFromSignedReceipt(capability), binding)) {
-      throw new Error("capability request or machine context mismatch");
-    }
-    const now = nowMs(this.clock);
-    if (now > capability.expires_at_unix_ms) {
-      record.state = "EXPIRED";
-      this.#persist();
-      throw new Error("capability expired");
-    }
     const executionId = receiptText(input?.host_tool_execution_id, "host_tool_execution_id", "hte_");
-    const pre = signedReceipt(this.secret, {
-      schema_version: 1,
-      provenance: "lab_host_tool_pre_receipt_v1",
-      pre_receipt_id: `hpr_${randomUUID()}`,
-      capability_id: capability.capability_id,
-      host_tool_execution_id: executionId,
-      ...binding,
-      pre_nonce: randomBytes(24).toString("hex"),
-      issued_at_unix_ms: now,
-      host_epoch_binding_sha256: sha256Text(`${binding.extension_binding_sha256}:${binding.extension_instance_id_sha256}:${binding.extension_loaded_at_ms}`)
+    return this.#mutate(() => {
+      const record = this.records.get(receiptText(capability.capability_id, "capability_id", "hic_"));
+      if (!record) throw new Error("capability replay or unknown capability");
+      if (record.state !== "ISSUED") throw new Error("capability replayed");
+      const signedBinding = validateBridgeBindingContract(bindingFromSignedReceipt(capability));
+      if (!sameReceiptBinding(record.binding, binding) || !sameReceiptBinding(signedBinding, binding)) {
+        throw new Error("capability request or machine context mismatch");
+      }
+      const now = nowMs(this.clock);
+      if (now >= capability.expires_at_unix_ms) throw new Error("capability expired");
+      const pre = signedReceipt(this.secret, {
+        schema_version: 1,
+        provenance: "lab_host_tool_pre_receipt_v1",
+        pre_receipt_id: `hpr_${randomUUID()}`,
+        capability_id: capability.capability_id,
+        host_tool_execution_id: executionId,
+        ...binding,
+        pre_nonce: randomBytes(24).toString("hex"),
+        issued_at_unix_ms: now,
+        host_epoch_binding_sha256: sha256Text(`${binding.extension_binding_sha256}:${binding.extension_instance_id_sha256}:${binding.extension_loaded_at_ms}`)
+      });
+      record.state = "HOST_VALIDATED_IN_FLIGHT";
+      record.pre = pre;
+      record.pre_receipt_sha256 = sha256Text(canonicalJson(pre));
+      return structuredClone(pre);
     });
-    record.state = "HOST_VALIDATED_IN_FLIGHT";
-    record.pre = pre;
-    record.pre_receipt_sha256 = sha256Text(canonicalJson(pre));
-    this.#persist();
-    return structuredClone(pre);
   }
 
   terminalize(input) {
     const pre = authenticateReceipt(this.secret, input?.pre_receipt, "lab_host_tool_pre_receipt_v1");
-    const record = this.records.get(receiptText(pre.capability_id, "pre_receipt.capability_id", "hic_"));
-    if (!record || record.state !== "HOST_VALIDATED_IN_FLIGHT" || !record.pre) {
-      throw new Error("pre receipt replay or mismatch");
-    }
-    if (record.pre.pre_receipt_id !== pre.pre_receipt_id ||
-        record.pre_receipt_sha256 !== sha256Text(canonicalJson(pre))) {
-      throw new Error("pre receipt mismatch");
-    }
     const binding = normalizeReceiptBinding(input);
-    if (!sameReceiptBinding(record.binding, binding) || pre.host_tool_execution_id !== record.pre.host_tool_execution_id) {
-      throw new Error("terminal request mismatch");
-    }
     const backendRoute = receiptText(input?.backend_route, "backend_route");
     if (!backendRoute.startsWith("/")) throw new Error("backend_route must be an absolute path");
     const httpStatus = Number(input?.http_status);
     if (!Number.isSafeInteger(httpStatus) || httpStatus < 100 || httpStatus > 599) throw new Error("http_status is invalid");
     const responseBodySha256 = digest(input?.response_body_sha256, "response_body_sha256");
     const classification = receiptText(input?.terminal_classification, "terminal_classification");
-    record.state = "TERMINAL_PENDING";
-    this.#persist();
-    const terminal = signedReceipt(this.secret, {
-      schema_version: 1,
-      provenance: "lab_host_tool_terminal_receipt_v1",
-      terminal_receipt_id: `htr_${randomUUID()}`,
-      pre_receipt_id: pre.pre_receipt_id,
-      pre_receipt_sha256: record.pre_receipt_sha256,
-      capability_id: pre.capability_id,
-      host_tool_execution_id: pre.host_tool_execution_id,
-      ...binding,
-      backend_route: backendRoute,
-      http_status: httpStatus,
-      response_body_sha256: responseBodySha256,
-      terminal_classification: classification,
-      issued_at_unix_ms: nowMs(this.clock),
-      host_epoch_binding_sha256: pre.host_epoch_binding_sha256
+    return this.#mutate(() => {
+      const record = this.records.get(receiptText(pre.capability_id, "pre_receipt.capability_id", "hic_"));
+      if (!record || record.state !== "HOST_VALIDATED_IN_FLIGHT" || !record.pre) {
+        throw new Error("pre receipt replay or mismatch");
+      }
+      if (record.pre.pre_receipt_id !== pre.pre_receipt_id ||
+          record.pre_receipt_sha256 !== sha256Text(canonicalJson(pre))) {
+        throw new Error("pre receipt mismatch");
+      }
+      if (!sameReceiptBinding(record.binding, binding) || pre.host_tool_execution_id !== record.pre.host_tool_execution_id) {
+        throw new Error("terminal request mismatch");
+      }
+      record.state = "TERMINAL_PENDING";
+      this.#persist();
+      const terminal = signedReceipt(this.secret, {
+        schema_version: 1,
+        provenance: "lab_host_tool_terminal_receipt_v1",
+        terminal_receipt_id: `htr_${randomUUID()}`,
+        pre_receipt_id: pre.pre_receipt_id,
+        pre_receipt_sha256: record.pre_receipt_sha256,
+        capability_id: pre.capability_id,
+        host_tool_execution_id: pre.host_tool_execution_id,
+        ...binding,
+        backend_route: backendRoute,
+        http_status: httpStatus,
+        response_body_sha256: responseBodySha256,
+        terminal_classification: classification,
+        issued_at_unix_ms: nowMs(this.clock),
+        host_epoch_binding_sha256: pre.host_epoch_binding_sha256
+      });
+      record.state = "TERMINAL";
+      record.terminal = terminal;
+      return structuredClone(terminal);
     });
-    record.state = "TERMINAL";
-    record.terminal = terminal;
-    this.#persist();
-    return structuredClone(terminal);
   }
 
   inspectStateForTest() {

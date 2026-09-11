@@ -1024,7 +1024,15 @@ function receiptMachineContext(overrides = {}) {
 function receiptRequest(overrides = {}) {
   return {
     bridge_call_id: "bc_test-call",
+    bridge_challenge_nonce: "bridge-challenge-nonce-test",
     transport_binding_id: "tb_test-transport",
+    workspace: "/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge",
+    production_release_revision: "a".repeat(40),
+    production_endpoint_generation: 7,
+    bridge_principal_id: "bridge-principal-test",
+    bridge_execution_session_id: "bridge-execution-session-test",
+    bridge_capability_id: "bridge-capability-test",
+    bridge_workspace_id: "local-agent-bridge-production",
     tool_name: "run_command",
     outer_request_sha256: "d".repeat(64),
     forwarded_request_sha256: "e".repeat(64),
@@ -1033,6 +1041,39 @@ function receiptRequest(overrides = {}) {
     ...overrides
   };
 }
+
+const CAPABILITY_SCHEMA_KEYS = [
+  "schema_version", "provenance", "capability_id", "bridge_call_id", "bridge_challenge_nonce",
+  "transport_binding_id", "workspace", "production_release_revision", "production_endpoint_generation",
+  "bridge_principal_id", "bridge_execution_session_id", "bridge_capability_id", "bridge_workspace_id",
+  "tool_name", "outer_request_sha256", "forwarded_request_sha256", "normalized_request_sha256",
+  "conversation_id", "browser_target_id", "top_frame_id", "loader_id", "generation_anchor_sha256",
+  "secure_origin", "extension_binding_sha256", "extension_instance_id_sha256", "extension_loaded_at_ms",
+  "issued_at_unix_ms", "expires_at_unix_ms", "host_mac_sha256"
+].sort();
+
+const PRE_SCHEMA_KEYS = [
+  "schema_version", "provenance", "pre_receipt_id", "capability_id", "host_tool_execution_id",
+  "bridge_call_id", "bridge_challenge_nonce", "transport_binding_id", "workspace",
+  "production_release_revision", "production_endpoint_generation", "bridge_principal_id",
+  "bridge_execution_session_id", "bridge_capability_id", "bridge_workspace_id", "tool_name",
+  "outer_request_sha256", "forwarded_request_sha256", "normalized_request_sha256", "conversation_id",
+  "browser_target_id", "top_frame_id", "loader_id", "generation_anchor_sha256", "secure_origin",
+  "extension_binding_sha256", "extension_instance_id_sha256", "extension_loaded_at_ms", "pre_nonce",
+  "issued_at_unix_ms", "host_epoch_binding_sha256", "host_mac_sha256"
+].sort();
+
+const TERMINAL_SCHEMA_KEYS = [
+  "schema_version", "provenance", "terminal_receipt_id", "pre_receipt_id", "pre_receipt_sha256",
+  "capability_id", "host_tool_execution_id", "bridge_call_id", "bridge_challenge_nonce",
+  "transport_binding_id", "workspace", "production_release_revision", "production_endpoint_generation",
+  "bridge_principal_id", "bridge_execution_session_id", "bridge_capability_id", "bridge_workspace_id",
+  "tool_name", "outer_request_sha256", "forwarded_request_sha256", "normalized_request_sha256",
+  "conversation_id", "browser_target_id", "top_frame_id", "loader_id", "generation_anchor_sha256",
+  "secure_origin", "extension_binding_sha256", "extension_instance_id_sha256", "extension_loaded_at_ms",
+  "backend_route", "http_status", "response_body_sha256", "terminal_classification", "issued_at_unix_ms",
+  "host_epoch_binding_sha256", "host_mac_sha256"
+].sort();
 
 test("durable Host receipt journal binds only machine identity and exact request across restart", () => {
   const time = clock();
@@ -1049,6 +1090,7 @@ test("durable Host receipt journal binds only machine identity and exact request
     caller_identity: "not-evidence"
   });
   assert.equal(capability.provenance, "lab_host_invocation_capability_v1");
+  assert.deepEqual(Object.keys(capability).sort(), CAPABILITY_SCHEMA_KEYS);
   assert.equal(capability.conversation_id, CONVERSATION);
   assert.equal(Object.hasOwn(capability, "caller_identity"), false);
   assert.equal(Object.hasOwn(capability, "generation_request_ids"), false);
@@ -1069,6 +1111,7 @@ test("durable Host receipt journal binds only machine identity and exact request
     host_tool_execution_id: "hte_test-execution"
   });
   assert.equal(pre.provenance, "lab_host_tool_pre_receipt_v1");
+  assert.deepEqual(Object.keys(pre).sort(), PRE_SCHEMA_KEYS);
   assert.throws(
     () => restarted.consumeCapability({
       ...receiptRequest(),
@@ -1099,6 +1142,7 @@ test("durable Host receipt journal binds only machine identity and exact request
     response_body: "must never persist"
   });
   assert.equal(terminal.provenance, "lab_host_tool_terminal_receipt_v1");
+  assert.deepEqual(Object.keys(terminal).sort(), TERMINAL_SCHEMA_KEYS);
   assert.equal(JSON.stringify(restarted.inspectStateForTest()).includes("must never persist"), false);
 });
 
@@ -1128,9 +1172,61 @@ test("Host receipt journal rejects expiry and every re-observed machine drift", 
       field
     );
   }
-  time.add(11);
+  time.add(10);
   assert.throws(
     () => journal.consumeCapability({ ...receiptRequest(), capability, host_tool_execution_id: "hte_expired" }),
     /expired/i
   );
+});
+
+test("two receipt journal instances permit exactly one consume after reloading durable state", () => {
+  const time = clock();
+  const statePath = join(mkdtempSync(join(tmpdir(), "lab-tool-receipt-race-")), "receipts.json");
+  const issuer = new ToolInvocationReceiptJournal(SECRET, { clock: time.now, statePath });
+  const capability = issuer.issueCapability(receiptRequest());
+  const first = new ToolInvocationReceiptJournal(SECRET, { clock: time.now, statePath });
+  const second = new ToolInvocationReceiptJournal(SECRET, { clock: time.now, statePath });
+  const pre = first.consumeCapability({
+    ...receiptRequest(), capability, host_tool_execution_id: "hte_instance-one"
+  });
+  assert.equal(pre.host_tool_execution_id, "hte_instance-one");
+  assert.throws(
+    () => second.consumeCapability({
+      ...receiptRequest(), capability, host_tool_execution_id: "hte_instance-two"
+    }),
+    /replay/i
+  );
+  const restarted = new ToolInvocationReceiptJournal(SECRET, { clock: time.now, statePath });
+  assert.throws(
+    () => restarted.consumeCapability({
+      ...receiptRequest(), capability, host_tool_execution_id: "hte_after-restart"
+    }),
+    /replay/i
+  );
+});
+
+test("receipt binding rejects each Bridge-private context and request digest drift", () => {
+  const journal = new ToolInvocationReceiptJournal(SECRET);
+  const capability = journal.issueCapability(receiptRequest());
+  for (const [field, value] of [
+    ["bridge_challenge_nonce", "different-nonce"],
+    ["workspace", "/tmp/not-the-canonical-workspace"],
+    ["production_release_revision", "b".repeat(40)],
+    ["production_endpoint_generation", 8],
+    ["bridge_principal_id", "different-principal"],
+    ["bridge_execution_session_id", "different-session"],
+    ["bridge_capability_id", "different-capability"],
+    ["bridge_workspace_id", "different-workspace"],
+    ["outer_request_sha256", "1".repeat(64)],
+    ["forwarded_request_sha256", "2".repeat(64)],
+    ["normalized_request_sha256", "3".repeat(64)]
+  ]) {
+    assert.throws(
+      () => journal.consumeCapability({
+        ...receiptRequest({ [field]: value }), capability, host_tool_execution_id: "hte_" + field
+      }),
+      /mismatch/i,
+      field
+    );
+  }
 });

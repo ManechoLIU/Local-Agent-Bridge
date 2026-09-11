@@ -184,7 +184,15 @@ export function createNativeHostHandler(options) {
     if (!epoch) throw new Error("HOST_EXTENSION_NOT_READY: receipt operations require a loaded extension epoch");
     return {
       bridge_call_id: request.bridge_call_id,
+      bridge_challenge_nonce: request.bridge_challenge_nonce,
       transport_binding_id: request.transport_binding_id,
+      workspace: request.workspace,
+      production_release_revision: request.production_release_revision,
+      production_endpoint_generation: request.production_endpoint_generation,
+      bridge_principal_id: request.bridge_principal_id,
+      bridge_execution_session_id: request.bridge_execution_session_id,
+      bridge_capability_id: request.bridge_capability_id,
+      bridge_workspace_id: request.bridge_workspace_id,
       tool_name: request.tool_name,
       outer_request_sha256: request.outer_request_sha256,
       forwarded_request_sha256: request.forwarded_request_sha256,

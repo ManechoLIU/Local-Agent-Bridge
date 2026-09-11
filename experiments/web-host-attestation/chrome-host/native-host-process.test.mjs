@@ -316,7 +316,15 @@ test("real native Host process bridges Unix socket to Native Messaging and signs
 
   const receiptRequest = {
     bridge_call_id: "bc_process",
+    bridge_challenge_nonce: "bridge-challenge-nonce-process",
     transport_binding_id: "tb_process",
+    workspace: "/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge",
+    production_release_revision: "a".repeat(40),
+    production_endpoint_generation: 7,
+    bridge_principal_id: "bridge-principal-process",
+    bridge_execution_session_id: "bridge-execution-session-process",
+    bridge_capability_id: "bridge-capability-process",
+    bridge_workspace_id: "local-agent-bridge-production",
     tool_name: "run_command",
     outer_request_sha256: "d".repeat(64),
     forwarded_request_sha256: "e".repeat(64),
