@@ -52,6 +52,47 @@ PRODUCTION_RUNTIME_ROOT = Path.home() / ".local-agent-bridge" / "production-conn
 PRODUCTION_BRIDGE_SOCKET = Path("/tmp/local-agent-bridge-production/bridge.sock")
 PRODUCTION_CATDESK_PORT = 33331
 PRODUCTION_HOST_MCP_PORT = 33321
+AI_BRIDGE_EXECUTABLE = Path("/Applications/AI-Bridge.app/Contents/MacOS/ai-bridge")
+COMPUTE_HELPER_EXECUTABLE = Path("/Applications/Compute Helper.app/Contents/MacOS/compute-helper")
+COMPUTE_HELPER_SOCKET = (
+    Path.home()
+    / "Library"
+    / "Application Support"
+    / "ai.originone.gpt-bridge"
+    / "computer-helper"
+    / "helper.sock"
+)
+RUNTIME_HOST_TOOL_HOOK_PROTOCOL = "runtime_host_tool_hook_v1"
+RUNTIME_HOST_TOOL_HOOK_RUNTIME_REVISION = "b2e9cf54583e17d7cc60919433b72bc9d6ac979a"
+RUNTIME_HOST_TOOL_HOOK_SOURCE_ROOT = Path("/Users/echoman/Documents/Codex/adaptive-delivery")
+RUNTIME_HOST_TOOL_HOOK_BUNDLE_RELATIVE_PATHS = (
+    "scripts/agent_target_resolution.py",
+    "scripts/assignment_runtime.py",
+    "scripts/control_event_guard.py",
+    "scripts/controller_health.py",
+    "scripts/controller_self_check.py",
+    "scripts/controller_state.py",
+    "scripts/controller_target_guard.py",
+    "scripts/event_scope_guard.py",
+    "scripts/goal_display_sync.py",
+    "scripts/ledger_consistency_guard.py",
+    "scripts/lifecycle_hook.py",
+    "scripts/lint_governance.py",
+    "scripts/preblock_guard.py",
+    "scripts/project_context_guard.py",
+    "scripts/project_state.py",
+    "scripts/reviewer_supervisor.py",
+    "scripts/route_contract.py",
+    "scripts/rule_handshake.py",
+    "scripts/runtime_host_tool_hook.py",
+    "scripts/terminal_continuation.py",
+    "scripts/web_agent_events.py",
+    "scripts/web_agent_execution.py",
+    "scripts/web_agent_health_supervisor.py",
+    "scripts/web_lifecycle_bridge.py",
+    "scripts/web_reentry_adapter.py",
+)
+RUNTIME_HOST_TOOL_HOOK_ENTRYPOINT_RELATIVE_PATH = "scripts/runtime_host_tool_hook.py"
 HISTORICAL_M0_BRIDGE_SOCKET = Path("/tmp/lab-real-ingress-e2e/bridge.sock")
 HISTORICAL_M0_RUNTIME_STATE = Path.home() / ".local-agent-bridge" / "m0-preview" / "runtime.json"
 AI_BRIDGE_FALLBACK_HEALTH_URL_FILE = (
@@ -254,6 +295,8 @@ def production_layout(
         "native_host_wrapper": release_dir / "bin" / "native-host-production",
         "runtime_verifier_cli": release_dir / "host" / "chrome-host" / "runtime-verifier-cli.mjs",
         "runtime_verifier_wrapper": release_dir / "bin" / "runtime-verifier-production",
+        "runtime_hook_dir": release_dir / "runtime-host-tool-hook",
+        "runtime_hook_entrypoint": release_dir / "runtime-host-tool-hook" / RUNTIME_HOST_TOOL_HOOK_ENTRYPOINT_RELATIVE_PATH,
         "host_backend_key": secrets_dir / "host-backend.key",
         "host_attestation_key": secrets_dir / "host-attestation.key",
         "host_socket_dir": host_socket_dir,
@@ -261,7 +304,11 @@ def production_layout(
         "host_verifier_state": runtime_generation_dir / "host" / "runtime-verifier-state.json",
         "host_reentry_state": runtime_generation_dir / "host" / "runtime-reentry-state.json",
         "host_extension_binding": runtime_generation_dir / "host" / "runtime-extension-binding.json",
+        "host_tool_receipt_state": runtime_generation_dir / "host" / "tool-receipts.json",
         "bridge_state_dir": runtime_generation_dir / "bridge",
+        "bridge_receipt_journal": runtime_generation_dir / "bridge" / "tool-receipt-journal.json",
+        "runtime_hook_socket_dir": host_socket_dir,
+        "runtime_hook_socket": host_socket_dir / "runtime-host-tool-hook.sock",
         "bridge_socket": Path(bridge_socket),
         "release_tunnel_profile": release_dir / "tunnel" / f"{TUNNEL_PROFILE_NAME}.yaml",
         "tunnel_dir": tunnel_dir,
@@ -299,6 +346,7 @@ def production_component_env(
         "LAB_HOST_MCP_BACKEND_KEY_FILE": str(layout["host_backend_key"]),
         "LAB_HOST_ATTESTATION_KEY_FILE": str(layout["host_attestation_key"]),
         "LAB_HOST_ADAPTER_SOCKET": str(layout["host_socket"]),
+        "LAB_HOST_TOOL_RECEIPT_STATE_FILE": str(layout["host_tool_receipt_state"]),
         "LAB_HOST_VERIFIER_STATE_FILE": str(layout["host_verifier_state"]),
         "LAB_HOST_REENTRY_STATE_FILE": str(layout["host_reentry_state"]),
         "LAB_HOST_MCP_BIND": "127.0.0.1",
@@ -317,6 +365,7 @@ def production_component_env(
         ),
         "LAB_HOST_BACKEND_URL": f"http://127.0.0.1:{PRODUCTION_HOST_MCP_PORT}/mcp",
         "LAB_HOST_BACKEND_KEY_FILE": str(layout["host_backend_key"]),
+        "LAB_RUNTIME_HOST_TOOL_HOOK_SOCKET": str(layout["runtime_hook_socket"]),
     }
     return {"host": host, "bridge": bridge}
 
@@ -469,6 +518,7 @@ def install_release_bundle(
         )
         _copy_owned_file(resolved_sources["host_attestation_key"], layout["host_attestation_key"], 0o600)
         _copy_owned_tree(resolved_sources["host_source_dir"], layout["host_dir"])
+        _materialize_runtime_host_tool_hook(layout)
         _private_dir(layout["host_backend_key"].parent)
         layout["host_backend_key"].write_bytes(secrets.token_bytes(32).hex().encode("ascii"))
         layout["host_backend_key"].chmod(0o600)
@@ -480,6 +530,7 @@ def install_release_bundle(
                 "#!/bin/sh",
                 f"export LAB_HOST_ADAPTER_SOCKET={shlex.quote(str(layout['host_socket']))}",
                 f"export LAB_HOST_ATTESTATION_KEY_FILE={shlex.quote(str(layout['host_attestation_key']))}",
+                f"export LAB_HOST_TOOL_RECEIPT_STATE_FILE={shlex.quote(str(layout['host_tool_receipt_state']))}",
                 f"export LAB_HOST_EXTENSION_BINDING_FILE={shlex.quote(str(layout['host_extension_binding']))}",
                 f"exec {shlex.quote(node['path'])} {shlex.quote(str(layout['native_host']))} \"$@\"",
                 "",
@@ -517,6 +568,9 @@ def install_release_bundle(
             artifacts[str(path.relative_to(release_dir))] = _sha256_file(path)
         installed_manifest = json.loads(json.dumps(manifest))
         installed_manifest["artifacts_sha256"] = artifacts
+        installed_manifest["runtime_host_tool_hook"] = _runtime_host_tool_hook_record(
+            layout, installed_manifest
+        )
         _write_json_private(layout["release_manifest"], installed_manifest)
 
         _private_dir(layout["tunnel_dir"])
@@ -646,6 +700,8 @@ def validate_installed_release(layout: dict[str, Path]) -> dict[str, Any]:
             raise RuntimeError(f"production release artifact missing or unsafe: {relative}")
         if _sha256_file(path) != expected:
             raise RuntimeError(f"production release artifact hash mismatch: {relative}")
+    if manifest.get("runtime_host_tool_hook") != _runtime_host_tool_hook_record(layout, manifest):
+        raise RuntimeError("production Runtime Host tool hook pin mismatch")
     if _sha256_file(layout["tunnel_profile"]) != _sha256_file(layout["release_tunnel_profile"]):
         raise RuntimeError("production tunnel profile does not match immutable release artifact")
     return manifest
@@ -1146,7 +1202,7 @@ def _runtime_verifier_record(
         raise RuntimeError("production Runtime Host verifier bundle exceeds Runtime limit")
     wrapper = layout["runtime_verifier_wrapper"].resolve(strict=True)
     return {
-        "protocol": "runtime_host_verifier_cli_v1",
+        "protocol": "runtime_host_verifier_cli_v2",
         "executable": str(wrapper),
         "sha256": _sha256_file(wrapper),
         "bundle_sha256": bundle_sha256,
@@ -2209,6 +2265,16 @@ def _verify_ai_bridge_fallback(health_url_file: Path) -> dict[str, Any]:
         raise RuntimeError("AI-Bridge fallback route target does not match its compute endpoint")
     if not _tcp_ready(compute_host, compute_port):
         raise RuntimeError("AI-Bridge fallback compute endpoint is not listening")
+    health_address = ipaddress.ip_address(parsed_health.hostname or "")
+    health_port = parsed_health.port
+    if not health_address.is_loopback or health_port is None:
+        raise RuntimeError("AI-Bridge fallback health endpoint is not loopback")
+    process_identities = _ai_bridge_fallback_process_identities(
+        health_host=str(health_address),
+        health_port=health_port,
+        compute_host=compute_host,
+        compute_port=compute_port,
+    )
     tools_status = _mcp_streamable_tools_list(compute_url)
     tools = sorted(
         item.get("name")
@@ -2218,15 +2284,111 @@ def _verify_ai_bridge_fallback(health_url_file: Path) -> dict[str, Any]:
     missing = sorted({"computer", "shell_command"}.difference(tools))
     if missing:
         raise RuntimeError("AI-Bridge fallback tools/list is missing: " + ", ".join(missing))
+    stable_identity = _stable_ai_bridge_fallback_identity(
+        status, main, compute_url, process_identities
+    )
     return {
         "ready": True,
+        "ai_bridge_is_trusted_receipt_source": False,
         "health_url": health_url,
         "compute_url": compute_url,
         "compute_host": compute_host,
         "compute_port": compute_port,
         "tools": tools,
         "status": status,
+        "stable_identity": stable_identity,
+        "status_sha256": hashlib.sha256(
+            json.dumps(stable_identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
     }
+
+
+def _stable_ai_bridge_fallback_identity(
+    status: dict[str, Any], main: dict[str, Any], compute_url: str,
+    process_identities: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    if not isinstance(status, dict) or not isinstance(main, dict):
+        raise RuntimeError("AI-Bridge fallback stable identity requires status and main channel objects")
+    required_processes = {"ai_bridge", "tunnel", "compute_helper"}
+    if set(process_identities) != required_processes:
+        raise RuntimeError("AI-Bridge fallback process identity set is incomplete")
+    for identity in process_identities.values():
+        _validate_process_identity_record(identity)
+
+    def stable_fields(value: object, keys: tuple[str, ...]) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        def stable_scalar(candidate: object) -> bool:
+            return (
+                candidate is None
+                or isinstance(candidate, (str, int, bool))
+                or (isinstance(candidate, float) and math.isfinite(candidate))
+            )
+        return {
+            key: value[key]
+            for key in keys
+            if key in value and stable_scalar(value.get(key))
+        }
+
+    routes = status.get("mcp_routes")
+    if isinstance(routes, dict):
+        routes = list(routes.values())
+    stable_routes = []
+    if isinstance(routes, list):
+        for route in routes:
+            if isinstance(route, dict) and route.get("channel", route.get("name", "main")) == "main":
+                stable_routes.append(stable_fields(
+                    route, ("channel", "name", "target", "target_url", "address", "url", "mcp_server_url", "started_at")
+                ))
+    control_plane = status.get("control_plane")
+    return {
+        "client_instance_id": status.get("client_instance_id", status.get("instance_id")),
+        "version": status.get("version", status.get("build_version")),
+        "started_at": status.get("started_at"),
+        "service": stable_fields(
+            status,
+            (
+                "control_plane_tunnel_id",
+                "control_plane_base_url",
+                "control_plane_route",
+                "mcp_server_url",
+                "health_listen_addr",
+            ),
+        ),
+        "control_plane": stable_fields(
+            control_plane, ("tunnel_id", "id", "base_url", "url", "endpoint", "started_at")
+        ),
+        "main": stable_fields(
+            main, ("name", "enabled", "probe_status", "server_kind", "transport_kind", "address", "url", "target_url", "mcp_server_url", "started_at")
+        ),
+        "routes": sorted(stable_routes, key=lambda item: json.dumps(item, sort_keys=True)),
+        "compute_url": compute_url,
+        "ai_bridge_process_identity": process_identities["ai_bridge"],
+        "tunnel_process_identity": process_identities["tunnel"],
+        "compute_helper_process_identity": process_identities["compute_helper"],
+    }
+
+
+def _ai_bridge_fallback_process_identities(
+    *, health_host: str, health_port: int, compute_host: str, compute_port: int
+) -> dict[str, dict[str, Any]]:
+    ai_bridge = _unique_process_identity_for_executable(AI_BRIDGE_EXECUTABLE, "AI-Bridge")
+    health_listener = _unique_loopback_listener_identity(health_host, health_port, "AI-Bridge health")
+    tunnel = _unique_tunnel_child_identity(ai_bridge)
+    if health_listener != tunnel:
+        raise RuntimeError("AI-Bridge health listener identity does not match its tunnel child")
+    compute_listener = _unique_loopback_listener_identity(
+        compute_host, compute_port, "AI-Bridge compute route"
+    )
+    if compute_listener != ai_bridge:
+        raise RuntimeError("AI-Bridge compute listener identity does not match AI-Bridge executable")
+    compute_helper = _unique_process_identity_for_executable(
+        COMPUTE_HELPER_EXECUTABLE, "Compute Helper"
+    )
+    _verify_process_owned_unix_socket(
+        compute_helper, COMPUTE_HELPER_SOCKET, "Compute Helper"
+    )
+    return {"ai_bridge": ai_bridge, "tunnel": tunnel, "compute_helper": compute_helper}
 
 
 def _validate_tunnel_profile(
@@ -3386,7 +3548,15 @@ def activate_production_tunnel(
             production["tunnel_id"], {production["pid"]}, expected_socket=layout["bridge_socket"]
         )
         fallback_after = _verify_ai_bridge_fallback(fallback_health_url_file)
-        for key in ("health_url", "compute_url", "compute_host", "compute_port", "tools"):
+        for key in (
+            "health_url",
+            "compute_url",
+            "compute_host",
+            "compute_port",
+            "tools",
+            "status_sha256",
+            "ai_bridge_is_trusted_receipt_source",
+        ):
             if fallback_after.get(key) != fallback_before.get(key):
                 raise RuntimeError("AI-Bridge fallback identity changed during production activation")
         rollback_receipt = _write_activation_rollback_receipt(
@@ -3444,6 +3614,15 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
         installed = None
         release_installed = False
         release_error = str(error)
+    runtime_verifier_config_ready = False
+    if release_installed:
+        try:
+            _validate_runtime_host_verifier_registration(
+                layout, manifest, home_dir=Path.home()
+            )
+            runtime_verifier_config_ready = True
+        except Exception:
+            pass
     state = _read_json_object(layout["runtime_state"])
     state_matches = bool(
         state.get("release_revision") == manifest["release_revision"]
@@ -3453,10 +3632,12 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
     )
     catdesk_pid = state.get("catdesk_supervisor_pid") if state_matches else None
     host_pid = state.get("host_pid") if state_matches else None
+    runtime_hook_pid = state.get("runtime_hook_pid") if state_matches else None
     bridge_pid = state.get("bridge_pid") if state_matches else None
     node = ((installed or {}).get("runtime_dependencies") or {}).get("node", {}).get("path")
     catdesk_identity = state.get("catdesk_supervisor_process_identity") if state_matches else None
     host_identity = state.get("host_process_identity") if state_matches else None
+    runtime_hook_identity = state.get("runtime_hook_process_identity") if state_matches else None
     bridge_identity = state.get("bridge_process_identity") if state_matches else None
     catdesk_process = bool(
         isinstance(catdesk_pid, int)
@@ -3471,6 +3652,12 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
         and host_identity.get("pid") == host_pid
         and _process_identity_matches(host_identity)
     )
+    runtime_hook_process = bool(
+        isinstance(runtime_hook_pid, int)
+        and isinstance(runtime_hook_identity, dict)
+        and runtime_hook_identity.get("pid") == runtime_hook_pid
+        and _process_identity_matches(runtime_hook_identity)
+    )
     bridge_process = bool(
         isinstance(bridge_pid, int)
         and isinstance(bridge_identity, dict)
@@ -3479,6 +3666,12 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
     )
     backend_ready = bool(catdesk_process and _tcp_ready("127.0.0.1", PRODUCTION_CATDESK_PORT))
     host_ready = bool(host_process and _tcp_ready("127.0.0.1", PRODUCTION_HOST_MCP_PORT))
+    runtime_hook_ready = bool(
+        runtime_hook_process
+        and _runtime_hook_socket_is_live(
+            layout["runtime_hook_socket"], state.get("runtime_hook_socket_identity")
+        )
+    )
     tools: list[str] = []
     bridge_ready = False
     if bridge_process and layout["bridge_socket"].exists():
@@ -3487,7 +3680,15 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
             bridge_ready = True
         except Exception:
             pass
-    local_ready = bool(release_installed and state_matches and backend_ready and host_ready and bridge_ready)
+    local_ready = bool(
+        release_installed
+        and state_matches
+        and runtime_verifier_config_ready
+        and backend_ready
+        and host_ready
+        and runtime_hook_ready
+        and bridge_ready
+    )
     tunnel = production_tunnel_status(manifest, layout)
     return {
         "connector_id": CONNECTOR_ID,
@@ -3501,12 +3702,15 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
         "release_installed": release_installed,
         "release_error": release_error,
         "runtime_state_matches": state_matches,
+        "runtime_verifier_config_ready": runtime_verifier_config_ready,
         "backend_ready": backend_ready,
         "host_ready": host_ready,
+        "runtime_hook_ready": runtime_hook_ready,
         "bridge_ready": bridge_ready,
         "local_runtime_ready": local_ready,
         "catdesk_supervisor_pid": catdesk_pid,
         "host_pid": host_pid,
+        "runtime_hook_pid": runtime_hook_pid,
         "bridge_pid": bridge_pid,
         "tools": tools,
         "manifest_has_artifacts": bool(installed and installed.get("artifacts_sha256")),
@@ -3722,11 +3926,14 @@ def start_local_runtime(manifest: dict[str, Any], layout: dict[str, Path]) -> di
         raise RuntimeError("production Host MCP port is occupied by an unverified process")
     if layout["bridge_socket"].exists():
         raise RuntimeError("production Bridge socket exists without a verified runtime owner")
+    if layout["runtime_hook_socket"].exists() or layout["runtime_hook_socket"].is_symlink():
+        raise RuntimeError("production Runtime Host tool hook socket exists without a verified runtime owner")
 
     catdesk_child_pid_was_absent = not layout["catdesk_child_pid"].exists()
     _private_dir(layout["logs_dir"])
     _materialize_catdesk_runtime(layout)
     _prepare_private_unix_socket_path(layout["host_socket"])
+    _prepare_private_unix_socket_path(layout["runtime_hook_socket"])
     _private_dir(layout["host_verifier_state"].parent)
     _private_dir(layout["bridge_state_dir"])
     slug = _catdesk_slug(layout["catdesk_config"])
@@ -3753,7 +3960,8 @@ def start_local_runtime(manifest: dict[str, Any], layout: dict[str, Path]) -> di
         started[-1] = (catdesk, catdesk_identity, True)
         _wait_for_tcp(catdesk, PRODUCTION_CATDESK_PORT, "production CatDesk")
 
-        node = Path(_validate_runtime_dependencies(manifest)["node"]["path"])
+        dependencies = _validate_runtime_dependencies(manifest)
+        node = Path(dependencies["node"]["path"])
         host_command = [str(node), str(layout["host_mcp_adapter"])]
         host = _spawn_logged(
             host_command,
@@ -3768,6 +3976,29 @@ def start_local_runtime(manifest: dict[str, Any], layout: dict[str, Path]) -> di
         )
         started[-1] = (host, host_identity, False)
         _wait_for_tcp(host, PRODUCTION_HOST_MCP_PORT, "production Host MCP")
+
+        runtime_python = Path(dependencies["python"]["path"])
+        runtime_hook_command = [
+            str(runtime_python),
+            str(layout["runtime_hook_entrypoint"]),
+            "--serve-unix-socket",
+            str(layout["runtime_hook_socket"]),
+        ]
+        runtime_hook = _spawn_logged(
+            runtime_hook_command,
+            layout["logs_dir"] / "runtime-host-tool-hook.out",
+            layout["logs_dir"] / "runtime-host-tool-hook.err",
+            cwd=layout["runtime_hook_dir"],
+            env=base_env,
+        )
+        started.append((runtime_hook, None, False))
+        runtime_hook_identity = _capture_process_identity(
+            runtime_hook.pid,
+            expected_executable=runtime_python,
+            expected_argv=runtime_hook_command,
+        )
+        started[-1] = (runtime_hook, runtime_hook_identity, False)
+        runtime_hook_socket_identity = _wait_for_runtime_hook(runtime_hook, layout)
 
         session_id = f"bridge-session-production-{uuid.uuid4()}"
         capability_id = f"bridge-cap-production-{uuid.uuid4()}"
@@ -3805,9 +4036,12 @@ def start_local_runtime(manifest: dict[str, Any], layout: dict[str, Path]) -> di
             "release_manifest": str(layout["release_manifest"]),
             "catdesk_supervisor_pid": catdesk.pid,
             "host_pid": host.pid,
+            "runtime_hook_pid": runtime_hook.pid,
             "bridge_pid": bridge.pid,
             "catdesk_supervisor_process_identity": catdesk_identity,
             "host_process_identity": host_identity,
+            "runtime_hook_process_identity": runtime_hook_identity,
+            "runtime_hook_socket_identity": runtime_hook_socket_identity,
             "bridge_process_identity": bridge_identity,
             "bridge_execution_session_id": session_id,
             "bridge_capability_id": capability_id,
@@ -3838,6 +4072,13 @@ def start_local_runtime(manifest: dict[str, Any], layout: dict[str, Path]) -> di
         if all_started_processes_stopped:
             try:
                 _unlink_owned_runtime_socket(layout["bridge_socket"])
+            except Exception:
+                pass
+            try:
+                _unlink_runtime_hook_socket(
+                    layout["runtime_hook_socket"],
+                    locals().get("runtime_hook_socket_identity"),
+                )
             except Exception:
                 pass
             if catdesk_child_pid_was_absent:
@@ -4305,6 +4546,120 @@ def _process_identity_matches(identity: dict[str, Any]) -> bool:
     return observed == expected
 
 
+def _unique_process_identity_for_executable(executable: Path, label: str) -> dict[str, Any]:
+    expected = Path(executable).expanduser().resolve(strict=True)
+    completed = subprocess.run(
+        ["ps", "-ww", "-axo", "pid=,comm="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"cannot enumerate {label} processes")
+    matches: list[dict[str, Any]] = []
+    for raw in completed.stdout.splitlines():
+        fields = raw.strip().split(maxsplit=1)
+        if len(fields) != 2:
+            raise RuntimeError(f"cannot parse {label} process enumeration")
+        try:
+            pid = int(fields[0])
+        except ValueError as error:
+            raise RuntimeError(f"cannot parse {label} process PID") from error
+        if pid < 1 or Path(fields[1]).expanduser().resolve(strict=False) != expected:
+            continue
+        matches.append(_capture_process_identity(pid, expected_executable=expected))
+    if len(matches) != 1:
+        raise RuntimeError(f"{label} executable must have exactly one live process")
+    return matches[0]
+
+
+def _unique_tunnel_child_identity(ai_bridge: dict[str, Any]) -> dict[str, Any]:
+    parent = _validate_process_identity_record(ai_bridge)
+    completed = subprocess.run(
+        ["ps", "-ww", "-axo", "pid=,ppid=,comm="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("cannot enumerate AI-Bridge child processes")
+    matches: list[dict[str, Any]] = []
+    for raw in completed.stdout.splitlines():
+        fields = raw.strip().split(maxsplit=2)
+        if len(fields) != 3:
+            raise RuntimeError("cannot parse AI-Bridge child process enumeration")
+        try:
+            pid, parent_pid = int(fields[0]), int(fields[1])
+        except ValueError as error:
+            raise RuntimeError("cannot parse AI-Bridge child process PID") from error
+        if pid < 1 or parent_pid != parent["pid"] or Path(fields[2]).name != "tunnel-client":
+            continue
+        matches.append(_capture_process_identity(pid))
+    if len(matches) != 1:
+        raise RuntimeError("AI-Bridge must have exactly one direct tunnel-client child")
+    return matches[0]
+
+
+def _unique_loopback_listener_identity(host: str, port: int, label: str) -> dict[str, Any]:
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError as error:
+        raise RuntimeError(f"{label} listener host is invalid") from error
+    if not address.is_loopback or not isinstance(port, int) or port < 1 or port > 65535:
+        raise RuntimeError(f"{label} listener must be an explicit loopback TCP port")
+    authority = f"[{address}]" if address.version == 6 else str(address)
+    completed = subprocess.run(
+        ["lsof", "-nP", "-t", f"-iTCP@{authority}:{port}", "-sTCP:LISTEN"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"cannot resolve {label} listener PID")
+    try:
+        pids = {int(value.strip()) for value in completed.stdout.splitlines() if value.strip()}
+    except ValueError as error:
+        raise RuntimeError(f"cannot parse {label} listener PID") from error
+    if len(pids) != 1 or any(pid < 1 for pid in pids):
+        raise RuntimeError(f"{label} listener must have exactly one PID")
+    return _capture_process_identity(next(iter(pids)))
+
+
+def _verify_process_owned_unix_socket(
+    identity: dict[str, Any], socket_path: Path, label: str
+) -> None:
+    expected = _validate_process_identity_record(identity)
+    path = Path(socket_path).expanduser()
+    try:
+        info = path.lstat()
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise RuntimeError(f"{label} Unix socket is missing") from error
+    if (
+        path.is_symlink()
+        or resolved != path
+        or not stat.S_ISSOCK(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) & 0o022
+    ):
+        raise RuntimeError(f"{label} Unix socket is unsafe")
+    completed = subprocess.run(
+        ["lsof", "-nP", "-a", "-p", str(expected["pid"]), "-U", "-Fn"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"cannot resolve {label} Unix socket owner")
+    names = {
+        line[1:]
+        for line in completed.stdout.splitlines()
+        if line.startswith("n") and not line.startswith("n->")
+    }
+    if str(path) not in names or not _process_identity_matches(expected):
+        raise RuntimeError(f"{label} Unix socket owner identity mismatch")
+
+
 def _stop_verified_process_identity(
     identity: dict[str, Any],
     *,
@@ -4415,10 +4770,96 @@ def _wait_for_bridge(process: subprocess.Popen[Any], layout: dict[str, Path]) ->
     raise RuntimeError("production Bridge did not become ready")
 
 
+def _runtime_hook_socket_identity(path: Path) -> dict[str, Any]:
+    try:
+        info = path.lstat()
+    except FileNotFoundError as error:
+        raise RuntimeError("production Runtime Host tool hook socket is missing") from error
+    if (
+        path.is_symlink()
+        or not stat.S_ISSOCK(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        raise RuntimeError("production Runtime Host tool hook socket is unsafe")
+    parent = path.parent.lstat()
+    if (
+        path.parent.is_symlink()
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.geteuid()
+        or stat.S_IMODE(parent.st_mode) != 0o700
+    ):
+        raise RuntimeError("production Runtime Host tool hook socket parent is unsafe")
+    return {
+        "path": str(path),
+        "uid": info.st_uid,
+        "mode": stat.S_IMODE(info.st_mode),
+        "device": info.st_dev,
+        "inode": info.st_ino,
+    }
+
+
+def _runtime_hook_socket_is_live(path: Path, identity: object) -> bool:
+    if not isinstance(identity, dict):
+        return False
+    try:
+        observed = _runtime_hook_socket_identity(path)
+        if observed != identity:
+            return False
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.5)
+            probe.connect(str(path))
+        return True
+    except (OSError, RuntimeError):
+        return False
+
+
+def _wait_for_runtime_hook(
+    process: subprocess.Popen[Any], layout: dict[str, Path]
+) -> dict[str, Any]:
+    for _ in range(100):
+        if process.poll() is not None:
+            raise RuntimeError("production Runtime Host tool hook exited during startup")
+        identity = _runtime_hook_socket_identity_or_none(layout["runtime_hook_socket"])
+        if identity is not None and _runtime_hook_socket_is_live(layout["runtime_hook_socket"], identity):
+            return identity
+        time.sleep(0.1)
+    raise RuntimeError("production Runtime Host tool hook did not become ready")
+
+
+def _runtime_hook_socket_identity_or_none(path: Path) -> dict[str, Any] | None:
+    try:
+        return _runtime_hook_socket_identity(path)
+    except RuntimeError:
+        return None
+
+
+def _unlink_runtime_hook_socket(path: Path, identity: object) -> None:
+    if not isinstance(identity, dict) or _runtime_hook_socket_identity(path) != identity:
+        raise RuntimeError("refusing to remove changed production Runtime Host tool hook socket")
+    path.unlink()
+
+
 def _stop_verified_local_runtime(state: dict[str, Any], layout: dict[str, Path]) -> None:
+    is_current_release_state = state.get("release_manifest") == str(layout["release_manifest"])
+    if is_current_release_state:
+        hook_pid = state.get("runtime_hook_pid")
+        hook_identity = state.get("runtime_hook_process_identity")
+        hook_socket_identity = state.get("runtime_hook_socket_identity")
+        if (
+            not isinstance(hook_pid, int)
+            or not isinstance(hook_identity, dict)
+            or hook_identity.get("pid") != hook_pid
+            or not isinstance(hook_socket_identity, dict)
+        ):
+            raise RuntimeError(
+                "cannot stop current production runtime without exact Runtime Host tool hook state"
+            )
+        _validate_process_identity_record(hook_identity)
     targets: list[tuple[dict[str, Any], bool]] = []
     for pid_key, identity_key, process_group in (
         ("bridge_pid", "bridge_process_identity", False),
+        ("runtime_hook_pid", "runtime_hook_process_identity", False),
         ("host_pid", "host_process_identity", False),
         ("catdesk_supervisor_pid", "catdesk_supervisor_process_identity", True),
     ):
@@ -4439,6 +4880,10 @@ def _stop_verified_local_runtime(state: dict[str, Any], layout: dict[str, Path])
         if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid():
             raise RuntimeError("refusing to remove unsafe production Bridge socket")
         layout["bridge_socket"].unlink()
+    if layout["runtime_hook_socket"].exists() or layout["runtime_hook_socket"].is_symlink():
+        _unlink_runtime_hook_socket(
+            layout["runtime_hook_socket"], state.get("runtime_hook_socket_identity")
+        )
 
 
 def _stop_prior_local_runtime_for_release_upgrade(state: dict[str, Any], layout: dict[str, Path]) -> None:
@@ -4446,6 +4891,7 @@ def _stop_prior_local_runtime_for_release_upgrade(state: dict[str, Any], layout:
     live_state = dict(state)
     for pid_key, identity_key in (
         ("bridge_pid", "bridge_process_identity"),
+        ("runtime_hook_pid", "runtime_hook_process_identity"),
         ("host_pid", "host_process_identity"),
         ("catdesk_supervisor_pid", "catdesk_supervisor_process_identity"),
     ):
@@ -4818,6 +5264,101 @@ def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _runtime_host_tool_hook_source_bytes(relative: str) -> bytes:
+    if relative not in RUNTIME_HOST_TOOL_HOOK_BUNDLE_RELATIVE_PATHS:
+        raise RuntimeError("Runtime Host tool hook source path is not part of the pinned bundle")
+    root = RUNTIME_HOST_TOOL_HOOK_SOURCE_ROOT.expanduser()
+    if not root.is_absolute() or not (root / ".git").exists():
+        raise RuntimeError("pinned Runtime Host tool hook source repository is unavailable")
+    revision = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--verify", f"{RUNTIME_HOST_TOOL_HOOK_RUNTIME_REVISION}^{{commit}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if revision.returncode != 0 or revision.stdout.strip() != RUNTIME_HOST_TOOL_HOOK_RUNTIME_REVISION:
+        raise RuntimeError("pinned Runtime Host tool hook revision is unavailable")
+    candidate = f"{RUNTIME_HOST_TOOL_HOOK_RUNTIME_REVISION}:{relative}"
+    completed = subprocess.run(
+        ["git", "-C", str(root), "show", candidate],
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0 or not completed.stdout:
+        raise RuntimeError("pinned Runtime Host tool hook source is unavailable")
+    return completed.stdout
+
+
+def _runtime_host_tool_hook_bundle_paths(layout: dict[str, Path]) -> tuple[Path, ...]:
+    return tuple(layout["runtime_hook_dir"] / relative for relative in RUNTIME_HOST_TOOL_HOOK_BUNDLE_RELATIVE_PATHS)
+
+
+def _materialize_runtime_host_tool_hook(layout: dict[str, Path]) -> None:
+    entrypoint = layout["runtime_hook_entrypoint"]
+    if entrypoint not in _runtime_host_tool_hook_bundle_paths(layout):
+        raise RuntimeError("Runtime Host tool hook entrypoint is outside its pinned bundle")
+    for relative, destination in zip(
+        RUNTIME_HOST_TOOL_HOOK_BUNDLE_RELATIVE_PATHS,
+        _runtime_host_tool_hook_bundle_paths(layout),
+        strict=True,
+    ):
+        payload = _runtime_host_tool_hook_source_bytes(relative)
+        _write_text_private(
+            destination,
+            payload.decode("utf-8"),
+            0o700 if destination == entrypoint else 0o600,
+        )
+
+
+def _validate_runtime_host_tool_hook_release_files(layout: dict[str, Path]) -> None:
+    release_dir = layout["release_dir"].resolve(strict=True)
+    bundle = _runtime_host_tool_hook_bundle_paths(layout)
+    if len(bundle) != len(set(bundle)) or layout["runtime_hook_entrypoint"] not in bundle:
+        raise RuntimeError("production Runtime Host tool hook bundle is malformed")
+    for path in bundle:
+        try:
+            resolved = path.resolve(strict=True)
+            info = path.lstat()
+        except FileNotFoundError as error:
+            raise RuntimeError(f"production Runtime Host tool hook artifact is missing: {path}") from error
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) & 0o077
+            or not resolved.is_relative_to(release_dir)
+        ):
+            raise RuntimeError(f"production Runtime Host tool hook artifact is unsafe: {path}")
+    if not os.access(layout["runtime_hook_entrypoint"], os.X_OK):
+        raise RuntimeError("production Runtime Host tool hook entrypoint is not executable")
+
+
+def _runtime_host_tool_hook_record(layout: dict[str, Path], installed: dict[str, Any]) -> dict[str, Any]:
+    _validate_runtime_host_tool_hook_release_files(layout)
+    artifacts = installed.get("artifacts_sha256")
+    if not isinstance(artifacts, dict):
+        raise RuntimeError("production release manifest has no Runtime Host tool hook hashes")
+    bundle_sha256: dict[str, str] = {}
+    for path in _runtime_host_tool_hook_bundle_paths(layout):
+        relative = str(path.relative_to(layout["release_dir"]))
+        digest = _sha256_file(path)
+        if artifacts.get(relative) != digest:
+            raise RuntimeError("Runtime Host tool hook artifact is not pinned to the immutable release")
+        bundle_sha256[str(path.resolve(strict=True))] = digest
+    runtime = (installed.get("runtime_dependencies") or {}).get("python")
+    if not isinstance(runtime, dict):
+        raise RuntimeError("production Runtime Host tool hook Python pin is missing")
+    return {
+        "protocol": RUNTIME_HOST_TOOL_HOOK_PROTOCOL,
+        "runtime_revision": RUNTIME_HOST_TOOL_HOOK_RUNTIME_REVISION,
+        "executable": str(layout["runtime_hook_entrypoint"].resolve(strict=True)),
+        "sha256": _sha256_file(layout["runtime_hook_entrypoint"]),
+        "bundle_sha256": bundle_sha256,
+        "python": dict(runtime),
+        "ai_bridge_is_trusted_receipt_source": False,
+    }
+
+
 def _node_runtime_dependency(node_executable: Path | None = None) -> dict[str, str]:
     raw = str(node_executable) if node_executable is not None else shutil.which("node")
     if not raw:
@@ -4831,7 +5372,15 @@ def _node_runtime_dependency(node_executable: Path | None = None) -> dict[str, s
     return {"path": str(path), "sha256": _sha256_file(path)}
 
 
-def _validate_runtime_dependencies(manifest: dict[str, Any]) -> dict[str, dict[str, str]]:
+def _python_runtime_dependency(python_executable: Path | None = None) -> dict[str, Any]:
+    path = _validate_trusted_python_binary(
+        python_executable or _kernel_python_executable(), "Runtime Host tool hook Python executable"
+    ).resolve(strict=True)
+    info = path.stat()
+    return {"path": str(path), "inode": info.st_ino, "sha256": _sha256_file(path)}
+
+
+def _validate_runtime_dependencies(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
     dependencies = manifest.get("runtime_dependencies")
     node = dependencies.get("node") if isinstance(dependencies, dict) else None
     if not isinstance(node, dict):
@@ -4851,7 +5400,37 @@ def _validate_runtime_dependencies(manifest: dict[str, Any]) -> dict[str, dict[s
         raise RuntimeError("production Node.js runtime path is not immutable and canonical")
     if _sha256_file(path) != expected_sha256:
         raise RuntimeError("production Node.js runtime hash mismatch")
-    return {"node": {"path": raw_path, "sha256": expected_sha256}}
+    python = dependencies.get("python") if isinstance(dependencies, dict) else None
+    if not isinstance(python, dict):
+        raise RuntimeError("production release manifest is missing the Runtime Host tool hook Python dependency")
+    python_path = python.get("path")
+    python_inode = python.get("inode")
+    python_digest = python.get("sha256")
+    if not isinstance(python_path, str) or not Path(python_path).is_absolute():
+        raise RuntimeError("production Runtime Host tool hook Python path is not absolute")
+    if not isinstance(python_inode, int) or python_inode < 1 or not isinstance(python_digest, str) or len(python_digest) != 64:
+        raise RuntimeError("production Runtime Host tool hook Python pin is invalid")
+    python_file = Path(python_path)
+    try:
+        python_resolved = python_file.resolve(strict=True)
+        python_info = python_file.lstat()
+    except FileNotFoundError as error:
+        raise RuntimeError("production Runtime Host tool hook Python is unavailable") from error
+    if (
+        python_resolved != python_file
+        or python_file.is_symlink()
+        or not python_file.is_file()
+        or python_info.st_uid not in {0, os.geteuid()}
+        or stat.S_IMODE(python_info.st_mode) & 0o022
+        or python_info.st_ino != python_inode
+        or not os.access(python_file, os.X_OK)
+        or _sha256_file(python_file) != python_digest
+    ):
+        raise RuntimeError("production Runtime Host tool hook Python pin mismatch")
+    return {
+        "node": {"path": raw_path, "sha256": expected_sha256},
+        "python": {"path": python_path, "inode": python_inode, "sha256": python_digest},
+    }
 
 
 def _catdesk_runner_source(manifest: dict[str, Any], layout: dict[str, Path]) -> str:
@@ -4958,7 +5537,10 @@ def release_manifest(
         "historical_connectors_forbidden": list(HISTORICAL_CONNECTOR_NAMES),
         "workspace": str(root),
         "required_tools": sorted(REQUIRED_TOOLS),
-        "runtime_dependencies": {"node": _node_runtime_dependency(node_executable)},
+        "runtime_dependencies": {
+            "node": _node_runtime_dependency(node_executable),
+            "python": _python_runtime_dependency(),
+        },
         "tunnel": {
             "profile_name": TUNNEL_PROFILE_NAME,
             "legacy_profile_names_forbidden": list(HISTORICAL_TUNNEL_PROFILE_NAMES),

@@ -11,7 +11,7 @@ import unittest
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from scripts import production_connector as pc
 
@@ -372,7 +372,9 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 "host_verifier_state",
                 "host_reentry_state",
                 "host_extension_binding",
+                "host_tool_receipt_state",
                 "bridge_state_dir",
+                "bridge_receipt_journal",
                 "catdesk_child_pid",
             ):
                 self.assertTrue(layout[key].is_relative_to(runtime_generation_dir), key)
@@ -380,6 +382,15 @@ class ProductionConnectorContractTests(unittest.TestCase):
             host_socket_dir = socket.parent / f"{REVISION}-g7"
             self.assertEqual(layout["host_socket_dir"], host_socket_dir)
             self.assertEqual(layout["host_socket"], host_socket_dir / "host.sock")
+            self.assertEqual(layout["runtime_hook_socket_dir"], host_socket_dir)
+            self.assertEqual(
+                layout["bridge_receipt_journal"],
+                layout["bridge_state_dir"] / "tool-receipt-journal.json",
+            )
+            self.assertEqual(
+                layout["runtime_hook_socket"],
+                layout["runtime_hook_socket_dir"] / "runtime-host-tool-hook.sock",
+            )
             self.assertFalse(layout["host_socket"].is_relative_to(layout["release_dir"]))
             self.assertEqual(
                 layout["release_catdesk_config"],
@@ -410,6 +421,18 @@ class ProductionConnectorContractTests(unittest.TestCase):
                     str(layout["release_manifest"]),
                 )
             self.assertEqual(env["bridge"]["LAB_BRIDGE_SOCKET"], str(socket))
+            self.assertEqual(
+                env["host"]["LAB_HOST_TOOL_RECEIPT_STATE_FILE"],
+                str(layout["host_tool_receipt_state"]),
+            )
+            self.assertEqual(
+                env["bridge"]["LAB_RUNTIME_HOST_TOOL_HOOK_SOCKET"],
+                str(layout["runtime_hook_socket"]),
+            )
+            self.assertEqual(
+                env["bridge"]["LAB_BRIDGE_STATE_DIR"],
+                str(layout["bridge_state_dir"]),
+            )
             self.assertEqual(env["bridge"]["LAB_PRODUCTION_WORKSPACE"], str(pc.canonical_workspace()))
             self.assertEqual(env["bridge"]["LAB_PRODUCTION_TUNNEL_PROFILE_NAME"], pc.TUNNEL_PROFILE_NAME)
             self.assertIn("host_attestation", env["bridge"]["LAB_BRIDGE_CAPABILITIES"])
@@ -492,6 +515,24 @@ class ProductionConnectorContractTests(unittest.TestCase):
             node = installed_manifest["runtime_dependencies"]["node"]
             self.assertTrue(Path(node["path"]).is_absolute())
             self.assertEqual(node["sha256"], pc._sha256_file(Path(node["path"])))
+            runtime_python = installed_manifest["runtime_dependencies"]["python"]
+            self.assertTrue(Path(runtime_python["path"]).is_absolute())
+            self.assertEqual(runtime_python["sha256"], pc._sha256_file(Path(runtime_python["path"])))
+            self.assertEqual(runtime_python["inode"], Path(runtime_python["path"]).stat().st_ino)
+            runtime_hook = layout["runtime_hook_entrypoint"]
+            self.assertTrue(runtime_hook.is_file())
+            self.assertEqual(
+                installed_manifest["runtime_host_tool_hook"]["protocol"],
+                "runtime_host_tool_hook_v1",
+            )
+            self.assertEqual(
+                installed_manifest["runtime_host_tool_hook"]["runtime_revision"],
+                pc.RUNTIME_HOST_TOOL_HOOK_RUNTIME_REVISION,
+            )
+            self.assertEqual(
+                installed_manifest["runtime_host_tool_hook"]["bundle_sha256"][str(runtime_hook.resolve())],
+                pc._sha256_file(runtime_hook),
+            )
             self.assertIn(f"exec {node['path']}", layout["native_host_wrapper"].read_text(encoding="utf-8"))
             verifier_wrapper = layout["runtime_verifier_wrapper"].read_text(
                 encoding="utf-8"
@@ -589,6 +630,45 @@ class ProductionConnectorContractTests(unittest.TestCase):
             layout["bridge_binary"].write_bytes(b"tampered")
             with self.assertRaisesRegex(RuntimeError, "hash|artifact"):
                 pc.validate_installed_release(layout)
+
+    def test_runtime_host_tool_hook_source_and_socket_identity_fail_closed(self):
+        source = pc._runtime_host_tool_hook_source_bytes(
+            pc.RUNTIME_HOST_TOOL_HOOK_ENTRYPOINT_RELATIVE_PATH
+        )
+        self.assertIn(b"HOOK_PROTOCOL = \"runtime_host_tool_hook_v1\"", source)
+        with patch.object(pc, "RUNTIME_HOST_TOOL_HOOK_RUNTIME_REVISION", "0" * 40):
+            with self.assertRaisesRegex(RuntimeError, "revision|source"):
+                pc._runtime_host_tool_hook_source_bytes(
+                    pc.RUNTIME_HOST_TOOL_HOOK_ENTRYPOINT_RELATIVE_PATH
+                )
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            socket_path = root / "generation-fenced" / "runtime.sock"
+            pc._prepare_private_unix_socket_path(socket_path)
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                listener.bind(str(socket_path))
+                socket_path.chmod(0o600)
+                listener.listen(1)
+                identity = pc._runtime_hook_socket_identity(socket_path)
+                self.assertTrue(pc._runtime_hook_socket_is_live(socket_path, identity))
+                socket_path.chmod(0o660)
+                self.assertFalse(pc._runtime_hook_socket_is_live(socket_path, identity))
+            finally:
+                listener.close()
+
+    def test_current_release_stop_requires_runtime_hook_identity(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest, runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
+            )
+            with self.assertRaisesRegex(RuntimeError, "Runtime Host tool hook state"):
+                pc._stop_verified_local_runtime(
+                    {"release_manifest": str(layout["release_manifest"])}, layout
+                )
 
     def test_install_release_rejects_noncanonical_show_detail_mode_and_cleans_partial_release(self):
         manifest = self._manifest()
@@ -880,7 +960,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 verifier["executable"],
                 str(layout["runtime_verifier_wrapper"].resolve(strict=True)),
             )
-            self.assertEqual(verifier["protocol"], "runtime_host_verifier_cli_v1")
+            self.assertEqual(verifier["protocol"], "runtime_host_verifier_cli_v2")
             self.assertEqual(
                 set(verifier["bundle_sha256"]),
                 {
@@ -2776,6 +2856,16 @@ class ProductionConnectorContractTests(unittest.TestCase):
                     {"name": "bridge_get_status"},
                 ]},
             }
+            process_identities = {
+                "ai_bridge": self._identity(
+                    101, ["/Applications/AI-Bridge.app/Contents/MacOS/ai-bridge"]
+                ),
+                "tunnel": self._identity(102, ["/private/tunnel-client", "run"]),
+                "compute_helper": self._identity(
+                    103,
+                    ["/Applications/Compute Helper.app/Contents/MacOS/compute-helper"],
+                ),
+            }
             with patch.object(
                 pc.urllib.request,
                 "urlopen",
@@ -2784,15 +2874,26 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 pc, "_tcp_ready", return_value=True
             ) as tcp_ready, patch.object(
                 pc, "_mcp_streamable_tools_list", return_value=tools_status
-            ) as handshake:
+            ) as handshake, patch.object(
+                pc,
+                "_ai_bridge_fallback_process_identities",
+                return_value=process_identities,
+            ) as process_check:
                 guard = pc._verify_ai_bridge_fallback(health_file)
             self.assertTrue(guard["ready"])
+            self.assertFalse(guard["ai_bridge_is_trusted_receipt_source"])
             self.assertEqual(guard["compute_host"], "127.0.0.1")
             self.assertEqual(guard["compute_port"], 52342)
             self.assertEqual(guard["tools"], ["bridge_get_status", "computer", "shell_command"])
             self.assertEqual(urlopen.call_count, 1)
             handshake.assert_called_once_with("http://127.0.0.1:52342/mcp/private-slug")
             tcp_ready.assert_called_once_with("127.0.0.1", 52342)
+            process_check.assert_called_once_with(
+                health_host="127.0.0.1",
+                health_port=52354,
+                compute_host="127.0.0.1",
+                compute_port=52342,
+            )
 
             for mismatched_route in (
                 "127.0.0.1:52343",
@@ -2830,8 +2931,86 @@ class ProductionConnectorContractTests(unittest.TestCase):
             with patch.object(pc.urllib.request, "urlopen", return_value=health_response), patch.object(
                 pc, "_tcp_ready", return_value=True
             ):
-                with self.assertRaisesRegex(RuntimeError, "loopback|compute"):
-                    pc._verify_ai_bridge_fallback(health_file)
+                        with self.assertRaisesRegex(RuntimeError, "loopback|compute"):
+                            pc._verify_ai_bridge_fallback(health_file)
+
+    def test_ai_bridge_fallback_stable_identity_excludes_uptime_and_binds_processes(self):
+        status = {
+            "client_instance_id": "ai-bridge-instance-1",
+            "version": "1.2.3",
+            "control_plane_tunnel_id": "tunnel-main",
+            "control_plane_base_url": "https://api.openai.com",
+            "control_plane_route": "/v1/agent-bridge",
+            "mcp_server_url": "http://127.0.0.1:52342/mcp",
+            "health_listen_addr": "127.0.0.1:52354",
+            "control_plane": {"tunnel_id": "tunnel-main", "base_url": "https://api.openai.com"},
+            "uptime_seconds": 10,
+            "channels": [{
+                "name": "main", "enabled": True, "probe_status": "ok",
+                "server_kind": "mcp", "transport_kind": "http",
+                "started_at": "2026-09-12T00:00:00Z",
+            }],
+            "mcp_routes": [{"channel": "main", "target": "127.0.0.1:52342"}],
+        }
+        process_identities = {
+            "ai_bridge": self._identity(101, ["/Applications/AI-Bridge.app/Contents/MacOS/ai-bridge"]),
+            "tunnel": self._identity(102, ["/private/tunnel-client", "run"]),
+            "compute_helper": self._identity(103, ["/Applications/Compute Helper.app/Contents/MacOS/compute-helper"]),
+        }
+        first = pc._stable_ai_bridge_fallback_identity(
+            status, status["channels"][0], "http://127.0.0.1:52342/mcp", process_identities
+        )
+        second_status = json.loads(json.dumps(status))
+        second_status["uptime_seconds"] = 11
+        second = pc._stable_ai_bridge_fallback_identity(
+            second_status, second_status["channels"][0], "http://127.0.0.1:52342/mcp", process_identities
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first["ai_bridge_process_identity"], process_identities["ai_bridge"])
+        self.assertEqual(first["compute_helper_process_identity"], process_identities["compute_helper"])
+        self.assertEqual(first["tunnel_process_identity"], process_identities["tunnel"])
+        self.assertEqual(first["service"]["control_plane_tunnel_id"], "tunnel-main")
+        self.assertEqual(first["service"]["control_plane_route"], "/v1/agent-bridge")
+
+    def test_ai_bridge_fallback_process_topology_binds_real_listener_owners_and_helper_socket(self):
+        ai_bridge = self._identity(101, [str(pc.AI_BRIDGE_EXECUTABLE)])
+        tunnel = self._identity(102, ["/private/tunnel-client", "run"])
+        compute_helper = self._identity(103, [str(pc.COMPUTE_HELPER_EXECUTABLE)])
+        with patch.object(
+            pc,
+            "_unique_process_identity_for_executable",
+            side_effect=[ai_bridge, compute_helper],
+        ) as process_lookup, patch.object(
+            pc, "_unique_tunnel_child_identity", return_value=tunnel
+        ) as tunnel_lookup, patch.object(
+            pc,
+            "_unique_loopback_listener_identity",
+            side_effect=[tunnel, ai_bridge],
+        ) as listener_lookup, patch.object(
+            pc, "_verify_process_owned_unix_socket"
+        ) as socket_check:
+            observed = pc._ai_bridge_fallback_process_identities(
+                health_host="127.0.0.1",
+                health_port=52354,
+                compute_host="127.0.0.1",
+                compute_port=52342,
+            )
+        self.assertEqual(
+            observed,
+            {"ai_bridge": ai_bridge, "tunnel": tunnel, "compute_helper": compute_helper},
+        )
+        self.assertEqual(process_lookup.call_count, 2)
+        tunnel_lookup.assert_called_once_with(ai_bridge)
+        self.assertEqual(
+            listener_lookup.call_args_list,
+            [
+                call("127.0.0.1", 52354, "AI-Bridge health"),
+                call("127.0.0.1", 52342, "AI-Bridge compute route"),
+            ],
+        )
+        socket_check.assert_called_once_with(
+            compute_helper, pc.COMPUTE_HELPER_SOCKET, "Compute Helper"
+        )
 
     def test_fallback_mcp_streamable_handshake_orders_requests_and_cleans_session(self):
         with fake_mcp_streamable_server() as (compute_url, events):
@@ -3623,7 +3802,9 @@ class ProductionConnectorContractTests(unittest.TestCase):
             node.write_text("node", encoding="utf-8")
             node.chmod(0o700)
             kernel_python = root / "kernel-python"
-            processes = [MagicMock(pid=801), MagicMock(pid=802), MagicMock(pid=803)]
+            processes = [
+                MagicMock(pid=801), MagicMock(pid=802), MagicMock(pid=803), MagicMock(pid=804)
+            ]
             identities = [
                 self._identity(process.pid, [f"/private/process-{process.pid}"])
                 for process in processes
@@ -3660,15 +3841,22 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 ) as spawn, patch.object(
                     pc, "_capture_process_identity", side_effect=identities
                 ) as capture, patch.object(pc, "_wait_for_tcp"), patch.object(
+                    pc, "_wait_for_runtime_hook", return_value={
+                        "path": str(layout["runtime_hook_socket"]),
+                        "uid": os.geteuid(), "mode": 0o600, "device": 1, "inode": 2,
+                    }
+                ), patch.object(
                     pc, "_wait_for_bridge", side_effect=bridge_became_ready
                 ), patch.object(
-                    pc, "_validate_runtime_dependencies", return_value={"node": {"path": str(node)}}
+                    pc, "_validate_runtime_dependencies", return_value={
+                        "node": {"path": str(node)}, "python": {"path": str(kernel_python)}
+                    }
                 ), patch.object(pc, "_stop_verified_process_identity") as stop:
                     with self.assertRaisesRegex(RuntimeError, "post-start status"):
                         pc.start_local_runtime(manifest, layout)
             finally:
                 bridge_listener.close()
-            self.assertEqual(stop.call_count, 3)
+            self.assertEqual(stop.call_count, 4)
             stop_prior.assert_called_once_with(prior, layout)
             self.assertEqual(spawn.call_args_list[0].args[0][0], str(kernel_python))
             self.assertEqual(
