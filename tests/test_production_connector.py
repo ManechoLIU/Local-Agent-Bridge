@@ -389,7 +389,16 @@ class ProductionConnectorContractTests(unittest.TestCase):
             )
             self.assertEqual(
                 layout["runtime_hook_socket"],
-                layout["runtime_hook_socket_dir"] / "runtime-host-tool-hook.sock",
+                layout["runtime_hook_socket_dir"] / "rh.sock",
+            )
+            self.assertLessEqual(
+                len(
+                    os.fsencode(
+                        str(pc.production_layout(manifest)["runtime_hook_socket"])
+                    )
+                ),
+                103,
+                "the canonical generation-fenced Runtime hook socket must fit macOS sockaddr_un",
             )
             self.assertFalse(layout["host_socket"].is_relative_to(layout["release_dir"]))
             self.assertEqual(

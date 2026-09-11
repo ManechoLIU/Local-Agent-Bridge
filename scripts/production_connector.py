@@ -308,7 +308,7 @@ def production_layout(
         "bridge_state_dir": runtime_generation_dir / "bridge",
         "bridge_receipt_journal": runtime_generation_dir / "bridge" / "tool-receipt-journal.json",
         "runtime_hook_socket_dir": host_socket_dir,
-        "runtime_hook_socket": host_socket_dir / "runtime-host-tool-hook.sock",
+        "runtime_hook_socket": host_socket_dir / "rh.sock",
         "bridge_socket": Path(bridge_socket),
         "release_tunnel_profile": release_dir / "tunnel" / f"{TUNNEL_PROFILE_NAME}.yaml",
         "tunnel_dir": tunnel_dir,
