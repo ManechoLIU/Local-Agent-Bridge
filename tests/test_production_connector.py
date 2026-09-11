@@ -1429,6 +1429,224 @@ class ProductionConnectorContractTests(unittest.TestCase):
             readiness_open.assert_called_once()
             readiness_sleep.assert_not_called()
 
+    def test_tunnel_startup_chain_accepts_only_v0014_alternate_chain_without_metadata(self):
+        init = {
+            "timestamp": 1001.0,
+            "component": "mcpclient",
+            "msg": "mcp session initialized",
+            "tunnel_id": "tunnel-production",
+            "client_instance_id": "instance-production-1",
+            "server_name": "catdesk",
+            "protocol_version": "2026-07-28",
+        }
+        started = {
+            "timestamp": 1002.0,
+            "msg": "🟢 tunnel-client started",
+            "tunnel_id": "tunnel-production",
+            "client_instance_id": "instance-production-1",
+            "name": "Production Connector",
+            "version": "0.0.14+test",
+        }
+        with tempfile.TemporaryDirectory() as raw_root:
+            log_path = Path(raw_root) / "tunnel.jsonl"
+
+            def read(events):
+                log_path.write_text(
+                    "\n".join(json.dumps(event) for event in events) + "\n",
+                    encoding="utf-8",
+                )
+                log_path.chmod(0o600)
+                return pc._read_tunnel_startup_event_chain(
+                    log_path,
+                    expected_tunnel_id="tunnel-production",
+                    started_at=1000.0,
+                    verification_time=1003.0,
+                )
+
+            self.assertEqual(
+                [event["msg"] for event in read([init, started])],
+                ["mcp session initialized", "🟢 tunnel-client started"],
+            )
+
+            for name, events in {
+                "started_without_init": [started],
+                "metadata_without_init": [{
+                    "timestamp": 1001.0,
+                    "component": "controlplane",
+                    "msg": "tunnel metadata fetched",
+                    "tunnel_id": "tunnel-production",
+                    "client_instance_id": "instance-production-1",
+                    "name": "Production Connector",
+                }],
+                "metadata_then_started_without_init": [{
+                    "timestamp": 1001.0,
+                    "component": "controlplane",
+                    "msg": "tunnel metadata fetched",
+                    "tunnel_id": "tunnel-production",
+                    "client_instance_id": "instance-production-1",
+                    "name": "Production Connector",
+                }, started],
+                "wrong_tunnel": [init, {**started, "tunnel_id": "tunnel-other"}],
+                "wrong_instance": [init, {**started, "client_instance_id": "instance-production-2"}],
+                "out_of_order_time": [init, {**started, "timestamp": 1000.5}],
+                "missing_started_name": [init, {key: value for key, value in started.items() if key != "name"}],
+                "missing_version": [init, {key: value for key, value in started.items() if key != "version"}],
+                "non_v0014_alternate_chain": [init, {**started, "version": "0.0.13"}],
+            }.items():
+                with self.subTest(name=name):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "event chain|tunnel.?id|instance|timestamps|name|version"
+                    ):
+                        read(events)
+
+            with self.assertRaises(pc._TransientTunnelStartupEventError):
+                read([init])
+
+    def test_tunnel_operational_gate_requires_all_evidence_for_v0014_alternate_chain(self):
+        init = {
+            "timestamp": 1001.0,
+            "component": "mcpclient",
+            "msg": "mcp session initialized",
+            "tunnel_id": "tunnel-production",
+            "client_instance_id": "instance-production-1",
+            "server_name": "catdesk",
+            "protocol_version": "2026-07-28",
+        }
+        started = {
+            "timestamp": 1002.0,
+            "msg": "🟢 tunnel-client started",
+            "tunnel_id": "tunnel-production",
+            "client_instance_id": "instance-production-1",
+            "name": "Production Connector",
+            "version": "0.0.14+test",
+        }
+        status_body = json.dumps({
+            "control_plane_tunnel_id": "tunnel-production",
+            "channels": {"main": {"enabled": True, "probe_status": "ok"}},
+        }).encode("utf-8")
+        fresh_metrics = (
+            'commands_poll_cycles_total{otel_scope_name="controlplane",service_name="tunnel-client"} 1\n'
+            'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane",service_name="tunnel-client"} 1001\n'
+        ).encode("utf-8")
+
+        def response(url, body, content_type="application/json"):
+            observed = MagicMock()
+            observed.status = 200
+            observed.read.return_value = body
+            observed.geturl.return_value = url
+            observed.headers.get.return_value = content_type
+            observed.__enter__.return_value = observed
+            return observed
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                self._manifest(), runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
+            )
+            layout["tunnel_health_url"].parent.mkdir(parents=True)
+            layout["tunnel_health_url"].write_text("http://127.0.0.1:49152\n", encoding="utf-8")
+            layout["tunnel_health_url"].chmod(0o600)
+            layout["tunnel_log"].parent.mkdir(parents=True)
+            layout["tunnel_log"].write_text(
+                "\n".join(json.dumps(event) for event in [init, started]) + "\n",
+                encoding="utf-8",
+            )
+            layout["tunnel_log"].chmod(0o600)
+            identity = self._identity(303, ["/opt/tunnel-client", "run"])
+
+            with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                pc, "_process_identity_matches", return_value=True
+            ), patch.object(
+                pc.TUNNEL_HEALTH_OPENER,
+                "open",
+                side_effect=[
+                    response("http://127.0.0.1:49152/api/status", status_body),
+                    response(
+                        "http://127.0.0.1:49152/metrics",
+                        fresh_metrics,
+                        "text/plain; version=0.0.4; charset=utf-8; escaping=underscores",
+                    ),
+                ],
+            ):
+                observed = pc._verify_tunnel_operational(
+                    layout,
+                    expected_tunnel_id="tunnel-production",
+                    started_at=1000.0,
+                    expected_process_identity=identity,
+                )
+            self.assertEqual(
+                [event["msg"] for event in observed["startup_operational_events"]],
+                ["mcp session initialized", "🟢 tunnel-client started"],
+            )
+
+            for name, metrics in {
+                "zero_cycles": fresh_metrics.replace(b"} 1\n", b"} 0\n", 1),
+                "before_started": fresh_metrics.replace(b"} 1001\n", b"} 999\n", 1),
+                "stale_success": fresh_metrics.replace(b"} 1001\n", b"} 900\n", 1),
+            }.items():
+                with self.subTest(name=name), patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                    pc, "_process_identity_matches", return_value=True
+                ), patch.object(
+                    pc.TUNNEL_HEALTH_OPENER,
+                    "open",
+                    side_effect=[
+                        response("http://127.0.0.1:49152/api/status", status_body),
+                        response(
+                            "http://127.0.0.1:49152/metrics",
+                            metrics,
+                            "text/plain; version=0.0.4; charset=utf-8; escaping=underscores",
+                        ),
+                    ],
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "cycles|fresh|stale"):
+                        pc._verify_tunnel_operational(
+                            layout,
+                            expected_tunnel_id="tunnel-production",
+                            started_at=1000.0,
+                            expected_process_identity=identity,
+                        )
+
+            with patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                pc, "_process_identity_matches", side_effect=[True, False]
+            ), patch.object(
+                pc.TUNNEL_HEALTH_OPENER,
+                "open",
+                side_effect=[
+                    response("http://127.0.0.1:49152/api/status", status_body),
+                    response(
+                        "http://127.0.0.1:49152/metrics",
+                        fresh_metrics,
+                        "text/plain; version=0.0.4; charset=utf-8; escaping=underscores",
+                    ),
+                ],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "identity"):
+                    pc._verify_tunnel_operational(
+                        layout,
+                        expected_tunnel_id="tunnel-production",
+                        started_at=1000.0,
+                        expected_process_identity=identity,
+                    )
+
+            for name, rejected_status, error in (
+                ("wrong_tunnel_id", status_body.replace(b"tunnel-production", b"tunnel-other"), "tunnel_id"),
+                ("pending_main", status_body.replace(b'"ok"', b'"pending"'), "main channel"),
+            ):
+                with self.subTest(name=name), patch.object(pc.time, "time", return_value=1003.0), patch.object(
+                    pc, "_process_identity_matches", return_value=True
+                ), patch.object(
+                    pc.TUNNEL_HEALTH_OPENER,
+                    "open",
+                    return_value=response("http://127.0.0.1:49152/api/status", rejected_status),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, error):
+                        pc._verify_tunnel_operational(
+                            layout,
+                            expected_tunnel_id="tunnel-production",
+                            started_at=1000.0,
+                            expected_process_identity=identity,
+                        )
+
     def test_tunnel_activation_retry_preserves_identity_origin_and_error_classification(self):
         manifest = self._manifest()
         with tempfile.TemporaryDirectory() as raw_root:

@@ -1248,11 +1248,17 @@ def _read_tunnel_startup_event_chain(
         if not isinstance(event_name, str) or event_name not in event_names:
             continue
         stage = event_names.index(event_name)
+        is_alternate_chain = (
+            stage == len(expected_events) - 1 and len(operational_events) == 1
+        )
         if stage == 0:
             operational_events = []
             client_instance_id = None
             tunnel_name = None
             last_event_at = None
+        elif is_alternate_chain:
+            # v0.0.14 permits this explicit init -> started alternate chain.
+            pass
         elif stage != len(operational_events):
             raise RuntimeError("production tunnel structured event chain is out of order")
 
@@ -1282,13 +1288,22 @@ def _read_tunnel_startup_event_chain(
                 raise RuntimeError("production tunnel metadata event name is missing")
             tunnel_name = observed_name
         else:
-            if event_value("name") != tunnel_name:
+            observed_name = event_value("name")
+            if not isinstance(observed_name, str) or not observed_name.strip():
+                raise RuntimeError("production tunnel started event name is missing")
+            if tunnel_name is not None and observed_name != tunnel_name:
                 raise RuntimeError("production tunnel started event name mismatch")
             observed_version = event_value("version")
             if not isinstance(observed_version, str) or not observed_version.strip():
                 raise RuntimeError("production tunnel started event version is missing")
+            if is_alternate_chain and re.fullmatch(
+                r"0\.0\.14(?:\+[0-9A-Za-z][0-9A-Za-z.-]*)?", observed_version
+            ) is None:
+                raise RuntimeError(
+                    "production tunnel alternate startup chain requires version 0.0.14"
+                )
         operational_events.append(event)
-        if len(operational_events) == len(expected_events):
+        if stage == len(expected_events) - 1:
             return operational_events
     raise _TransientTunnelStartupEventError(
         "production tunnel log has no fresh structured operational event chain"
