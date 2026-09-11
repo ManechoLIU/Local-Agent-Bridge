@@ -187,7 +187,7 @@ git commit -m "feat(bridge): gate shell dispatch on Host receipts"
 
 - [ ] **Step 1: Write failing verifier boundary tests**
 
-Use literal Task 1 receipts and the real CLI subprocess. Prove exact schema/profile/MAC, bounded freshness, current extension binding/instance/load epoch from the same fresh current-entry request, current-entry conversation and generation, all four request digests, execution/pre-chain IDs, terminal outcome and response digest. Reject unknown keys, old unprofiled receipts, forged or stale MACs, wrong current entry, changed pre/terminal chain, and caller-added Runtime Controller/turn fields.
+Use literal Task 1 receipts and the real CLI subprocess. Prove exact schema/profile/MAC, bounded freshness, current extension binding/instance/load epoch from the same fresh current-entry request, current-entry conversation and generation anchor, all four request digests, execution/pre-chain IDs, terminal outcome and response digest. Reject unknown keys, old unprofiled receipts, forged or stale MACs, wrong current entry, changed pre/terminal chain, and caller-added Runtime Controller/turn fields.
 
 - [ ] **Step 2: Run focused tests and capture RED**
 
@@ -204,6 +204,8 @@ Expected: FAIL because verifier v2 receipt commands do not exist.
 - [ ] **Step 3: Implement minimal verifier v2**
 
 Export pure Host receipt authentication helpers from `attestation.mjs`, then expose them through the existing immutable CLI/integration boundary. Add a backward-compatible client method that returns current entry and extension epoch from the same private Host response while preserving the legacy method shape. Reuse the configured private Host key and loaded-extension binding checks. The CLI reads one bounded JSON object and writes one bounded object; it does not accept caller identity as attestation, does not mutate Host journal state, and does not invoke a shell.
+
+`generation_anchor_sha256` is an additive Host-signed field on `runtime_host_current_entry_v1`: validation, signing, and verification require it so the verifier can compare the receipt with the same fresh browser generation. Existing v1 operation inputs, provenance, required fields, and result envelopes stay compatible; consumers that already authenticate the entire object continue to cover the additive field.
 
 ```json
 {
