@@ -178,6 +178,7 @@ git commit -m "feat(bridge): gate shell dispatch on Host receipts"
 - Modify: `experiments/web-host-attestation/chrome-host/client.test.mjs`
 - Modify: `experiments/web-host-attestation/chrome-host/integration.mjs`
 - Modify: `experiments/web-host-attestation/chrome-host/integration.test.mjs`
+- Modify: `experiments/web-host-attestation/chrome-host/native-host-core.mjs`
 - Modify: `experiments/web-host-attestation/chrome-host/native-host-core.test.mjs`
 - Modify: `experiments/web-host-attestation/chrome-host/runtime-verifier-cli.mjs`
 - Modify: `experiments/web-host-attestation/chrome-host/runtime-verifier-cli.test.mjs`
@@ -188,7 +189,7 @@ git commit -m "feat(bridge): gate shell dispatch on Host receipts"
 
 - [ ] **Step 1: Write failing verifier boundary tests**
 
-Use literal Task 1 receipts and the real CLI subprocess. Prove exact schema/profile/MAC, bounded freshness, current extension binding/instance/load epoch from the same fresh current-entry request, current-entry conversation and generation anchor, all four request digests, execution/pre-chain IDs, terminal outcome and response digest. Reject unknown keys, old unprofiled receipts, forged or stale MACs, wrong current entry, changed pre/terminal chain, and caller-added Runtime Controller/turn fields.
+Use literal Task 1 receipts and the real CLI subprocess. Prove exact schema/profile/MAC, bounded freshness, current extension binding/instance/load epoch from the same fresh current-entry request, current-entry conversation and generation anchor, all four request digests, execution/pre-chain IDs, terminal outcome and response digest. Reject unknown keys, old unprofiled receipts, forged or stale MACs, wrong current entry, changed pre/terminal chain, and caller-added Runtime Controller/turn fields. If the loaded extension epoch changes while an asynchronous browser current-entry request is in flight, discovery and receipt issue/consume fail closed instead of pairing the new browser entry with the old epoch.
 
 - [ ] **Step 2: Run focused tests and capture RED**
 
@@ -234,7 +235,7 @@ Run the Step 2 command plus the complete Task 1 Host suite. Expected: all pass a
 - [ ] **Step 5: Commit Task 3**
 
 ```bash
-git add experiments/web-host-attestation/attestation.mjs experiments/web-host-attestation/attestation.test.mjs experiments/web-host-attestation/chrome-host/client.mjs experiments/web-host-attestation/chrome-host/client.test.mjs experiments/web-host-attestation/chrome-host/integration.mjs experiments/web-host-attestation/chrome-host/integration.test.mjs experiments/web-host-attestation/chrome-host/native-host-core.test.mjs experiments/web-host-attestation/chrome-host/runtime-verifier-cli.mjs experiments/web-host-attestation/chrome-host/runtime-verifier-cli.test.mjs
+git add experiments/web-host-attestation/attestation.mjs experiments/web-host-attestation/attestation.test.mjs experiments/web-host-attestation/chrome-host/client.mjs experiments/web-host-attestation/chrome-host/client.test.mjs experiments/web-host-attestation/chrome-host/integration.mjs experiments/web-host-attestation/chrome-host/integration.test.mjs experiments/web-host-attestation/chrome-host/native-host-core.mjs experiments/web-host-attestation/chrome-host/native-host-core.test.mjs experiments/web-host-attestation/chrome-host/runtime-verifier-cli.mjs experiments/web-host-attestation/chrome-host/runtime-verifier-cli.test.mjs
 git commit -m "feat(host): verify tool receipts for Runtime"
 ```
 
