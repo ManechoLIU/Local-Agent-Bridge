@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import socket
 import stat
 import struct
@@ -140,6 +141,19 @@ class ProductionConnectorContractTests(unittest.TestCase):
             endpoint_generation=generation,
         )
 
+    def _browser_executable(self, root: Path) -> Path:
+        path = (
+            root
+            / "Google Chrome for Testing.app"
+            / "Contents"
+            / "MacOS"
+            / "Google Chrome for Testing"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"test-browser-executable")
+        path.chmod(0o700)
+        return path
+
     def _release_sources(self, root: Path) -> dict[str, Path]:
         sources_root = root / "sources"
         host = sources_root / "host"
@@ -150,6 +164,12 @@ class ProductionConnectorContractTests(unittest.TestCase):
         (chrome_host / "extension" / "manifest.json").write_text(
             json.dumps({"version": "0.1.1"}), encoding="utf-8"
         )
+        for relative in pc.RUNTIME_VERIFIER_BUNDLE_RELATIVE_PATHS:
+            path = host / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                path.write_text(f"// {relative}\n", encoding="utf-8")
+            path.chmod(0o700 if relative == "chrome-host/runtime-verifier-cli.mjs" else 0o600)
         for name in ("bridge", "catdesk"):
             path = sources_root / name
             path.write_bytes(name.encode() * 32)
@@ -185,6 +205,32 @@ class ProductionConnectorContractTests(unittest.TestCase):
             "host_source_dir": host,
             "tunnel_profile": tunnel,
         }
+
+    def _write_managed_extension_preferences(
+        self,
+        home: Path,
+        extension_dir: Path,
+        native_user_data_dirs=(),
+    ) -> None:
+        for user_data_dir in pc._managed_native_user_data_dirs(
+            home, native_user_data_dirs
+        ):
+            default_dir = user_data_dir / "Default"
+            default_dir.mkdir(parents=True, mode=0o700)
+            preferences = default_dir / "Secure Preferences"
+            preferences.write_text(
+                json.dumps(
+                    {
+                        "extensions": {
+                            "settings": {
+                                pc.HOST_EXTENSION_ID: {"path": str(extension_dir)}
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            preferences.chmod(0o600)
 
     def _healthy(self, manifest):
         return {
@@ -325,6 +371,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 "catdesk_home",
                 "host_verifier_state",
                 "host_reentry_state",
+                "host_extension_binding",
                 "bridge_state_dir",
                 "catdesk_child_pid",
             ):
@@ -341,6 +388,10 @@ class ProductionConnectorContractTests(unittest.TestCase):
             self.assertEqual(
                 layout["release_catdesk_backend_key"],
                 layout["release_dir"] / "catdesk-home" / ".catdesk" / "backend.key",
+            )
+            self.assertEqual(
+                layout["runtime_verifier_wrapper"],
+                layout["release_dir"] / "bin" / "runtime-verifier-production",
             )
             self.assertEqual(layout["bridge_socket"], socket)
             self.assertEqual(
@@ -387,59 +438,18 @@ class ProductionConnectorContractTests(unittest.TestCase):
         manifest = self._manifest()
         with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
             root = Path(raw_root)
-            sources_root = root / "sources"
-            host = sources_root / "host"
-            chrome_host = host / "chrome-host"
-            (chrome_host / "extension").mkdir(parents=True)
-            (chrome_host / "native-host.mjs").write_text("#!/usr/bin/env node\n", encoding="utf-8")
-            (chrome_host / "host-mcp-adapter.mjs").write_text("#!/usr/bin/env node\n", encoding="utf-8")
-            (chrome_host / "extension" / "manifest.json").write_text(
-                json.dumps({"version": "0.1.1"}), encoding="utf-8"
+            sources = self._release_sources(root)
+            sources["catdesk_config"].write_bytes(
+                b"mcpSlug = 'private-slug'\n"
+                b"showDetailMode = \"expanded\" # production policy input\n"
+                b"[usage]\nenabled = true\n"
             )
-            for name in ("bridge", "catdesk"):
-                path = sources_root / name
-                path.write_bytes(name.encode() * 32)
-                path.chmod(0o700)
-            for name, content in (
-                (
-                    "catdesk-config",
-                    (
-                        b"mcpSlug = 'private-slug'\n"
-                        b"showDetailMode = \"expanded\" # production policy input\n"
-                        b"[usage]\nenabled = true\n"
-                    ),
-                ),
-                ("catdesk-key", b"k" * 64),
-                ("attestation-key", b"a" * 32),
-            ):
-                path = sources_root / name
-                path.write_bytes(content)
-                path.chmod(0o600)
-            tunnel = sources_root / "m0-profile.json"
-            tunnel.write_text(json.dumps({
-                "config_version": 1,
-                "control_plane": {
-                    "tunnel_id": "tunnel_existing_private_connector",
-                    "base_url": "https://api.openai.com",
-                    "api_key": "file:/private/key",
-                },
-                "mcp": {"server_urls": [{"url": "http://localhost/mcp", "unix_socket": "/tmp/lab-real-ingress-e2e/bridge.sock"}]},
-            }), encoding="utf-8")
-            tunnel.chmod(0o600)
+            sources["catdesk_config"].chmod(0o600)
             layout = pc.production_layout(
                 manifest,
                 runtime_root=root / "runtime",
                 bridge_socket=root / "socket" / "bridge.sock",
             )
-            sources = {
-                "bridge_binary": sources_root / "bridge",
-                "catdesk_binary": sources_root / "catdesk",
-                "catdesk_config": sources_root / "catdesk-config",
-                "catdesk_backend_key": sources_root / "catdesk-key",
-                "host_attestation_key": sources_root / "attestation-key",
-                "host_source_dir": host,
-                "tunnel_profile": tunnel,
-            }
             installed = pc.install_release_bundle(manifest, layout, sources)
             self.assertEqual(installed, layout)
             pc.validate_installed_release(layout)
@@ -483,6 +493,55 @@ class ProductionConnectorContractTests(unittest.TestCase):
             self.assertTrue(Path(node["path"]).is_absolute())
             self.assertEqual(node["sha256"], pc._sha256_file(Path(node["path"])))
             self.assertIn(f"exec {node['path']}", layout["native_host_wrapper"].read_text(encoding="utf-8"))
+            verifier_wrapper = layout["runtime_verifier_wrapper"].read_text(
+                encoding="utf-8"
+            )
+            self.assertTrue(os.access(layout["runtime_verifier_wrapper"], os.X_OK))
+            for name, path in (
+                ("LAB_HOST_ADAPTER_SOCKET", layout["host_socket"]),
+                ("LAB_HOST_ATTESTATION_KEY_FILE", layout["host_attestation_key"]),
+                ("LAB_HOST_VERIFIER_STATE_FILE", layout["host_verifier_state"]),
+                ("LAB_HOST_REENTRY_STATE_FILE", layout["host_reentry_state"]),
+                ("LAB_HOST_EXTENSION_BINDING_FILE", layout["host_extension_binding"]),
+            ):
+                self.assertIn(f"export {name}={path}", verifier_wrapper)
+            self.assertIn(
+                f"exec {node['path']} {layout['runtime_verifier_cli']} \"$@\"",
+                verifier_wrapper,
+            )
+            verifier_bundle = pc._runtime_verifier_bundle_paths(layout)
+            self.assertEqual(len(verifier_bundle), 21)
+            self.assertEqual(len(set(verifier_bundle)), 21)
+            self.assertEqual(verifier_bundle[0], layout["runtime_verifier_wrapper"])
+            self.assertEqual(
+                pc.RUNTIME_VERIFIER_BUNDLE_RELATIVE_PATHS,
+                (
+                    "chrome-host/runtime-verifier-cli.mjs",
+                    "chrome-host/integration.mjs",
+                    "chrome-host/client.mjs",
+                    "chrome-host/extension-id.mjs",
+                    "provider.mjs",
+                    "attestation.mjs",
+                    "chrome-host/native-host.mjs",
+                    "chrome-host/native-host-core.mjs",
+                    "chrome-host/native-framing.mjs",
+                    "chrome-host/extension/timeout-budget.js",
+                    "chrome-host/extension/manifest.json",
+                    "chrome-host/extension/background.js",
+                    "chrome-host/extension/current-entry-registry.js",
+                    "chrome-host/extension/debugger-session.js",
+                    "chrome-host/extension/observation.js",
+                    "chrome-host/extension/browser-submit.js",
+                    "chrome-host/extension/submit-page.js",
+                    "chrome-host/extension/submit-journal.js",
+                    "chrome-host/extension/trusted-input.js",
+                    "chrome-host/extension/submit-transaction-queue.js",
+                ),
+            )
+            self.assertTrue(
+                {str(path.relative_to(layout["release_dir"])) for path in verifier_bundle}
+                .issubset(installed_artifacts)
+            )
 
             # Real components may create these files after install. They must
             # remain outside the immutable release artifact boundary.
@@ -723,28 +782,68 @@ class ProductionConnectorContractTests(unittest.TestCase):
             layout["native_host_wrapper"].parent.mkdir(parents=True)
             layout["native_host_wrapper"].write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             layout["native_host_wrapper"].chmod(0o700)
-            installed_release = json.loads(json.dumps(manifest))
-            installed_release["artifacts_sha256"] = {
-                str(layout["native_host_wrapper"].relative_to(layout["release_dir"])): pc._sha256_file(
-                    layout["native_host_wrapper"]
+            layout["runtime_verifier_wrapper"].write_text(
+                "#!/bin/sh\nexit 0\n", encoding="utf-8"
+            )
+            layout["runtime_verifier_wrapper"].chmod(0o700)
+            for relative in pc.RUNTIME_VERIFIER_BUNDLE_RELATIVE_PATHS:
+                path = layout["host_dir"] / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"// {relative}\n", encoding="utf-8")
+                path.chmod(
+                    0o700
+                    if relative == "chrome-host/runtime-verifier-cli.mjs"
+                    else 0o600
                 )
-            }
             extension_manifest = layout["host_dir"] / "chrome-host" / "extension" / "manifest.json"
-            extension_manifest.parent.mkdir(parents=True)
             extension_manifest.write_text(json.dumps({"version": "0.1.1"}), encoding="utf-8")
             extension_manifest.chmod(0o600)
-
+            installed_release = json.loads(json.dumps(manifest))
+            installed_release["artifacts_sha256"] = {
+                str(path.relative_to(layout["release_dir"])): pc._sha256_file(path)
+                for path in (
+                    layout["native_host_wrapper"],
+                    *pc._runtime_verifier_bundle_paths(layout),
+                )
+            }
             custom_dirs = [
                 root / ".chatgpt-web-mcp" / "chrome-profile",
                 root / ".chatgpt-web-mcp" / "chrome-for-testing-profile",
                 root / ".chatgpt-web-mcp" / "chrome-profile-current-entry-v2",
             ]
+            browser_executable = self._browser_executable(root)
+            self._write_managed_extension_preferences(
+                root / "home",
+                layout["host_dir"] / "chrome-host" / "extension",
+                custom_dirs,
+            )
+            verifier_path = (
+                root / "home" / ".codex" / "adaptive-delivery-host-attestation-verifiers.json"
+            )
+            verifier_path.parent.mkdir(parents=True, mode=0o700)
+            verifier_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "verifiers": {
+                            "desktop": {
+                                "protocol": "test",
+                                "executable": "/private/preserved",
+                            }
+                        },
+                        "preserved_top_level": {"owner": "runtime"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            verifier_path.chmod(0o600)
             with patch.object(pc, "validate_installed_release", return_value=installed_release):
                 installed = pc.install_native_messaging_manifests(
                     layout,
                     manifest,
                     home_dir=root / "home",
                     native_user_data_dirs=custom_dirs,
+                    browser_executables=[browser_executable],
                 )
             self.assertEqual(
                 set(installed),
@@ -766,6 +865,35 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 self.assertEqual(value["allowed_origins"], [f"chrome-extension://{pc.HOST_EXTENSION_ID}/"])
                 observed_paths.add(value["path"])
             self.assertEqual(observed_paths, {str(layout["native_host_wrapper"])})
+            verifier_config = json.loads(
+                verifier_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                verifier_config["verifiers"]["desktop"]["executable"],
+                "/private/preserved",
+            )
+            self.assertEqual(
+                verifier_config["preserved_top_level"], {"owner": "runtime"}
+            )
+            verifier = verifier_config["verifiers"]["web"]
+            self.assertEqual(
+                verifier["executable"],
+                str(layout["runtime_verifier_wrapper"].resolve(strict=True)),
+            )
+            self.assertEqual(verifier["protocol"], "runtime_host_verifier_cli_v1")
+            self.assertEqual(
+                set(verifier["bundle_sha256"]),
+                {
+                    *(
+                        str(path.resolve(strict=True))
+                        for path in pc._runtime_verifier_bundle_paths(layout)
+                    ),
+                    installed_release["runtime_dependencies"]["node"]["path"],
+                    str(layout["host_extension_binding"].resolve(strict=True)),
+                },
+            )
+            for path, digest in verifier["bundle_sha256"].items():
+                self.assertEqual(digest, pc._sha256_file(Path(path)))
 
             with patch.object(pc, "validate_installed_release", return_value=installed_release):
                 pc.validate_native_messaging_manifests(
@@ -774,6 +902,24 @@ class ProductionConnectorContractTests(unittest.TestCase):
                     home_dir=root / "home",
                     native_user_data_dirs=custom_dirs,
                 )
+            duplicate_profile = custom_dirs[0] / "Profile 1" / "Secure Preferences"
+            duplicate_profile.parent.mkdir(parents=True)
+            shutil.copy2(
+                custom_dirs[0] / "Default" / "Secure Preferences",
+                duplicate_profile,
+            )
+            duplicate_profile.chmod(0o600)
+            with patch.object(pc, "validate_installed_release", return_value=installed_release):
+                with self.assertRaisesRegex(RuntimeError, "unbound Chrome profile"):
+                    pc.install_native_messaging_manifests(
+                        layout,
+                        manifest,
+                        home_dir=root / "home",
+                        native_user_data_dirs=custom_dirs,
+                        browser_executables=[browser_executable],
+                    )
+            duplicate_profile.unlink()
+            duplicate_profile.parent.rmdir()
             chrome_path = installed["chrome"]
             chrome_value = json.loads(chrome_path.read_text(encoding="utf-8"))
             chrome_value["path"] = "/private/stale/native-host"
@@ -787,11 +933,168 @@ class ProductionConnectorContractTests(unittest.TestCase):
                         native_user_data_dirs=custom_dirs,
                     )
 
+            chrome_value["path"] = str(layout["native_host_wrapper"])
+            chrome_path.write_text(json.dumps(chrome_value), encoding="utf-8")
+            chrome_path.chmod(0o600)
+
+            verifier_config["verifiers"]["web"]["sha256"] = "0" * 64
+            verifier_path.write_text(json.dumps(verifier_config), encoding="utf-8")
+            verifier_path.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "verifier.*pin|verifier.*mismatch"):
+                with patch.object(pc, "validate_installed_release", return_value=installed_release):
+                    pc.validate_native_messaging_manifests(
+                        layout,
+                        manifest,
+                        home_dir=root / "home",
+                        native_user_data_dirs=custom_dirs,
+                    )
+
+            original_raw = verifier_path.read_bytes()
+            with patch.object(
+                pc,
+                "_runtime_verifier_record",
+                return_value=verifier_config["verifiers"]["web"],
+            ), patch.object(
+                pc,
+                "_read_runtime_verifier_config",
+                return_value=(verifier_config, original_raw),
+            ), patch.object(
+                pc,
+                "_read_private_bytes_if_present",
+                return_value=original_raw + b" ",
+            ), patch.object(
+                pc, "validate_installed_release", return_value=installed_release
+            ):
+                with self.assertRaisesRegex(RuntimeError, "changed concurrently"):
+                    pc._register_runtime_host_verifier(
+                        layout, manifest, home_dir=root / "home"
+                    )
+
+            verifier_path.unlink()
+            symlink_target = root / "unsafe-verifier-target.json"
+            symlink_target.write_bytes(original_raw)
+            symlink_target.chmod(0o600)
+            verifier_path.symlink_to(symlink_target)
+            with patch.object(
+                pc, "validate_installed_release", return_value=installed_release
+            ):
+                with self.assertRaisesRegex(RuntimeError, "opened safely|regular file"):
+                    pc._validate_runtime_host_verifier_registration(
+                        layout, manifest, home_dir=root / "home"
+                    )
+
             with self.assertRaisesRegex(RuntimeError, "absolute"):
                 pc._native_messaging_paths(
                     root / "home",
                     native_user_data_dirs=[Path("relative-chrome-profile")],
                 )
+
+    def test_real_release_registers_and_revalidates_runtime_host_verifier(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest,
+                runtime_root=root / "runtime",
+                bridge_socket=root / "socket" / "bridge.sock",
+            )
+            pc.install_release_bundle(manifest, layout, self._release_sources(root))
+            loaded_extension = root / "loaded-extension"
+            shutil.copytree(
+                layout["host_dir"] / "chrome-host" / "extension",
+                loaded_extension,
+            )
+            for path in loaded_extension.iterdir():
+                if path.is_file():
+                    path.chmod(0o644)
+            self._write_managed_extension_preferences(
+                root / "home", loaded_extension
+            )
+            pc.install_native_messaging_manifests(
+                layout,
+                manifest,
+                home_dir=root / "home",
+                browser_executables=[self._browser_executable(root)],
+            )
+            pc.validate_native_messaging_manifests(
+                layout, manifest, home_dir=root / "home"
+            )
+            config_path = pc._runtime_verifier_config_path(root / "home")
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(stat.S_IMODE(config_path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(config_path.parent.stat().st_mode), 0o700)
+            self.assertEqual(len(config["verifiers"]["web"]["bundle_sha256"]), 34)
+            for relative in pc.RUNTIME_EXTENSION_EXECUTION_RELATIVE_PATHS:
+                self.assertIn(
+                    str((loaded_extension / relative).resolve(strict=True)),
+                    config["verifiers"]["web"]["bundle_sha256"],
+                )
+            node = json.loads(
+                layout["release_manifest"].read_text(encoding="utf-8")
+            )["runtime_dependencies"]["node"]
+            self.assertEqual(
+                config["verifiers"]["web"]["bundle_sha256"][node["path"]],
+                node["sha256"],
+            )
+
+            dependency = layout["host_dir"] / "chrome-host" / "client.mjs"
+            dependency.chmod(0o640)
+            with self.assertRaisesRegex(RuntimeError, "unsafe"):
+                pc.validate_native_messaging_manifests(
+                    layout, manifest, home_dir=root / "home"
+                )
+            dependency.chmod(0o600)
+            dependency.write_text("// tampered\n", encoding="utf-8")
+            dependency.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "hash mismatch|not pinned"):
+                pc.validate_native_messaging_manifests(
+                    layout, manifest, home_dir=root / "home"
+                )
+
+    def test_native_and_verifier_publication_rolls_back_as_one_transaction(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
+            root = Path(raw_root)
+            home = root / "home"
+            layout = pc.production_layout(
+                manifest,
+                runtime_root=root / "runtime",
+                bridge_socket=root / "socket" / "bridge.sock",
+            )
+            pc.install_release_bundle(manifest, layout, self._release_sources(root))
+            self._write_managed_extension_preferences(
+                home, layout["host_dir"] / "chrome-host" / "extension"
+            )
+            paths = pc._native_messaging_paths(home)
+            existing = paths["chrome"]
+            existing.parent.mkdir(parents=True)
+            old_payload = '{"path":"/private/preserved-old-host"}\n'
+            existing.write_text(old_payload, encoding="utf-8")
+            existing.chmod(0o600)
+
+            with patch.object(
+                pc,
+                "_register_runtime_host_verifier_locked",
+                side_effect=RuntimeError("injected verifier registration failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected verifier"):
+                    pc.install_native_messaging_manifests(
+                        layout,
+                        manifest,
+                        home_dir=home,
+                        browser_executables=[self._browser_executable(root)],
+                    )
+
+            self.assertEqual(existing.read_text(encoding="utf-8"), old_payload)
+            for browser, path in paths.items():
+                if browser != "chrome":
+                    self.assertFalse(path.exists(), browser)
+            self.assertFalse(pc._runtime_verifier_config_path(home).exists())
+            self.assertFalse(
+                pc._runtime_verifier_config_path(home)
+                .with_name("adaptive-delivery-host-attestation-verifiers.json.lock")
+                .exists()
+            )
 
     def test_default_release_sources_and_head_fence_are_canonical_and_fail_closed(self):
         sources = pc.default_release_sources()

@@ -126,17 +126,53 @@ function validateBrowserResponse(response, requestId) {
   return response.result;
 }
 
+function extensionEpochHealthSummary(epoch) {
+  if (!epoch || typeof epoch !== "object" || Array.isArray(epoch)) return {};
+  const instanceHash = typeof epoch.instance_id_sha256 === "string" && /^[0-9a-f]{64}$/.test(epoch.instance_id_sha256)
+    ? epoch.instance_id_sha256
+    : null;
+  const bindingHash = typeof epoch.binding_sha256 === "string" && /^[0-9a-f]{64}$/.test(epoch.binding_sha256)
+    ? epoch.binding_sha256
+    : null;
+  const loadedAt = Number.isSafeInteger(epoch.loaded_at_ms) && epoch.loaded_at_ms > 0
+    ? epoch.loaded_at_ms
+    : null;
+  if (!instanceHash || !bindingHash || !loadedAt) return {};
+  return {
+    extension_ready: true,
+    extension_instance_id_sha256: instanceHash,
+    extension_loaded_at_ms: loadedAt,
+    extension_binding_sha256: bindingHash
+  };
+}
+
+function extensionEpochReceipt(epoch) {
+  const summary = extensionEpochHealthSummary(epoch);
+  if (summary.extension_ready !== true) {
+    throw new Error("HOST_EXTENSION_NOT_READY: loaded extension epoch is invalid");
+  }
+  return Object.freeze({
+    binding_sha256: summary.extension_binding_sha256,
+    instance_id_sha256: summary.extension_instance_id_sha256,
+    loaded_at_ms: summary.extension_loaded_at_ms
+  });
+}
+
 export function createNativeHostHandler(options) {
   const secret = options && options.secret;
   const sendBrowserCommand = options && options.sendBrowserCommand;
   const clock = options && options.clock || Date.now;
   const getLiveValidation = options && options.getLiveValidation || function () { return null; };
   const recordLiveValidation = options && options.recordLiveValidation || function () {};
+  const requireExtensionReady = options && options.requireExtensionReady || null;
   if (!secret || Buffer.byteLength(secret) < 32) {
     throw new Error("Host attestation key must be at least 32 bytes");
   }
   if (typeof sendBrowserCommand !== "function") {
     throw new Error("sendBrowserCommand is required");
+  }
+  if (requireExtensionReady != null && typeof requireExtensionReady !== "function") {
+    throw new Error("requireExtensionReady must be a function");
   }
 
   async function browser(op, fields) {
@@ -153,6 +189,9 @@ export function createNativeHostHandler(options) {
       throw new Error("runtime request must be an object");
     }
     const op = requiredText(request.op, "op", 64);
+    const extensionEpoch = requireExtensionReady ? requireExtensionReady() : null;
+    const epochReceipt = extensionEpoch ? extensionEpochReceipt(extensionEpoch) : null;
+    const epochFields = epochReceipt ? { extension_epoch: epochReceipt } : {};
 
     if (op === "health") {
       const live = getLiveValidation() || {};
@@ -163,7 +202,9 @@ export function createNativeHostHandler(options) {
         submit_live_validated: live.submit_live_validated === true,
         ...(live.submit_live_validated === true && Number.isSafeInteger(live.validated_at_ms)
           ? { submit_live_validated_at_ms: live.validated_at_ms }
-          : {})
+          : {}),
+        ...extensionEpochHealthSummary(extensionEpoch),
+        ...epochFields
       };
     }
 
@@ -185,7 +226,8 @@ export function createNativeHostHandler(options) {
           targetGeneration: targetGeneration,
           ownershipGeneration: ownershipGeneration,
           clock: clock
-        })
+        }),
+        ...epochFields
       };
     }
 
@@ -205,7 +247,8 @@ export function createNativeHostHandler(options) {
           challenge: challenge,
           observation: observation,
           clock: clock
-        })
+        }),
+        ...epochFields
       };
     }
 
@@ -218,7 +261,7 @@ export function createNativeHostHandler(options) {
       if (observation.browser_target_id !== target) {
         throw new Error("browser machine returned wrong target");
       }
-      return { observation: observation };
+      return { observation: observation, ...epochFields };
     }
 
     if (op === "submit_continuation") {
@@ -264,7 +307,7 @@ export function createNativeHostHandler(options) {
           host_submit_receipt: normalized.host_submit_receipt
         });
       }
-      return normalized;
+      return { ...normalized, ...epochFields };
     }
 
     throw new Error("unsupported runtime operation: " + op);

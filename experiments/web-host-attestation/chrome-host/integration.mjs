@@ -10,10 +10,12 @@ export function createChromeRuntimeHostIntegration(options) {
   const verifierStatePath = options && options.verifierStatePath || null;
   const reentryStatePath = options && options.reentryStatePath || null;
   const timeoutMs = options && options.timeoutMs || RUNTIME_HOST_REQUEST_TIMEOUT_MS;
+  const expectedExtensionBindingSha256 = options && options.expectedExtensionBindingSha256 || null;
 
   const driver = createChromeHostDriver({
     socketPath: socketPath,
-    timeoutMs: timeoutMs
+    timeoutMs: timeoutMs,
+    expectedExtensionBindingSha256: expectedExtensionBindingSha256
   });
 
   const provider = createRuntimeHostProvider({

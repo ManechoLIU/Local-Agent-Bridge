@@ -176,6 +176,65 @@ test("health reports live-submit validation state", async function () {
   });
 });
 
+test("extension readiness callback fails closed before every runtime operation", async function () {
+  let browserCalls = 0;
+  const handle = createNativeHostHandler({
+    secret: SECRET,
+    requireExtensionReady: function () {
+      throw new Error("HOST_EXTENSION_NOT_READY: valid extension hello required");
+    },
+    sendBrowserCommand: async function () {
+      browserCalls += 1;
+      throw new Error("browser must not be called before extension readiness");
+    }
+  });
+  const requests = [
+    { op: "health" },
+    { op: "discover_current_entry", target_generation: 4, ownership_generation: 8 },
+    { op: "attest", challenge: {} },
+    { op: "observe_target", browser_target_id: "browser-target-7" },
+    {
+      op: "submit_continuation",
+      browser_target_id: "browser-target-7",
+      conversation_id: CONVERSATION,
+      payload: "resume",
+      wake_id: "wake",
+      wake_nonce: "nonce",
+      target_generation: 4,
+      ownership_generation: 8
+    }
+  ];
+  for (const request of requests) {
+    await assert.rejects(handle(request), /EXTENSION_NOT_READY/);
+  }
+  assert.equal(browserCalls, 0);
+});
+
+test("health exposes only hashed loaded extension epoch summary", async function () {
+  const handle = createNativeHostHandler({
+    secret: SECRET,
+    requireExtensionReady: function () {
+      return {
+        instance_id: "ei_00000000-0000-4000-8000-000000000002",
+        instance_id_sha256: "a".repeat(64),
+        loaded_at_ms: 1800000000200,
+        binding_sha256: "b".repeat(64),
+        binding_path: "/private/extension-binding.json"
+      };
+    },
+    sendBrowserCommand: async function () {
+      throw new Error("browser must not be called for health");
+    }
+  });
+  const health = await handle({ op: "health" });
+  assert.equal(health.extension_ready, true);
+  assert.equal(health.extension_instance_id_sha256, "a".repeat(64));
+  assert.equal(health.extension_loaded_at_ms, 1800000000200);
+  assert.equal(health.extension_binding_sha256, "b".repeat(64));
+  assert.equal(JSON.stringify(health).includes("/private/extension-binding.json"), false);
+  assert.equal(JSON.stringify(health).includes("ei_00000000-0000-4000-8000-000000000002"), false);
+});
+
 test("confirmed live submit records validation but uncertain submit does not", async function () {
   const records = [];
   let confirmed = true;

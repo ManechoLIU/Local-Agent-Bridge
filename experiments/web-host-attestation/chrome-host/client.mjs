@@ -75,6 +75,20 @@ export async function requestNativeHost(socketPath, request, options) {
 export function createChromeHostDriver(options) {
   const socketPath = options && options.socketPath;
   const timeoutMs = options && options.timeoutMs || RUNTIME_HOST_REQUEST_TIMEOUT_MS;
+  const expectedBindingSha256 = options && options.expectedExtensionBindingSha256 || null;
+
+  function requireExpectedExtensionEpoch(result) {
+    if (expectedBindingSha256 == null) return;
+    if (!/^[0-9a-f]{64}$/.test(expectedBindingSha256)) {
+      throw new Error("expected extension binding hash is invalid");
+    }
+    const epoch = result && result.extension_epoch;
+    if (!epoch || epoch.binding_sha256 !== expectedBindingSha256 ||
+        !/^[0-9a-f]{64}$/.test(String(epoch.instance_id_sha256 || "")) ||
+        !Number.isSafeInteger(epoch.loaded_at_ms) || epoch.loaded_at_ms < 1) {
+      throw new Error("Host adapter extension epoch does not match current binding");
+    }
+  }
   return Object.freeze({
     interface_version: 1,
 
@@ -84,6 +98,7 @@ export function createChromeHostDriver(options) {
         target_generation: Number(input && input.target_generation),
         ownership_generation: Number(input && input.ownership_generation)
       }, { timeoutMs: timeoutMs });
+      requireExpectedExtensionEpoch(result);
       return result.current_entry;
     },
 
@@ -92,6 +107,7 @@ export function createChromeHostDriver(options) {
         op: "attest",
         challenge: challenge
       }, { timeoutMs: timeoutMs });
+      requireExpectedExtensionEpoch(result);
       return result.attestation;
     },
 
@@ -100,11 +116,12 @@ export function createChromeHostDriver(options) {
         op: "observe_target",
         browser_target_id: requiredText(browserTargetId, "browser_target_id", 256)
       }, { timeoutMs: timeoutMs });
+      requireExpectedExtensionEpoch(result);
       return result.observation;
     },
 
     async submitContinuation(input) {
-      return await requestNativeHost(socketPath, {
+      const result = await requestNativeHost(socketPath, {
         op: "submit_continuation",
         browser_target_id: requiredText(input && input.browser_target_id, "browser_target_id", 256),
         conversation_id: requiredText(input && input.conversation_id, "conversation_id", 128),
@@ -114,6 +131,8 @@ export function createChromeHostDriver(options) {
         target_generation: Number(input && input.target_generation),
         ownership_generation: Number(input && input.ownership_generation)
       }, { timeoutMs: timeoutMs });
+      requireExpectedExtensionEpoch(result);
+      return result;
     }
   });
 }

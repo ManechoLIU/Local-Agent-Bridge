@@ -2,11 +2,16 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   existsSync,
+  fstatSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
+  unlinkSync,
   writeFileSync
 } from "node:fs";
 import { homedir } from "node:os";
@@ -20,8 +25,10 @@ const EXTENSION_MANIFEST_PATH = fileURLToPath(new URL("./extension/manifest.json
 const RUNTIME_VERIFIER_PATH = fileURLToPath(new URL("./runtime-verifier-cli.mjs", import.meta.url));
 const RUNTIME_VERIFIER_BUNDLE_PATHS = Object.freeze([
   RUNTIME_VERIFIER_PATH,
+  process.execPath,
   fileURLToPath(new URL("./integration.mjs", import.meta.url)),
   fileURLToPath(new URL("./client.mjs", import.meta.url)),
+  fileURLToPath(new URL("./extension-id.mjs", import.meta.url)),
   fileURLToPath(new URL("../provider.mjs", import.meta.url)),
   fileURLToPath(new URL("../attestation.mjs", import.meta.url)),
   fileURLToPath(new URL("./native-host.mjs", import.meta.url)),
@@ -81,8 +88,61 @@ function atomicJson(path, value) {
   chmodSync(path, 0o600);
 }
 
+function privateFileSnapshot(path) {
+  if (!existsSync(path)) return null;
+  validatePrivateFile(path, 0);
+  const stat = lstatSync(path);
+  return { bytes: readFileSync(path), mode: stat.mode & 0o777 };
+}
+
+function restorePrivateFileSnapshot(path, snapshot) {
+  if (snapshot == null) {
+    if (!existsSync(path)) return;
+    validatePrivateFile(path, 0);
+    unlinkSync(path);
+    return;
+  }
+  const parent = dirname(path);
+  ensureDirectory(parent, 0o755, false);
+  const temp = join(parent, "." + randomUUID() + ".rollback.tmp");
+  writeFileSync(temp, snapshot.bytes, { mode: snapshot.mode, flag: "wx" });
+  renameSync(temp, path);
+  chmodSync(path, snapshot.mode);
+}
+
 function sha256File(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function withRuntimeVerifierPublicationLock(homeDir, operation) {
+  const configDir = join(homeDir, ".codex");
+  ensureDirectory(configDir, 0o700, true);
+  const lockPath = join(configDir, "adaptive-delivery-host-attestation-verifiers.json.lock");
+  let descriptor;
+  try {
+    descriptor = openSync(lockPath, "wx", 0o600);
+  } catch (error) {
+    if (error && error.code === "EEXIST") {
+      throw new Error("Runtime Host verifier publication lock is already held");
+    }
+    throw error;
+  }
+  try {
+    writeFileSync(descriptor, String(process.pid) + "\n", "ascii");
+    fsyncSync(descriptor);
+    return operation();
+  } finally {
+    try {
+      const lockStat = lstatSync(lockPath);
+      const openStat = fstatSync(descriptor);
+      if (lockStat.isFile() && !lockStat.isSymbolicLink() &&
+          lockStat.dev === openStat.dev && lockStat.ino === openStat.ino) {
+        unlinkSync(lockPath);
+      }
+    } finally {
+      closeSync(descriptor);
+    }
+  }
 }
 
 function validateOwnedRegularFile(path, executable) {
@@ -114,6 +174,12 @@ function installRuntimeVerifierRegistration(homeDir, verifierPath, bundlePaths) 
     if (!config || config.schema_version !== 1 || typeof config.verifiers !== "object" || Array.isArray(config.verifiers)) {
       throw new Error("existing Runtime Host verifier config is invalid");
     }
+  }
+  const existingWeb = config.verifiers.web;
+  if (existingWeb != null &&
+      (!existingWeb || typeof existingWeb !== "object" || Array.isArray(existingWeb) ||
+       existingWeb.executable !== executable)) {
+    throw new Error("refusing to replace an existing Runtime Host web verifier owned by another installer");
   }
   config.verifiers.web = {
     protocol: "runtime_host_verifier_cli_v1",
@@ -183,19 +249,45 @@ export function installChromeNativeHost(options) {
     manifestScope = "default_user_path";
   }
   const manifestPath = join(manifestDir, HOST_NAME + ".json");
-  atomicJson(manifestPath, {
-    name: HOST_NAME,
-    description: "Local Agent Bridge Web Host native messaging adapter",
-    path: hostScriptPath,
-    type: "stdio",
-    allowed_origins: [
-      "chrome-extension://" + extensionId + "/"
-    ]
+  const configPath = join(homeDir, ".codex", "adaptive-delivery-host-attestation-verifiers.json");
+  const runtimeVerifierConfigPath = withRuntimeVerifierPublicationLock(homeDir, () => {
+    const manifestSnapshot = privateFileSnapshot(manifestPath);
+    const verifierSnapshot = registerRuntimeVerifier ? privateFileSnapshot(configPath) : null;
+    try {
+      if (manifestSnapshot) {
+        let existingManifest;
+        try { existingManifest = JSON.parse(manifestSnapshot.bytes.toString("utf8")); }
+        catch { throw new Error("existing Native Messaging manifest is invalid"); }
+        if (!existingManifest || existingManifest.path !== hostScriptPath) {
+          throw new Error("refusing to replace a Native Messaging manifest owned by another installer");
+        }
+      }
+      atomicJson(manifestPath, {
+        name: HOST_NAME,
+        description: "Local Agent Bridge Web Host native messaging adapter",
+        path: hostScriptPath,
+        type: "stdio",
+        allowed_origins: [
+          "chrome-extension://" + extensionId + "/"
+        ]
+      });
+      return registerRuntimeVerifier
+        ? installRuntimeVerifierRegistration(homeDir, runtimeVerifierPath, runtimeVerifierBundlePaths)
+        : null;
+    } catch (error) {
+      const rollbackErrors = [];
+      if (registerRuntimeVerifier) {
+        try { restorePrivateFileSnapshot(configPath, verifierSnapshot); }
+        catch (rollbackError) { rollbackErrors.push(String(rollbackError)); }
+      }
+      try { restorePrivateFileSnapshot(manifestPath, manifestSnapshot); }
+      catch (rollbackError) { rollbackErrors.push(String(rollbackError)); }
+      if (rollbackErrors.length) {
+        throw new Error(String(error && error.message || error) + "; publication rollback failed: " + rollbackErrors.join("; "));
+      }
+      throw error;
+    }
   });
-
-  const runtimeVerifierConfigPath = registerRuntimeVerifier
-    ? installRuntimeVerifierRegistration(homeDir, runtimeVerifierPath, runtimeVerifierBundlePaths)
-    : null;
 
   return Object.freeze({
     browser: browser,

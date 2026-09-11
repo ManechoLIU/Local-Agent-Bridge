@@ -97,6 +97,41 @@ REQUIRED_TOOLS = frozenset(
         "cancel_command",
     }
 )
+RUNTIME_VERIFIER_BUNDLE_RELATIVE_PATHS = (
+    "chrome-host/runtime-verifier-cli.mjs",
+    "chrome-host/integration.mjs",
+    "chrome-host/client.mjs",
+    "chrome-host/extension-id.mjs",
+    "provider.mjs",
+    "attestation.mjs",
+    "chrome-host/native-host.mjs",
+    "chrome-host/native-host-core.mjs",
+    "chrome-host/native-framing.mjs",
+    "chrome-host/extension/timeout-budget.js",
+    "chrome-host/extension/manifest.json",
+    "chrome-host/extension/background.js",
+    "chrome-host/extension/current-entry-registry.js",
+    "chrome-host/extension/debugger-session.js",
+    "chrome-host/extension/observation.js",
+    "chrome-host/extension/browser-submit.js",
+    "chrome-host/extension/submit-page.js",
+    "chrome-host/extension/submit-journal.js",
+    "chrome-host/extension/trusted-input.js",
+    "chrome-host/extension/submit-transaction-queue.js",
+)
+RUNTIME_EXTENSION_EXECUTION_RELATIVE_PATHS = (
+    "timeout-budget.js",
+    "manifest.json",
+    "background.js",
+    "current-entry-registry.js",
+    "debugger-session.js",
+    "observation.js",
+    "browser-submit.js",
+    "submit-page.js",
+    "submit-journal.js",
+    "trusted-input.js",
+    "submit-transaction-queue.js",
+)
 
 
 def canonical_workspace() -> Path:
@@ -217,12 +252,15 @@ def production_layout(
         "host_mcp_adapter": release_dir / "host" / "chrome-host" / "host-mcp-adapter.mjs",
         "native_host": release_dir / "host" / "chrome-host" / "native-host.mjs",
         "native_host_wrapper": release_dir / "bin" / "native-host-production",
+        "runtime_verifier_cli": release_dir / "host" / "chrome-host" / "runtime-verifier-cli.mjs",
+        "runtime_verifier_wrapper": release_dir / "bin" / "runtime-verifier-production",
         "host_backend_key": secrets_dir / "host-backend.key",
         "host_attestation_key": secrets_dir / "host-attestation.key",
         "host_socket_dir": host_socket_dir,
         "host_socket": host_socket_dir / "host.sock",
         "host_verifier_state": runtime_generation_dir / "host" / "runtime-verifier-state.json",
         "host_reentry_state": runtime_generation_dir / "host" / "runtime-reentry-state.json",
+        "host_extension_binding": runtime_generation_dir / "host" / "runtime-extension-binding.json",
         "bridge_state_dir": runtime_generation_dir / "bridge",
         "bridge_socket": Path(bridge_socket),
         "release_tunnel_profile": release_dir / "tunnel" / f"{TUNNEL_PROFILE_NAME}.yaml",
@@ -442,11 +480,29 @@ def install_release_bundle(
                 "#!/bin/sh",
                 f"export LAB_HOST_ADAPTER_SOCKET={shlex.quote(str(layout['host_socket']))}",
                 f"export LAB_HOST_ATTESTATION_KEY_FILE={shlex.quote(str(layout['host_attestation_key']))}",
-                f"exec {shlex.quote(node['path'])} {shlex.quote(str(layout['native_host']))}",
+                f"export LAB_HOST_EXTENSION_BINDING_FILE={shlex.quote(str(layout['host_extension_binding']))}",
+                f"exec {shlex.quote(node['path'])} {shlex.quote(str(layout['native_host']))} \"$@\"",
                 "",
             ]
         )
         _write_text_private(layout["native_host_wrapper"], wrapper, 0o700)
+        verifier_wrapper = "\n".join(
+            [
+                "#!/bin/sh",
+                f"export LAB_HOST_ADAPTER_SOCKET={shlex.quote(str(layout['host_socket']))}",
+                f"export LAB_HOST_ATTESTATION_KEY_FILE={shlex.quote(str(layout['host_attestation_key']))}",
+                f"export LAB_HOST_VERIFIER_STATE_FILE={shlex.quote(str(layout['host_verifier_state']))}",
+                f"export LAB_HOST_REENTRY_STATE_FILE={shlex.quote(str(layout['host_reentry_state']))}",
+                f"export LAB_HOST_EXTENSION_BINDING_FILE={shlex.quote(str(layout['host_extension_binding']))}",
+                (
+                    f"exec {shlex.quote(node['path'])} "
+                    f"{shlex.quote(str(layout['runtime_verifier_cli']))} \"$@\""
+                ),
+                "",
+            ]
+        )
+        _write_text_private(layout["runtime_verifier_wrapper"], verifier_wrapper, 0o700)
+        _validate_runtime_verifier_release_files(layout)
         _write_text_private(
             layout["catdesk_runner"],
             _catdesk_runner_source(manifest, layout),
@@ -621,6 +677,7 @@ def install_native_messaging_manifests(
     *,
     home_dir: Path = Path.home(),
     native_user_data_dirs: Iterable[Path] = (),
+    browser_executables: Iterable[Path] = (),
 ) -> dict[str, Path]:
     _validate_manifest_contract(manifest)
     _validate_immutable_native_wrapper(layout, manifest)
@@ -644,15 +701,514 @@ def install_native_messaging_manifests(
         "allowed_origins": [f"chrome-extension://{HOST_EXTENSION_ID}/"],
     }
     paths = _native_messaging_paths(home_dir, native_user_data_dirs=native_user_data_dirs)
-    installed: dict[str, Path] = {}
-    for browser, path in paths.items():
-        root = path.parent
-        root.mkdir(parents=True, exist_ok=True, mode=0o755)
-        if root.is_symlink() or not root.is_dir() or root.stat().st_uid != os.geteuid():
-            raise RuntimeError(f"Native Messaging directory is unsafe for {browser}")
-        _write_json_private(path, value, private_parent=False)
-        installed[browser] = path
+    extension_binding = _build_runtime_extension_binding(
+        layout,
+        manifest,
+        home_dir=home_dir,
+        native_user_data_dirs=native_user_data_dirs,
+        browser_executables=browser_executables,
+    )
+    config_path = _runtime_verifier_config_path(home_dir)
+    with _runtime_verifier_config_lock(home_dir):
+        snapshots = {
+            path: _private_file_snapshot(path, f"Native Messaging manifest for {browser}")
+            for browser, path in paths.items()
+        }
+        snapshots[config_path] = _private_file_snapshot(
+            config_path, "Runtime Host verifier config"
+        )
+        snapshots[layout["host_extension_binding"]] = _private_file_snapshot(
+            layout["host_extension_binding"], "Runtime Host extension binding"
+        )
+        installed: dict[str, Path] = {}
+        try:
+            for browser, path in paths.items():
+                root = path.parent
+                root.mkdir(parents=True, exist_ok=True, mode=0o755)
+                if root.is_symlink() or not root.is_dir() or root.stat().st_uid != os.geteuid():
+                    raise RuntimeError(f"Native Messaging directory is unsafe for {browser}")
+                _write_json_private(path, value, private_parent=False)
+                installed[browser] = path
+            _write_json_private(layout["host_extension_binding"], extension_binding)
+            _register_runtime_host_verifier_locked(
+                layout, manifest, home_dir=home_dir
+            )
+            _validate_runtime_host_verifier_registration(
+                layout, manifest, home_dir=home_dir
+            )
+        except Exception as error:
+            rollback_errors: list[str] = []
+            for path, snapshot in reversed(tuple(snapshots.items())):
+                try:
+                    _restore_private_file_snapshot(
+                        path,
+                        snapshot,
+                        private_parent=path == config_path,
+                    )
+                except Exception as rollback_error:
+                    rollback_errors.append(f"{path}: {rollback_error}")
+            if rollback_errors:
+                raise RuntimeError(
+                    f"Native Messaging/verifier publication failed: {error}; rollback failed: "
+                    + "; ".join(rollback_errors)
+                ) from error
+            raise
     return installed
+
+
+def _managed_native_user_data_dirs(
+    home_dir: Path, native_user_data_dirs: Iterable[Path]
+) -> tuple[Path, ...]:
+    candidates = [
+        Path(home_dir).expanduser() / ".chatgpt-web-mcp" / name
+        for name in DEFAULT_NATIVE_USER_DATA_DIR_NAMES
+    ]
+    candidates.extend(Path(path).expanduser() for path in native_user_data_dirs)
+    observed: set[Path] = set()
+    result: list[Path] = []
+    for candidate in candidates:
+        if not candidate.is_absolute():
+            raise RuntimeError("custom Chrome user-data-dir must be absolute")
+        resolved = candidate.resolve()
+        if resolved not in observed:
+            observed.add(resolved)
+            result.append(resolved)
+    return tuple(result)
+
+
+def _configured_extension_source(user_data_dir: Path) -> tuple[Path, Path]:
+    preferences = user_data_dir / "Default" / "Secure Preferences"
+    raw = _read_private_bytes_if_present(
+        preferences, "Chrome Secure Preferences for Runtime Host extension"
+    )
+    if raw is None:
+        raise RuntimeError(
+            f"Chrome Secure Preferences is missing for managed profile: {user_data_dir}"
+        )
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("Chrome Secure Preferences is not valid UTF-8 JSON") from error
+    record = (
+        (((value.get("extensions") or {}).get("settings") or {}).get(HOST_EXTENSION_ID))
+        if isinstance(value, dict)
+        else None
+    )
+    configured = record.get("path") if isinstance(record, dict) else None
+    if not isinstance(configured, str) or not configured.strip():
+        raise RuntimeError("managed Chrome profile has no Local Agent Bridge extension path")
+    extension_dir = Path(configured).expanduser()
+    if not extension_dir.is_absolute():
+        raise RuntimeError("managed Chrome extension path must be absolute")
+    try:
+        info = extension_dir.lstat()
+        resolved = extension_dir.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise RuntimeError("managed Chrome extension path is unavailable") from error
+    if extension_dir.is_symlink() or not extension_dir.is_dir() or info.st_uid != os.geteuid():
+        raise RuntimeError("managed Chrome extension path is unsafe")
+    return preferences, resolved
+
+
+def _build_runtime_extension_binding(
+    layout: dict[str, Path],
+    manifest: dict[str, Any],
+    *,
+    home_dir: Path,
+    native_user_data_dirs: Iterable[Path],
+    browser_executables: Iterable[Path],
+) -> dict[str, Any]:
+    profiles = _managed_native_user_data_dirs(home_dir, native_user_data_dirs)
+    configured = [_configured_extension_source(profile) for profile in profiles]
+    for user_data_dir, (bound_preference, _) in zip(profiles, configured, strict=True):
+        try:
+            profile_dirs = tuple(user_data_dir.iterdir())
+        except OSError as error:
+            raise RuntimeError("cannot inspect managed Chrome profile directories") from error
+        for profile_dir in profile_dirs:
+            candidate = profile_dir / "Secure Preferences"
+            if candidate == bound_preference or not candidate.exists():
+                continue
+            if profile_dir.is_symlink() or not profile_dir.is_dir():
+                raise RuntimeError("managed Chrome profile directory is unsafe")
+            raw = _read_private_bytes_if_present(
+                candidate, "unbound Chrome Secure Preferences"
+            )
+            if raw is None:
+                continue
+            try:
+                profile_value = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise RuntimeError("unbound Chrome Secure Preferences is invalid") from error
+            record = (
+                (((profile_value.get("extensions") or {}).get("settings") or {}).get(HOST_EXTENSION_ID))
+                if isinstance(profile_value, dict)
+                else None
+            )
+            if isinstance(record, dict):
+                raise RuntimeError(
+                    "Host extension is installed in an unbound Chrome profile"
+                )
+    extension_dirs = {extension_dir for _, extension_dir in configured}
+    if len(extension_dirs) != 1:
+        raise RuntimeError("managed Chrome profiles do not use one exact Host extension source")
+    extension_dir = extension_dirs.pop()
+    executable_pins: list[dict[str, str]] = []
+    observed_executables: set[Path] = set()
+    for raw_path in browser_executables:
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            raise RuntimeError("trusted Chrome executable path must be absolute")
+        try:
+            info = candidate.lstat()
+            resolved = candidate.resolve(strict=True)
+        except FileNotFoundError as error:
+            raise RuntimeError("trusted Chrome executable is missing") from error
+        if (
+            candidate.is_symlink()
+            or not candidate.is_file()
+            or info.st_uid not in {0, os.geteuid()}
+            or not os.access(candidate, os.X_OK)
+            or not str(resolved).endswith(
+                (
+                    ".app/Contents/MacOS/Google Chrome",
+                    ".app/Contents/MacOS/Google Chrome for Testing",
+                )
+            )
+        ):
+            raise RuntimeError("trusted Chrome executable is unsafe or unsupported")
+        if resolved in observed_executables:
+            continue
+        observed_executables.add(resolved)
+        executable_pins.append({"path": str(resolved), "sha256": _sha256_file(resolved)})
+    if not executable_pins or len(executable_pins) > 8:
+        raise RuntimeError("at least one trusted Chrome executable pin is required")
+    release_extension_dir = layout["host_dir"] / "chrome-host" / "extension"
+    bundle_sha256: dict[str, str] = {}
+    for relative in RUNTIME_EXTENSION_EXECUTION_RELATIVE_PATHS:
+        actual = extension_dir / relative
+        release = release_extension_dir / relative
+        for path, label in (
+            (actual, "loaded Chrome extension artifact"),
+            (release, "production release extension artifact"),
+        ):
+            try:
+                path_info = path.lstat()
+            except FileNotFoundError as error:
+                raise RuntimeError(f"{label} is missing: {relative}") from error
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or path_info.st_uid != os.geteuid()
+                or stat.S_IMODE(path_info.st_mode) & 0o022
+            ):
+                raise RuntimeError(f"{label} is unsafe: {relative}")
+        actual_digest = _sha256_file(actual)
+        if actual_digest != _sha256_file(release):
+            raise RuntimeError(
+                f"loaded Chrome extension does not match production release: {relative}"
+            )
+        bundle_sha256[str(actual)] = actual_digest
+    return {
+        "schema_version": "runtime_host_extension_binding_v1",
+        "extension_id": HOST_EXTENSION_ID,
+        "release_revision": manifest["release_revision"],
+        "created_at_unix_ms": int(time.time() * 1000),
+        "extension_dir": str(extension_dir),
+        "preference_paths": [str(path) for path, _ in configured],
+        "browser_executables": executable_pins,
+        "bundle_sha256": bundle_sha256,
+    }
+
+
+def _validate_runtime_extension_binding(
+    layout: dict[str, Path], installed: dict[str, Any]
+) -> dict[str, Any]:
+    path = layout["host_extension_binding"]
+    raw = _read_private_bytes_if_present(path, "Runtime Host extension binding")
+    if raw is None:
+        raise RuntimeError("Runtime Host extension binding is missing")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("Runtime Host extension binding is not valid UTF-8 JSON") from error
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != "runtime_host_extension_binding_v1"
+        or value.get("extension_id") != HOST_EXTENSION_ID
+        or value.get("release_revision") != installed.get("release_revision")
+        or not isinstance(value.get("created_at_unix_ms"), int)
+        or value["created_at_unix_ms"] < 1
+    ):
+        raise RuntimeError("Runtime Host extension binding identity mismatch")
+    extension_dir_raw = value.get("extension_dir")
+    preferences = value.get("preference_paths")
+    bundle = value.get("bundle_sha256")
+    browser_executables = value.get("browser_executables")
+    if (
+        not isinstance(extension_dir_raw, str)
+        or not Path(extension_dir_raw).is_absolute()
+        or not isinstance(preferences, list)
+        or not preferences
+        or not isinstance(bundle, dict)
+        or len(bundle) != len(RUNTIME_EXTENSION_EXECUTION_RELATIVE_PATHS)
+        or not isinstance(browser_executables, list)
+        or not browser_executables
+        or len(browser_executables) > 8
+    ):
+        raise RuntimeError("Runtime Host extension binding structure mismatch")
+    extension_dir = Path(extension_dir_raw).resolve(strict=True)
+    for preference_raw in preferences:
+        if not isinstance(preference_raw, str) or not Path(preference_raw).is_absolute():
+            raise RuntimeError("Runtime Host extension preference path is invalid")
+        _, configured_dir = _configured_extension_source(Path(preference_raw).parents[1])
+        if configured_dir != extension_dir:
+            raise RuntimeError("Runtime Host extension profile binding drifted")
+    observed_browser_paths: set[Path] = set()
+    for record in browser_executables:
+        if not isinstance(record, dict) or set(record) != {"path", "sha256"}:
+            raise RuntimeError("Runtime Host browser executable pin is invalid")
+        raw_path = record.get("path")
+        digest = record.get("sha256")
+        if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+            raise RuntimeError("Runtime Host browser executable path is invalid")
+        path = Path(raw_path)
+        try:
+            info = path.lstat()
+            resolved = path.resolve(strict=True)
+        except FileNotFoundError as error:
+            raise RuntimeError("Runtime Host browser executable is missing") from error
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or info.st_uid not in {0, os.geteuid()}
+            or not os.access(path, os.X_OK)
+            or resolved in observed_browser_paths
+            or not str(resolved).endswith(
+                (
+                    ".app/Contents/MacOS/Google Chrome",
+                    ".app/Contents/MacOS/Google Chrome for Testing",
+                )
+            )
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or _sha256_file(path) != digest
+        ):
+            raise RuntimeError("Runtime Host browser executable pin mismatch")
+        observed_browser_paths.add(resolved)
+    release_extension_dir = layout["host_dir"] / "chrome-host" / "extension"
+    expected_paths = {
+        str(extension_dir / relative) for relative in RUNTIME_EXTENSION_EXECUTION_RELATIVE_PATHS
+    }
+    if set(bundle) != expected_paths:
+        raise RuntimeError("Runtime Host extension bundle path mismatch")
+    for relative in RUNTIME_EXTENSION_EXECUTION_RELATIVE_PATHS:
+        actual = extension_dir / relative
+        expected = bundle.get(str(actual))
+        if (
+            not isinstance(expected, str)
+            or _sha256_file(actual) != expected
+            or _sha256_file(release_extension_dir / relative) != expected
+        ):
+            raise RuntimeError(f"Runtime Host extension bundle hash mismatch: {relative}")
+    return value
+
+
+def _runtime_verifier_bundle_paths(layout: dict[str, Path]) -> tuple[Path, ...]:
+    return (
+        layout["runtime_verifier_wrapper"],
+        *(layout["host_dir"] / relative for relative in RUNTIME_VERIFIER_BUNDLE_RELATIVE_PATHS),
+    )
+
+
+def _validate_runtime_verifier_release_files(layout: dict[str, Path]) -> None:
+    release_dir = layout["release_dir"].resolve(strict=True)
+    bundle = _runtime_verifier_bundle_paths(layout)
+    if len(bundle) != len(set(bundle)):
+        raise RuntimeError("production Runtime Host verifier bundle contains duplicates")
+    for path in bundle:
+        try:
+            resolved = path.resolve(strict=True)
+            info = path.lstat()
+        except FileNotFoundError as error:
+            raise RuntimeError(
+                f"production Runtime Host verifier artifact is missing: {path}"
+            ) from error
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) & 0o077
+            or not resolved.is_relative_to(release_dir)
+        ):
+            raise RuntimeError(
+                f"production Runtime Host verifier artifact is unsafe: {path}"
+            )
+    for path in (layout["runtime_verifier_wrapper"], layout["runtime_verifier_cli"]):
+        if not os.access(path, os.X_OK):
+            raise RuntimeError(
+                f"production Runtime Host verifier executable is not executable: {path}"
+            )
+
+
+def _runtime_verifier_config_path(home_dir: Path) -> Path:
+    return Path(home_dir).expanduser() / ".codex" / "adaptive-delivery-host-attestation-verifiers.json"
+
+
+@contextmanager
+def _runtime_verifier_config_lock(home_dir: Path):
+    config_path = _runtime_verifier_config_path(home_dir)
+    _private_dir(config_path.parent)
+    lock_path = config_path.with_name(config_path.name + ".lock")
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except FileExistsError as error:
+        raise RuntimeError(
+            "Runtime Host verifier publication lock is already held"
+        ) from error
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) & 0o077
+        ):
+            raise RuntimeError("Runtime Host verifier config lock is unsafe")
+        os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+        os.fsync(fd)
+        yield
+    finally:
+        try:
+            lock_info = lock_path.lstat()
+            open_info = os.fstat(fd)
+            if (
+                stat.S_ISREG(lock_info.st_mode)
+                and lock_info.st_dev == open_info.st_dev
+                and lock_info.st_ino == open_info.st_ino
+            ):
+                lock_path.unlink()
+        finally:
+            os.close(fd)
+
+
+def _runtime_verifier_record(
+    layout: dict[str, Path], installed: dict[str, Any]
+) -> dict[str, Any]:
+    _validate_runtime_verifier_release_files(layout)
+    artifacts = installed.get("artifacts_sha256")
+    if not isinstance(artifacts, dict):
+        raise RuntimeError("production release manifest has no Runtime verifier artifact hashes")
+    bundle_sha256: dict[str, str] = {}
+    for path in _runtime_verifier_bundle_paths(layout):
+        relative = str(path.relative_to(layout["release_dir"]))
+        expected = artifacts.get(relative)
+        actual = _sha256_file(path)
+        if not isinstance(expected, str) or expected != actual:
+            raise RuntimeError(
+                f"Runtime Host verifier artifact is not pinned to the immutable release: {relative}"
+            )
+        bundle_sha256[str(path.resolve(strict=True))] = actual
+    node_record = (installed.get("runtime_dependencies") or {}).get("node")
+    if not isinstance(node_record, dict):
+        raise RuntimeError("production Runtime Host verifier Node pin is missing")
+    node_path_raw = node_record.get("path")
+    node_digest = node_record.get("sha256")
+    if not isinstance(node_path_raw, str) or not isinstance(node_digest, str):
+        raise RuntimeError("production Runtime Host verifier Node pin is invalid")
+    node_path = Path(node_path_raw)
+    try:
+        node_info = node_path.lstat()
+    except FileNotFoundError as error:
+        raise RuntimeError("production Runtime Host verifier Node executable is missing") from error
+    if (
+        not node_path.is_absolute()
+        or node_path.is_symlink()
+        or not node_path.is_file()
+        or node_info.st_uid != os.geteuid()
+        or stat.S_IMODE(node_info.st_mode) & 0o022
+        or not os.access(node_path, os.X_OK)
+        or _sha256_file(node_path) != node_digest
+    ):
+        raise RuntimeError("production Runtime Host verifier Node executable pin mismatch")
+    bundle_sha256[str(node_path)] = node_digest
+    extension_binding = _validate_runtime_extension_binding(layout, installed)
+    binding_path = layout["host_extension_binding"]
+    bundle_sha256[str(binding_path.resolve(strict=True))] = _sha256_file(binding_path)
+    for actual_path, actual_digest in extension_binding["bundle_sha256"].items():
+        existing = bundle_sha256.get(actual_path)
+        if existing is not None and existing != actual_digest:
+            raise RuntimeError("Runtime Host extension pin conflicts with release bundle")
+        bundle_sha256[actual_path] = actual_digest
+    if len(bundle_sha256) > 64:
+        raise RuntimeError("production Runtime Host verifier bundle exceeds Runtime limit")
+    wrapper = layout["runtime_verifier_wrapper"].resolve(strict=True)
+    return {
+        "protocol": "runtime_host_verifier_cli_v1",
+        "executable": str(wrapper),
+        "sha256": _sha256_file(wrapper),
+        "bundle_sha256": bundle_sha256,
+    }
+
+
+def _read_runtime_verifier_config(path: Path) -> tuple[dict[str, Any], bytes | None]:
+    raw = _read_private_bytes_if_present(path, "Runtime Host verifier config")
+    if raw is None:
+        return {"schema_version": 1, "verifiers": {}}, None
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("Runtime Host verifier config is not valid UTF-8 JSON") from error
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != 1
+        or not isinstance(value.get("verifiers"), dict)
+    ):
+        raise RuntimeError("Runtime Host verifier config schema is invalid")
+    return value, raw
+
+
+def _register_runtime_host_verifier(
+    layout: dict[str, Path], manifest: dict[str, Any], *, home_dir: Path
+) -> Path:
+    with _runtime_verifier_config_lock(home_dir):
+        return _register_runtime_host_verifier_locked(
+            layout, manifest, home_dir=home_dir
+        )
+
+
+def _register_runtime_host_verifier_locked(
+    layout: dict[str, Path], manifest: dict[str, Any], *, home_dir: Path
+) -> Path:
+    installed = _validate_immutable_native_wrapper(layout, manifest)
+    record = _runtime_verifier_record(layout, installed)
+    config_path = _runtime_verifier_config_path(home_dir)
+    value, original = _read_runtime_verifier_config(config_path)
+    updated = json.loads(json.dumps(value))
+    updated["verifiers"]["web"] = record
+    current = _read_private_bytes_if_present(
+        config_path, "Runtime Host verifier config"
+    )
+    if current != original:
+        raise RuntimeError(
+            "Runtime Host verifier config changed concurrently before publication"
+        )
+    _write_json_private(config_path, updated)
+    return config_path
+
+
+def _validate_runtime_host_verifier_registration(
+    layout: dict[str, Path], manifest: dict[str, Any], *, home_dir: Path
+) -> Path:
+    installed = _validate_immutable_native_wrapper(layout, manifest)
+    expected = _runtime_verifier_record(layout, installed)
+    config_path = _runtime_verifier_config_path(home_dir)
+    value, _ = _read_runtime_verifier_config(config_path)
+    if value["verifiers"].get("web") != expected:
+        raise RuntimeError("Runtime Host verifier registration pin mismatch")
+    return config_path
 
 
 def _native_messaging_paths(
@@ -736,6 +1292,7 @@ def validate_native_messaging_manifests(
             raise RuntimeError(f"Native Messaging manifest for {browser} is not valid JSON") from error
         if not isinstance(value, dict) or any(value.get(key) != wanted for key, wanted in expected.items()):
             raise RuntimeError(f"Native Messaging manifest pin mismatch for {browser}")
+    _validate_runtime_host_verifier_registration(layout, manifest, home_dir=home_dir)
     return paths
 
 
@@ -4026,6 +4583,77 @@ def _validate_private_source(path: Path, label: str) -> None:
         raise RuntimeError(f"{label} permissions must be 0600 or stricter")
 
 
+def _read_private_bytes_if_present(path: Path, label: str) -> bytes | None:
+    """Read an owned private regular file without following a replacement symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise RuntimeError(f"{label} cannot be opened safely") from error
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) & 0o077
+        ):
+            raise RuntimeError(f"{label} must be an owned private regular file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _private_file_snapshot(path: Path, label: str) -> tuple[bytes, int] | None:
+    payload = _read_private_bytes_if_present(path, label)
+    if payload is None:
+        return None
+    info = path.lstat()
+    if path.is_symlink() or not path.is_file() or info.st_uid != os.geteuid():
+        raise RuntimeError(f"{label} changed while taking a publication snapshot")
+    return payload, stat.S_IMODE(info.st_mode)
+
+
+def _restore_private_file_snapshot(
+    path: Path,
+    snapshot: tuple[bytes, int] | None,
+    *,
+    private_parent: bool,
+) -> None:
+    if snapshot is None:
+        current = _read_private_bytes_if_present(path, "publication rollback target")
+        if current is None:
+            return
+        path.unlink()
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        directory_fd = os.open(path.parent, directory_flags)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return
+    payload, mode = snapshot
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RuntimeError("publication rollback snapshot is not UTF-8") from error
+    _write_text_private(
+        path,
+        text,
+        mode,
+        private_parent=private_parent,
+    )
+
+
 def _validate_owned_file_source(source: Path, label: str) -> None:
     source = Path(source)
     try:
@@ -4538,6 +5166,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--historical-runtime-state", type=Path, default=HISTORICAL_M0_RUNTIME_STATE)
     parser.add_argument("--tunnel-client", type=Path)
     parser.add_argument("--native-user-data-dir", action="append", type=Path, default=[])
+    parser.add_argument("--browser-executable", action="append", type=Path, default=[])
     parser.add_argument("--fallback-health-url-file", type=Path, default=AI_BRIDGE_FALLBACK_HEALTH_URL_FILE)
     parser.add_argument("--rollback-receipt", type=Path)
     args = parser.parse_args(argv)
@@ -4586,6 +5215,7 @@ def main(argv: list[str] | None = None) -> int:
             layout,
             manifest,
             native_user_data_dirs=args.native_user_data_dir,
+            browser_executables=args.browser_executable,
         ).items()}
     elif args.action == "rollback-tunnel":
         result = rollback_production_activation(

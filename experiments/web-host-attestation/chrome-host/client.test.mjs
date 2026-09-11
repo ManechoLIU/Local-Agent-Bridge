@@ -4,7 +4,7 @@ import net from "node:net";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { requestNativeHost } from "./client.mjs";
+import { createChromeHostDriver, requestNativeHost } from "./client.mjs";
 
 async function serverFor(t, responder) {
   const root = mkdtempSync(join(tmpdir(), "lab-client-test-"));
@@ -55,4 +55,58 @@ test("Unix socket client accepts only matching request id", async function (t) {
   });
   const result = await requestNativeHost(socketPath, { op: "health" }, { timeoutMs: 1000 });
   assert.deepEqual(result, { status: "ready" });
+});
+
+test("driver rejects a stale native Host extension binding epoch", async function (t) {
+  const expected = "a".repeat(64);
+  const socketPath = await serverFor(t, function (request) {
+    return {
+      request_id: request.request_id,
+      ok: true,
+      result: {
+        current_entry: { conversation_id: "stale" },
+        extension_epoch: {
+          binding_sha256: "b".repeat(64),
+          instance_id_sha256: "c".repeat(64),
+          loaded_at_ms: 1
+        }
+      }
+    };
+  });
+  const driver = createChromeHostDriver({
+    socketPath,
+    timeoutMs: 1000,
+    expectedExtensionBindingSha256: expected
+  });
+  await assert.rejects(
+    driver.discoverCurrentEntry({ target_generation: 1, ownership_generation: 1 }),
+    /extension epoch does not match current binding/
+  );
+});
+
+test("driver accepts only the current native Host extension binding epoch", async function (t) {
+  const expected = "a".repeat(64);
+  const socketPath = await serverFor(t, function (request) {
+    return {
+      request_id: request.request_id,
+      ok: true,
+      result: {
+        current_entry: { conversation_id: "current" },
+        extension_epoch: {
+          binding_sha256: expected,
+          instance_id_sha256: "c".repeat(64),
+          loaded_at_ms: 1
+        }
+      }
+    };
+  });
+  const driver = createChromeHostDriver({
+    socketPath,
+    timeoutMs: 1000,
+    expectedExtensionBindingSha256: expected
+  });
+  assert.deepEqual(
+    await driver.discoverCurrentEntry({ target_generation: 1, ownership_generation: 1 }),
+    { conversation_id: "current" }
+  );
 });
