@@ -1,0 +1,214 @@
+# Host Tool Receipt Producer Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Produce durable Host-signed capability, pre-tool, and terminal receipts at the real Rust Bridge execution boundary without changing CatDesk or the public Host tool list.
+
+**Architecture:** The Host owns machine observation, signing, and single-use capability state; the Rust Bridge owns transport binding, exact request canonicalization, dispatch ordering, and crash-safe execution state. Protected `run_command` calls use a two-call challenge handshake; the first call issues a bound capability without backend execution and the exact retry consumes it before Runtime authorization and backend dispatch.
+
+**Tech Stack:** Rust/Tokio/Axum/Serde, Node.js ES modules, Chrome extension Native Messaging, Python production release tooling, Node test runner, Cargo tests, Python unittest.
+
+**Spec:** `/Users/echoman/Documents/ChatGPT/.worktrees/lab-production-connector-p0/docs/superpowers/specs/2026-09-11-host-tool-receipt-chain.md`
+
+## Global Constraints
+
+- Public Host MCP `tools/list` remains exactly `discover_current_entry`.
+- Caller identity fields and caller request/session IDs are never identity evidence.
+- `bridge_call_id`, `bridge_challenge_nonce`, `transport_binding_id`, and `host_tool_execution_id` are generated inside Bridge/Host, never accepted from tool arguments or incoming headers.
+- The capability binds exact normalized `run_command` arguments, canonical workspace, outer and forwarded request SHA-256, production release revision/generation, Bridge capability context, machine-derived Web entry, active generation anchor, and loaded extension epoch.
+- Capability and dispatch state are atomically persisted before side effects; post-dispatch uncertainty is terminally `RESULT_UNKNOWN_AFTER_DISPATCH` and never auto-retried.
+- CatDesk source and binary are unchanged; Bridge strips `host_invocation_capability` before forwarding.
+- LAB remains independently runnable without Runtime integration. Production protected shell calls fail closed when the explicitly configured, hash-pinned Runtime hook is unavailable.
+- AI-Bridge and compute helper remain available and unchanged, but their data never satisfies Host identity, Runtime CLOSED, or Live-E2E gates.
+- Existing untracked `.orig`, `.rej`, and `__pycache__` files are preserved.
+
+---
+
+### Task 1: Host capability and signed receipt state machine
+
+**Files:**
+- Modify: `experiments/web-host-attestation/attestation.mjs`
+- Modify: `experiments/web-host-attestation/attestation.test.mjs`
+- Modify: `experiments/web-host-attestation/chrome-host/extension/current-entry-registry.js`
+- Modify: `experiments/web-host-attestation/chrome-host/extension/current-entry-registry.test.mjs`
+- Modify: `experiments/web-host-attestation/chrome-host/extension/background.js`
+- Modify: `experiments/web-host-attestation/chrome-host/native-host-core.mjs`
+- Modify: `experiments/web-host-attestation/chrome-host/native-host-core.test.mjs`
+- Modify: `experiments/web-host-attestation/chrome-host/native-host.mjs`
+- Modify: `experiments/web-host-attestation/chrome-host/native-host-process.test.mjs`
+
+**Interfaces:**
+- Consumes: private Native Messaging channel, Host HMAC secret, current extension epoch, `currentEntryRegistry.resolveCurrent()`.
+- Produces: `ToolInvocationReceiptJournal.issueCapability(input)`, `.consumeCapability(input)`, and `.terminalize(input)` returning the exact v1 schemas in the spec; private browser/native operations `tool_receipt_issue`, `tool_receipt_consume`, and `tool_receipt_terminal`.
+
+- [ ] **Step 1: Write failing Host receipt tests**
+
+Add behavior tests whose literal fixtures prove: machine-only identity fields; exact normalized request binding; generation-anchor and extension-epoch binding; single-use consume across restart; cross-transport, TTL, target/frame/loader/generation drift rejection; terminal requires the exact consumed pre; terminal does not store response bodies.
+
+```js
+assert.equal(capability.provenance, "lab_host_invocation_capability_v1");
+assert.equal(pre.provenance, "lab_host_tool_pre_receipt_v1");
+assert.equal(terminal.provenance, "lab_host_tool_terminal_receipt_v1");
+assert.throws(() => restarted.consumeCapability(changed), /replay|mismatch/i);
+```
+
+- [ ] **Step 2: Run the focused tests and capture RED**
+
+Run:
+
+```bash
+node --test experiments/web-host-attestation/attestation.test.mjs experiments/web-host-attestation/chrome-host/extension/current-entry-registry.test.mjs experiments/web-host-attestation/chrome-host/native-host-core.test.mjs experiments/web-host-attestation/chrome-host/native-host-process.test.mjs
+```
+
+Expected: FAIL because the new receipt journal and private operations do not exist; existing tests remain green before the first new failure.
+
+- [ ] **Step 3: Implement the minimal Host state machine**
+
+Use canonical JSON HMAC, private atomic state writes with file and parent-directory fsync, strict owner/symlink/mode checks, and the monotonic state transitions from the spec. `generation_anchor_sha256` is computed from the exact sorted active Chrome generation request IDs and is never returned as raw request IDs.
+
+```js
+export class ToolInvocationReceiptJournal {
+  issueCapability(input) {}
+  consumeCapability(input) {}
+  terminalize(input) {}
+}
+```
+
+The extension returns machine context and a generation-anchor digest only. Native Host adds the loaded extension epoch and signs all receipts.
+
+- [ ] **Step 4: Run focused Host tests GREEN**
+
+Run the Step 2 command. Expected: all tests pass with no warnings.
+
+- [ ] **Step 5: Commit Task 1**
+
+```bash
+git add experiments/web-host-attestation/attestation.mjs experiments/web-host-attestation/attestation.test.mjs experiments/web-host-attestation/chrome-host/extension/current-entry-registry.js experiments/web-host-attestation/chrome-host/extension/current-entry-registry.test.mjs experiments/web-host-attestation/chrome-host/extension/background.js experiments/web-host-attestation/chrome-host/native-host-core.mjs experiments/web-host-attestation/chrome-host/native-host-core.test.mjs experiments/web-host-attestation/chrome-host/native-host.mjs experiments/web-host-attestation/chrome-host/native-host-process.test.mjs
+git commit -m "feat(host): sign durable tool execution receipts"
+```
+
+### Task 2: Bridge challenge handshake and dispatch journal
+
+**Files:**
+- Modify: `crates/bridge-security-core/src/lib.rs`
+- Modify: `crates/local-tool-bridge/src/lib.rs`
+- Modify: `crates/local-tool-bridge/src/main.rs`
+- Modify: `crates/local-tool-bridge/tests/ingress.rs`
+- Create: `crates/local-tool-bridge/tests/tool_receipt_chain.rs`
+
+**Interfaces:**
+- Consumes: Task 1 private Host operations and signed schemas.
+- Produces: Bridge-generated transport/execution identities, `ToolReceiptJournal`, protected `run_command` schema decoration, capability stripping, private Host client, and optional hash-pinned Runtime hook protocol `runtime_host_tool_hook_v1`.
+
+- [ ] **Step 1: Write failing Bridge tests**
+
+Test the real ingress boundary with controlled Host/backend/hook servers. The first protected call must return `HOST_INVOCATION_CAPABILITY_REQUIRED` and make zero backend calls. The exact retry must call Host consume, call Runtime pre, persist dispatch intent, execute the backend once, call Host terminal, call Runtime terminal, and return the buffered response.
+
+```rust
+assert_eq!(backend.calls(), 0);
+assert_eq!(challenge["error"]["data"]["code"], "HOST_INVOCATION_CAPABILITY_REQUIRED");
+assert_eq!(backend.calls(), 1);
+assert_eq!(journal.state(call_id), "TERMINAL");
+```
+
+Add negative tests for caller-supplied execution IDs, changed command/cwd/timeout, cross-binding use, concurrent consume, state persistence failure, pre rejection, backend timeout, Host terminal loss, Runtime terminal rejection, and restart after `DISPATCH_INTENT`.
+
+- [ ] **Step 2: Run the focused Cargo tests and capture RED**
+
+Run:
+
+```bash
+cd crates/local-tool-bridge
+cargo test --test tool_receipt_chain --test ingress
+```
+
+Expected: FAIL because the receipt client/journal and schema decoration are absent.
+
+- [ ] **Step 3: Implement the minimal Bridge flow**
+
+Add a Bridge-only execution identity to `RequestProof` and its fixed HMAC message. Canonicalize `run_command` arguments after removing `host_invocation_capability`; bind both outer and forwarded digests. Buffer backend responses before terminalization.
+
+```rust
+pub struct BufferedBackendResponse {
+    pub status: StatusCode,
+    pub content_type: Option<String>,
+    pub bytes: Bytes,
+}
+
+pub enum ToolReceiptState {
+    Issued,
+    HostValidatedInFlight,
+    RuntimeAllowed,
+    DispatchIntent,
+    BackendResponse,
+    TerminalPending,
+    Terminal,
+    ResultUnknownAfterDispatch,
+}
+```
+
+`tools/list` keeps the same tool names and only decorates `run_command.inputSchema` with the reserved capability field. The outgoing CatDesk body never contains that field.
+
+- [ ] **Step 4: Run focused Bridge tests GREEN**
+
+Run the Step 2 command plus:
+
+```bash
+cargo test --test release_fence --test runtime_recovery
+```
+
+Expected: all tests pass and no backend side effect appears on any failing pre path.
+
+- [ ] **Step 5: Commit Task 2**
+
+```bash
+git add crates/bridge-security-core/src/lib.rs crates/local-tool-bridge/src/lib.rs crates/local-tool-bridge/src/main.rs crates/local-tool-bridge/tests/ingress.rs crates/local-tool-bridge/tests/tool_receipt_chain.rs
+git commit -m "feat(bridge): gate shell dispatch on Host receipts"
+```
+
+### Task 3: Production release wiring and compatibility fences
+
+**Files:**
+- Modify: `scripts/production_connector.py`
+- Modify: `tests/test_production_connector.py`
+- Modify: `experiments/web-host-attestation/chrome-host/host-mcp-adapter.test.mjs`
+
+**Interfaces:**
+- Consumes: Task 1 Host state path/operations and Task 2 Bridge env/hook settings.
+- Produces: immutable release paths for Host receipt state, Bridge receipt journal, Host socket and verification material, and a Runtime hook registration that pins executable, transitive bundle hashes, installed Runtime revision, and protocol `runtime_host_tool_hook_v1`.
+
+- [ ] **Step 1: Write failing production contract tests**
+
+Add literal assertions that the immutable release carries the new Host/Bridge state paths and that protected shell activation rejects missing, symlinked, group-writable, wrong-owner, stale-revision, or hash-mismatched Runtime hooks. Preserve the public Host single-tool assertion and the exact AI-Bridge/compute-helper before/after health identity.
+
+```python
+self.assertEqual(host_tools, ["discover_current_entry"])
+self.assertEqual(binding["protocol"], "runtime_host_tool_hook_v1")
+self.assertFalse(binding["ai_bridge_is_trusted_receipt_source"])
+```
+
+- [ ] **Step 2: Run focused production tests and capture RED**
+
+Run:
+
+```bash
+python3 -m unittest -v tests.test_production_connector
+node --test experiments/web-host-attestation/chrome-host/host-mcp-adapter.test.mjs
+```
+
+Expected: new contract assertions fail before implementation; all existing assertions remain green.
+
+- [ ] **Step 3: Implement release wiring**
+
+Generate private state paths under the immutable production runtime, pass only exact canonical paths through component environments, include the new executable and transitive files in release hashes, and validate the Runtime hook immediately before every production start. Do not start, stop, install, refresh, or reconnect production in this task.
+
+- [ ] **Step 4: Run the production and focused cross-component regression**
+
+Run the Step 2 command, Task 1 Node command, and Task 2 Cargo commands. Expected: all pass with unchanged public tool names and unchanged AI-Bridge/compute-helper identity checks.
+
+- [ ] **Step 5: Commit Task 3**
+
+```bash
+git add scripts/production_connector.py tests/test_production_connector.py experiments/web-host-attestation/chrome-host/host-mcp-adapter.test.mjs
+git commit -m "feat(production): pin Host tool receipt chain"
+```
