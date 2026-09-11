@@ -109,4 +109,8 @@ test("driver accepts only the current native Host extension binding epoch", asyn
     await driver.discoverCurrentEntry({ target_generation: 1, ownership_generation: 1 }),
     { conversation_id: "current" }
   );
+  assert.deepEqual(
+    await driver.discoverCurrentEntryWithEpoch({ target_generation: 1, ownership_generation: 1 }),
+    { current_entry: { conversation_id: "current" }, extension_epoch: { binding_sha256: expected, instance_id_sha256: "c".repeat(64), loaded_at_ms: 1 } }
+  );
 });

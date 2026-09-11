@@ -247,6 +247,7 @@ export function validateHostInvocationContext(input) {
     top_frame_id: nonEmpty(input?.top_frame_id, "current_entry.top_frame_id"),
     loader_id: nonEmpty(input?.loader_id, "current_entry.loader_id"),
     secure_origin: nonEmpty(input?.secure_origin, "current_entry.secure_origin"),
+    generation_anchor_sha256: digest(input?.generation_anchor_sha256, "current_entry.generation_anchor_sha256"),
     observed_at_ms: positiveInteger(input?.observed_at_ms, "current_entry.observed_at_ms")
   };
   if (context.entry_scope !== CURRENT_ENTRY_SCOPE) {
@@ -290,6 +291,7 @@ export function signCurrentEntryEvidence({
     top_frame_id: context.top_frame_id,
     loader_id: context.loader_id,
     secure_origin: context.secure_origin,
+    generation_anchor_sha256: context.generation_anchor_sha256,
     target_generation: positiveInteger(targetGeneration, "current_entry.target_generation"),
     ownership_generation: positiveInteger(ownershipGeneration, "current_entry.ownership_generation"),
     host_receipt_id: `hce_${randomUUID()}`,
@@ -328,6 +330,7 @@ export function verifyCurrentEntryEvidence({
   nonEmpty(evidence.browser_target_id, "current_entry.browser_target_id");
   nonEmpty(evidence.top_frame_id, "current_entry.top_frame_id");
   nonEmpty(evidence.loader_id, "current_entry.loader_id");
+  digest(evidence.generation_anchor_sha256, "current_entry.generation_anchor_sha256");
   nonEmpty(evidence.host_receipt_id, "current_entry.host_receipt_id");
   const targetGeneration = positiveInteger(evidence.target_generation, "current_entry.target_generation");
   const ownershipGeneration = positiveInteger(evidence.ownership_generation, "current_entry.ownership_generation");
@@ -867,6 +870,86 @@ export class ToolInvocationReceiptJournal {
   inspectStateForTest() {
     return structuredClone({ schema_version: 1, records: [...this.records.entries()] });
   }
+}
+
+const PRE_KEYS = [
+  "schema_version", "provenance", "request_digest_profile", "pre_receipt_id", "capability_id", "host_tool_execution_id",
+  "bridge_call_id", "bridge_challenge_nonce", "transport_binding_id", "workspace", "production_release_revision",
+  "production_endpoint_generation", "bridge_principal_id", "bridge_execution_session_id", "bridge_capability_id",
+  "bridge_workspace_id", "tool_name", "outer_request_sha256", "forwarded_request_sha256", "normalized_request_sha256",
+  "retry_outer_request_sha256", "conversation_id", "browser_target_id", "top_frame_id", "loader_id",
+  "generation_anchor_sha256", "secure_origin", "extension_binding_sha256", "extension_instance_id_sha256",
+  "extension_loaded_at_ms", "pre_nonce", "issued_at_unix_ms", "host_epoch_binding_sha256", "host_mac_sha256"
+].sort();
+const TERMINAL_KEYS = [
+  "schema_version", "provenance", "request_digest_profile", "terminal_receipt_id", "pre_receipt_id", "pre_receipt_sha256",
+  "capability_id", "host_tool_execution_id", "bridge_call_id", "bridge_challenge_nonce", "transport_binding_id",
+  "workspace", "production_release_revision", "production_endpoint_generation", "bridge_principal_id",
+  "bridge_execution_session_id", "bridge_capability_id", "bridge_workspace_id", "tool_name", "outer_request_sha256",
+  "forwarded_request_sha256", "normalized_request_sha256", "retry_outer_request_sha256", "conversation_id",
+  "browser_target_id", "top_frame_id", "loader_id", "generation_anchor_sha256", "secure_origin",
+  "extension_binding_sha256", "extension_instance_id_sha256", "extension_loaded_at_ms", "backend_route", "http_status",
+  "response_body_sha256", "terminal_classification", "issued_at_unix_ms", "host_epoch_binding_sha256", "host_mac_sha256"
+].sort();
+
+function exactKeys(value, keys, label) {
+  const actual = value && typeof value === "object" && !Array.isArray(value) ? Object.keys(value).sort() : [];
+  if (actual.length !== keys.length || actual.some((key, index) => key !== keys[index])) {
+    throw new Error(`${label} keys are invalid`);
+  }
+}
+
+function verifyToolReceipt(input, keys, provenance) {
+  const { secret, receipt, receipt_sha256, expected_request_digests: expected, clock = Date.now,
+    maxReceiptAgeMs = 15_000, futureSkewMs = 5_000 } = input || {};
+  exactKeys(receipt, keys, "tool receipt");
+  const signed = authenticateReceipt(secret, receipt, provenance);
+  const binding = validateBridgeBindingContract(bindingFromSignedReceipt(signed));
+  if (signed.schema_version !== 1 || signed.request_digest_profile !== RUN_COMMAND_DIGEST_PROFILE ||
+      signed.tool_name !== "run_command") throw new Error("tool receipt schema is invalid");
+  const now = nowMs(clock);
+  const issued = positiveInteger(signed.issued_at_unix_ms, "issued_at_unix_ms");
+  if (issued > now + futureSkewMs || now - issued > maxReceiptAgeMs) throw new Error("tool receipt is stale");
+  const epochBinding = sha256Text(`${binding.extension_binding_sha256}:${binding.extension_instance_id_sha256}:${binding.extension_loaded_at_ms}`);
+  if (signed.host_epoch_binding_sha256 !== epochBinding) throw new Error("tool receipt Host epoch binding mismatch");
+  if (digest(receipt_sha256, "receipt_sha256") !== sha256Text(canonicalJson(signed))) throw new Error("receipt_sha256 mismatch");
+  exactKeys(expected, ["forwarded_request_sha256", "normalized_request_sha256", "outer_request_sha256", "retry_outer_request_sha256"], "expected_request_digests");
+  for (const key of Object.keys(expected)) {
+    if (signed[key] !== digest(expected[key], `expected ${key}`)) throw new Error(`${key} mismatch`);
+  }
+  return signed;
+}
+
+export function verifyToolPreReceipt(input) {
+  const receipt = verifyToolReceipt(input, PRE_KEYS, "lab_host_tool_pre_receipt_v1");
+  receiptText(receipt.pre_receipt_id, "pre_receipt_id", "hpr_");
+  receiptText(receipt.capability_id, "capability_id", "hic_");
+  receiptText(receipt.host_tool_execution_id, "host_tool_execution_id", "hte_");
+  if (!/^[0-9a-f]{48}$/.test(receipt.pre_nonce)) throw new Error("pre_nonce is invalid");
+  return Object.freeze({ ...receipt });
+}
+
+export function verifyToolTerminalReceipt(input) {
+  const receipt = verifyToolReceipt(input, TERMINAL_KEYS, "lab_host_tool_terminal_receipt_v1");
+  receiptText(receipt.terminal_receipt_id, "terminal_receipt_id", "htr_");
+  receiptText(receipt.pre_receipt_id, "pre_receipt_id", "hpr_");
+  receiptText(receipt.capability_id, "capability_id", "hic_");
+  receiptText(receipt.host_tool_execution_id, "host_tool_execution_id", "hte_");
+  const chain = input?.expected_pre_chain;
+  exactKeys(chain, ["capability_id", "host_tool_execution_id", "pre_receipt_id", "pre_receipt_sha256"], "expected_pre_chain");
+  for (const key of ["pre_receipt_id", "capability_id", "host_tool_execution_id"]) {
+    if (receipt[key] !== chain[key]) throw new Error(`terminal ${key} mismatch`);
+  }
+  if (receipt.pre_receipt_sha256 !== digest(chain.pre_receipt_sha256, "expected_pre_chain.pre_receipt_sha256")) {
+    throw new Error("terminal pre_receipt_sha256 mismatch");
+  }
+  if (!String(receipt.backend_route).startsWith("/")) throw new Error("terminal backend_route is invalid");
+  if (!Number.isSafeInteger(receipt.http_status) || receipt.http_status < 100 || receipt.http_status > 599) {
+    throw new Error("terminal http_status is invalid");
+  }
+  digest(receipt.response_body_sha256, "response_body_sha256");
+  receiptText(receipt.terminal_classification, "terminal_classification");
+  return Object.freeze({ ...receipt });
 }
 
 export class RuntimeHostVerifier {

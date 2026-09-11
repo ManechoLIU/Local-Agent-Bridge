@@ -1,5 +1,5 @@
 import { createRuntimeHostProvider } from "../provider.mjs";
-import { verifyCurrentEntryEvidence, verifyReentryReceipt } from "../attestation.mjs";
+import { verifyCurrentEntryEvidence, verifyReentryReceipt, verifyToolPreReceipt, verifyToolTerminalReceipt } from "../attestation.mjs";
 import { createChromeHostDriver } from "./client.mjs";
 import { RUNTIME_HOST_REQUEST_TIMEOUT_MS } from "./extension/timeout-budget.js";
 
@@ -32,10 +32,13 @@ export function createChromeRuntimeHostIntegration(options) {
       "issueChallenge",
       "requestAttestation",
       "verifyAttestation",
-      "discoverCurrentEntry",      "attestAndVerify",
+      "discoverCurrentEntry",
+      "attestAndVerify",
       "consumeVerifiedTarget",
       "submitReentry",
-      "submitAndVerifyReentry"
+      "submitAndVerifyReentry",
+      "verifyToolPreReceipt",
+      "verifyToolTerminalReceipt"
     ]),
 
     issueChallenge(input) {
@@ -59,6 +62,14 @@ export function createChromeRuntimeHostIntegration(options) {
         expectedOwnershipGeneration: input && input.ownership_generation,
         clock: clock
       });
+    },
+
+    async verifyToolPreReceipt(input) {
+      return await verifyToolReceiptWithCurrentEntry(input, verifyToolPreReceipt);
+    },
+
+    async verifyToolTerminalReceipt(input) {
+      return await verifyToolReceiptWithCurrentEntry(input, verifyToolTerminalReceipt);
     },
 
     async attestAndVerify(input) {
@@ -105,6 +116,24 @@ export function createChromeRuntimeHostIntegration(options) {
       });
     }
   });
+
+  async function verifyToolReceiptWithCurrentEntry(input, verifyReceipt) {
+    const fresh = await driver.discoverCurrentEntryWithEpoch({
+      target_generation: input.expected_target_generation,
+      ownership_generation: input.expected_ownership_generation
+    });
+    const current = verifyCurrentEntryEvidence({ secret, evidence: fresh.current_entry,
+      expectedTargetGeneration: input.expected_target_generation,
+      expectedOwnershipGeneration: input.expected_ownership_generation, clock });
+    const receipt = verifyReceipt({ ...input, secret, clock });
+    for (const field of ["conversation_id", "browser_target_id", "top_frame_id", "loader_id", "secure_origin", "generation_anchor_sha256"]) {
+      if (receipt[field] !== current[field]) throw new Error("tool receipt current-entry " + field + " mismatch");
+    }
+    if (receipt.extension_binding_sha256 !== fresh.extension_epoch.binding_sha256 ||
+        receipt.extension_instance_id_sha256 !== fresh.extension_epoch.instance_id_sha256 ||
+        receipt.extension_loaded_at_ms !== fresh.extension_epoch.loaded_at_ms) throw new Error("tool receipt extension epoch mismatch");
+    return Object.freeze({ receipt, current_entry: current });
+  }
 }
 
 function requiredRuntimeText(value, name, max) {
@@ -122,12 +151,37 @@ function requiredRuntimeGeneration(value, name) {
 
 export async function executeRuntimeVerifierCommand(input, options) {
   const operation = requiredRuntimeText(input && input.operation, "operation", 64);
-  if (operation !== "discover_current_entry" && operation !== "attest_and_verify" && operation !== "submit_reentry") {
+  if (!["discover_current_entry", "attest_and_verify", "submit_reentry", "verify_tool_pre", "verify_tool_terminal"].includes(operation)) {
     throw new Error("unsupported Runtime Host operation: " + operation);
   }
   const integration = options && options.integration;
   if (!integration) {
     throw new Error("Runtime Host integration is required");
+  }
+
+  if (operation === "verify_tool_pre" || operation === "verify_tool_terminal") {
+    const expectedKeys = operation === "verify_tool_pre"
+      ? ["protocol", "operation", "receipt_sha256", "receipt", "expected_target_generation", "expected_ownership_generation", "expected_request_digests"]
+      : ["protocol", "operation", "receipt_sha256", "receipt", "expected_target_generation", "expected_ownership_generation", "expected_request_digests", "expected_pre_chain"];
+    const actual = input && typeof input === "object" && !Array.isArray(input) ? Object.keys(input).sort() : [];
+    if (actual.length !== expectedKeys.length || actual.some((key) => !expectedKeys.includes(key))) throw new Error("v2 Runtime Host command keys are invalid");
+    if (input.protocol !== "runtime_host_verifier_cli_v2") throw new Error("v2 Runtime Host protocol is required");
+    const request = {
+      receipt: input.receipt,
+      receipt_sha256: requiredRuntimeText(input.receipt_sha256, "receipt_sha256", 64),
+      expected_target_generation: requiredRuntimeGeneration(input.expected_target_generation, "expected_target_generation"),
+      expected_ownership_generation: requiredRuntimeGeneration(input.expected_ownership_generation, "expected_ownership_generation"),
+      expected_request_digests: input.expected_request_digests,
+      ...(operation === "verify_tool_terminal" ? { expected_pre_chain: input.expected_pre_chain } : {})
+    };
+    const result = await integration[operation === "verify_tool_pre" ? "verifyToolPreReceipt" : "verifyToolTerminalReceipt"](request);
+    const receipt = result.receipt;
+    return Object.freeze({ ok: true, protocol: "runtime_host_verifier_cli_v2", operation,
+      receipt_sha256: request.receipt_sha256,
+      receipt_id: operation === "verify_tool_pre" ? receipt.pre_receipt_id : receipt.terminal_receipt_id,
+      capability_id: receipt.capability_id, host_tool_execution_id: receipt.host_tool_execution_id,
+      current_entry: result.current_entry,
+      ...(operation === "verify_tool_terminal" ? { pre_chain: Object.freeze({ pre_receipt_id: receipt.pre_receipt_id, pre_receipt_sha256: receipt.pre_receipt_sha256 }) } : {}) });
   }
 
   if (operation === "discover_current_entry") {

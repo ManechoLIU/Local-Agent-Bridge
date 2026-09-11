@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -15,6 +15,8 @@ import {
   signRuntimeInvocationOriginReceipt,
   validateMachineObservation,
   validateMachineInvocationOrigin,
+  verifyToolPreReceipt,
+  verifyToolTerminalReceipt,
   verifyReentryReceipt
 } from "./attestation.mjs";
 import { createHostDriver } from "./host-driver.mjs";
@@ -1301,4 +1303,24 @@ test("unprofiled capability and durable receipt state fail closed", () => {
     () => new ToolInvocationReceiptJournal(SECRET, { statePath }),
     /profile|state/i
   );
+});
+
+test("v2 receipt verifiers require exact signed receipt and terminal pre chain", () => {
+  const time = clock();
+  const journal = new ToolInvocationReceiptJournal(SECRET, { clock: time.now });
+  const capability = journal.issueCapability(receiptRequest());
+  const pre = journal.consumeCapability({ ...receiptConsumeInput(), capability, host_tool_execution_id: "hte_v2" });
+  const expected = { outer_request_sha256: "d".repeat(64), forwarded_request_sha256: "e".repeat(64), normalized_request_sha256: "f".repeat(64), retry_outer_request_sha256: "4".repeat(64) };
+  const preDigest = createHash("sha256").update(canonicalJsonForTest(pre)).digest("hex");
+  assert.equal(verifyToolPreReceipt({ secret: SECRET, receipt: pre, receipt_sha256: preDigest, expected_request_digests: expected, clock: time.now }).pre_receipt_id, pre.pre_receipt_id);
+  const terminal = journal.terminalize({ ...receiptConsumeInput(), pre_receipt: pre, backend_route: "/v1/tools/run_command", http_status: 200, response_body_sha256: "1".repeat(64), terminal_classification: "SUCCESS" });
+  const terminalDigest = createHash("sha256").update(canonicalJsonForTest(terminal)).digest("hex");
+  assert.equal(verifyToolTerminalReceipt({ secret: SECRET, receipt: terminal, receipt_sha256: terminalDigest, expected_request_digests: expected, expected_pre_chain: { pre_receipt_id: pre.pre_receipt_id, pre_receipt_sha256: preDigest, capability_id: pre.capability_id, host_tool_execution_id: pre.host_tool_execution_id }, clock: time.now }).terminal_receipt_id, terminal.terminal_receipt_id);
+  assert.throws(() => verifyToolPreReceipt({ secret: SECRET, receipt: { ...pre, controller_id: "caller" }, receipt_sha256: preDigest, expected_request_digests: expected, clock: time.now }), /keys/i);
+  assert.throws(() => verifyToolPreReceipt({ secret: SECRET, receipt: pre, receipt_sha256: "0".repeat(64), expected_request_digests: expected, clock: time.now }), /receipt_sha256/i);
+  assert.throws(() => verifyToolPreReceipt({ secret: SECRET, receipt: pre, receipt_sha256: preDigest, expected_request_digests: { ...expected, retry_outer_request_sha256: "0".repeat(64) }, clock: time.now }), /retry_outer_request_sha256/i);
+  assert.throws(() => verifyToolPreReceipt({ secret: SECRET, receipt: { ...pre, host_mac_sha256: "0".repeat(64) }, receipt_sha256: preDigest, expected_request_digests: expected, clock: time.now }), /authentication/i);
+  assert.throws(() => verifyToolTerminalReceipt({ secret: SECRET, receipt: terminal, receipt_sha256: terminalDigest, expected_request_digests: expected, expected_pre_chain: { pre_receipt_id: "hpr_other", pre_receipt_sha256: preDigest, capability_id: pre.capability_id, host_tool_execution_id: pre.host_tool_execution_id }, clock: time.now }), /pre_receipt_id/i);
+  time.add(15_001);
+  assert.throws(() => verifyToolPreReceipt({ secret: SECRET, receipt: pre, receipt_sha256: preDigest, expected_request_digests: expected, clock: time.now }), /stale/i);
 });

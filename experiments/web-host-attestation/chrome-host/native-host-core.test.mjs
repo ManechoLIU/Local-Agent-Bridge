@@ -467,6 +467,7 @@ test("current-entry discovery signs only browser-provided runtime-invocation mac
             top_frame_id: "top-frame-current-entry",
             loader_id: "loader-current-entry",
             secure_origin: "https://chatgpt.com",
+            generation_anchor_sha256: "a".repeat(64),
             observed_at_ms: 1800000000150
           }
         }
@@ -484,6 +485,7 @@ test("current-entry discovery signs only browser-provided runtime-invocation mac
   assert.equal(result.current_entry.top_frame_id, "top-frame-current-entry");
   assert.equal(result.current_entry.loader_id, "loader-current-entry");
   assert.equal(result.current_entry.secure_origin, "https://chatgpt.com");
+  assert.equal(result.current_entry.generation_anchor_sha256, "a".repeat(64));
   assert.equal(result.current_entry.target_generation, 4);
   assert.equal(result.current_entry.ownership_generation, 8);
   assert.match(result.current_entry.host_receipt_id, /^hce_/);

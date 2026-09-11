@@ -99,7 +99,9 @@ test("Runtime-facing Chrome integration issues challenge obtains Host attestatio
     "attestAndVerify",
     "consumeVerifiedTarget",
     "submitReentry",
-    "submitAndVerifyReentry"
+    "submitAndVerifyReentry",
+    "verifyToolPreReceipt",
+    "verifyToolTerminalReceipt"
   ]);
 
   const issued = integration.issueChallenge({
