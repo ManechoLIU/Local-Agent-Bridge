@@ -90,6 +90,7 @@ git commit -m "feat(host): sign durable tool execution receipts"
 ### Task 2: Bridge challenge handshake and dispatch journal
 
 **Files:**
+- Modify: `crates/local-tool-bridge/Cargo.toml`
 - Modify: `crates/bridge-security-core/src/lib.rs`
 - Modify: `crates/local-tool-bridge/src/lib.rs`
 - Modify: `crates/local-tool-bridge/src/main.rs`
@@ -128,6 +129,8 @@ Expected: FAIL because the receipt client/journal and schema decoration are abse
 
 Add a Bridge-only execution identity to `RequestProof` and its fixed HMAC message. Strictly parse the protected JSON-RPC profile, canonicalize `run_command` after removing only `host_invocation_capability`, replace the backend envelope ID with `bridge_call_id`, freeze those exact bytes, and bind the challenge outer, frozen forwarded, normalized arguments, and retry outer digests under `lab_run_command_digest_v1`. Sign the backend RequestProof only after the frozen forwarded bytes exist. Buffer and validate backend responses before terminalization, then map only the response ID for the caller after Runtime closure.
 
+Receipt behavior and schema decoration are conditional on the receipt chain being configured; the disabled path preserves legacy request/response bytes and never advertises or forwards the reserved capability. Journal mutation takes a cross-process file lock and reloads durable state inside that lock before every insert/update. Private UDS connection, write, and read all have real deadlines; use Tokio's async I/O/time features rather than a blocking connect with only post-connect read/write timeouts.
+
 ```rust
 pub struct BufferedBackendResponse {
     pub status: StatusCode,
@@ -162,7 +165,7 @@ Expected: all tests pass and no backend side effect appears on any failing pre p
 - [ ] **Step 5: Commit Task 2**
 
 ```bash
-git add crates/bridge-security-core/src/lib.rs crates/local-tool-bridge/src/lib.rs crates/local-tool-bridge/src/main.rs crates/local-tool-bridge/tests/ingress.rs crates/local-tool-bridge/tests/tool_receipt_chain.rs
+git add crates/local-tool-bridge/Cargo.toml crates/bridge-security-core/src/lib.rs crates/local-tool-bridge/src/lib.rs crates/local-tool-bridge/src/main.rs crates/local-tool-bridge/tests/ingress.rs crates/local-tool-bridge/tests/tool_receipt_chain.rs
 git commit -m "feat(bridge): gate shell dispatch on Host receipts"
 ```
 
