@@ -1319,7 +1319,9 @@ def _verify_tunnel_operational(
         if not retry_transient_metrics:
             raise error
         if deadline is None or time.monotonic() >= deadline:
-            raise RuntimeError(f"production tunnel {label} retry deadline expired") from error
+            raise RuntimeError(
+                f"production tunnel {label} retry deadline expired: {error}"
+            ) from error
         time.sleep(TUNNEL_POLL_RETRY_INTERVAL_SECONDS)
 
     def read_health_url() -> tuple[str, urllib.parse.SplitResult]:
@@ -2238,7 +2240,14 @@ def _start_production_tunnel(
             manifest, layout, retry_transient_metrics=True
         )
         if verified.get("ready") is not True or verified.get("pid") != item["pid"]:
-            raise RuntimeError("production tunnel did not satisfy its post-start status fence")
+            reason = verified.get("reason")
+            if not isinstance(reason, str) or not reason:
+                reason = "unknown_status_reason"
+            raise RuntimeError(
+                "production tunnel did not satisfy its post-start status fence: "
+                f"reason={reason}; expected_pid={item['pid']}; "
+                f"observed_pid={verified.get('pid')}"
+            )
         return item
     except Exception as error:
         cleanup_errors: list[str] = []

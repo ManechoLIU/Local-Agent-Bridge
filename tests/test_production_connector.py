@@ -1961,13 +1961,17 @@ class ProductionConnectorContractTests(unittest.TestCase):
                     stale_metrics_response,
                 ],
             ) as retry_open:
-                with self.assertRaisesRegex(RuntimeError, "poll|fresh|cycles"):
+                with self.assertRaisesRegex(RuntimeError, "poll|fresh|cycles") as caught:
                     pc._verify_tunnel_operational(
                         layout,
                         expected_tunnel_id="tunnel-production",
                         started_at=1000.0,
                         retry_transient_metrics=True,
                     )
+            self.assertIn(
+                "production tunnel controlplane poll cycles have not started",
+                str(caught.exception),
+            )
             self.assertEqual(retry_open.call_count, 4)
             retry_sleep.assert_called_once()
 
@@ -2242,6 +2246,85 @@ class ProductionConnectorContractTests(unittest.TestCase):
                     pc._start_production_tunnel(manifest, layout)
             stop.assert_called_once_with(identity, process=process)
             self.assertEqual(json.loads(layout["runtime_state"].read_text(encoding="utf-8")), original)
+
+    def test_start_production_tunnel_preserves_status_reason_and_restores_state(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest,
+                runtime_root=root / "runtime",
+                bridge_socket=root / "bridge.sock",
+            )
+            layout["runtime_state"].parent.mkdir(parents=True)
+            original = {
+                "release_revision": REVISION,
+                "endpoint_generation": 7,
+                "sentinel": "preserve",
+            }
+            layout["runtime_state"].write_text(json.dumps(original), encoding="utf-8")
+            layout["runtime_state"].chmod(0o600)
+            process = MagicMock(pid=303)
+            identity = self._identity(
+                303,
+                [
+                    "/opt/tunnel-client",
+                    "run",
+                    "--profile-dir",
+                    str(layout["tunnel_dir"]),
+                    "--profile",
+                    pc.TUNNEL_PROFILE_NAME,
+                ],
+            )
+            item = {
+                "pid": 303,
+                "tunnel_id": "tunnel-production",
+                "process_identity": identity,
+            }
+
+            def record_candidate(*_args, **_kwargs):
+                layout["runtime_state"].write_text(
+                    json.dumps({"candidate_tunnel_pid": 303}), encoding="utf-8"
+                )
+
+            with patch.object(
+                pc,
+                "_validate_tunnel_profile",
+                return_value={"tunnel_id": "tunnel-production"},
+            ), patch.object(
+                pc, "_find_tunnel_client", return_value=Path("/opt/tunnel-client")
+            ), patch.object(
+                pc, "_spawn_tunnel", return_value=process
+            ), patch.object(
+                pc, "_capture_process_identity", return_value=identity
+            ), patch.object(
+                pc, "_wait_for_tunnel", return_value=item
+            ), patch.object(
+                pc, "_record_production_tunnel", side_effect=record_candidate
+            ), patch.object(
+                pc,
+                "production_tunnel_status",
+                return_value={
+                    "ready": False,
+                    "pid": 303,
+                    "reason": (
+                        "production tunnel controlplane poll readiness retry deadline "
+                        "expired: production tunnel controlplane poll cycles have not started"
+                    ),
+                },
+            ), patch.object(
+                pc, "_stop_verified_process_identity"
+            ) as stop:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "poll cycles have not started.*expected_pid=303.*observed_pid=303",
+                ):
+                    pc._start_production_tunnel(manifest, layout)
+            stop.assert_called_once_with(identity, process=process)
+            self.assertEqual(
+                json.loads(layout["runtime_state"].read_text(encoding="utf-8")),
+                original,
+            )
 
     def test_zombie_is_not_running_and_spawned_process_is_reaped_after_verified_signal(self):
         identity = self._identity(303, ["/opt/tunnel-client", "run"])
