@@ -14,16 +14,19 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
-    io::{BufRead, BufReader, Read, Write},
+    io::Write,
     net::IpAddr,
+    os::fd::AsRawFd,
     os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
-    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
-use tokio::sync::Mutex;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader},
+    sync::Mutex,
+};
 use uuid::Uuid;
 
 const INGRESS_KEY_HEADER: &str = "x-lab-ingress-key";
@@ -92,6 +95,26 @@ impl ToolReceiptState {
             "RESULT_UNKNOWN_AFTER_DISPATCH" => Ok(Self::ResultUnknownAfterDispatch),
             _ => Err("tool receipt journal state is invalid".into()),
         }
+    }
+
+    fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Issued, Self::HostValidatedInFlight)
+                | (Self::HostValidatedInFlight, Self::RuntimeAllowed)
+                | (Self::RuntimeAllowed, Self::DispatchIntent)
+                | (Self::DispatchIntent, Self::BackendResponse)
+                | (Self::DispatchIntent, Self::ResultUnknownAfterDispatch)
+                | (Self::BackendResponse, Self::TerminalPending)
+                | (Self::BackendResponse, Self::ResultUnknownAfterDispatch)
+                | (Self::TerminalPending, Self::Terminal)
+                | (Self::TerminalPending, Self::ResultUnknownAfterDispatch)
+                | (Self::Terminal, Self::ResultUnknownAfterDispatch)
+                | (
+                    Self::ResultUnknownAfterDispatch,
+                    Self::ResultUnknownAfterDispatch
+                )
+        )
     }
 }
 
@@ -215,6 +238,7 @@ impl ToolReceiptJournal {
 
     fn reload(&mut self) -> Result<(), String> {
         if !self.path.exists() {
+            self.records.clear();
             return Ok(());
         }
         let metadata = std::fs::symlink_metadata(&self.path)
@@ -242,8 +266,12 @@ impl ToolReceiptJournal {
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| "tool receipt journal records are invalid".to_string())?;
         let mut loaded = HashMap::new();
+        let mut bridge_call_ids = HashSet::new();
         for value in records {
             let record = ToolReceiptRecord::from_json(value)?;
+            if !bridge_call_ids.insert(record.bridge_call_id.clone()) {
+                return Err("tool receipt journal has duplicate bridge call ids".into());
+            }
             if loaded
                 .insert(record.capability_id.clone(), record)
                 .is_some()
@@ -272,38 +300,133 @@ impl ToolReceiptJournal {
     }
 
     fn insert(&mut self, record: ToolReceiptRecord) -> Result<(), String> {
-        if self.records.contains_key(&record.capability_id) {
-            return Err("Host returned a duplicate capability id".into());
-        }
-        let capability_id = record.capability_id.clone();
-        self.records.insert(capability_id.clone(), record);
-        if let Err(error) = self.persist() {
-            self.records.remove(&capability_id);
-            return Err(error);
-        }
-        Ok(())
+        self.mutate_locked(move |records| {
+            if records.contains_key(&record.capability_id) {
+                return Err("Host returned a duplicate capability id".into());
+            }
+            if records
+                .values()
+                .any(|current| current.bridge_call_id == record.bridge_call_id)
+            {
+                return Err("Bridge generated a duplicate bridge call id".into());
+            }
+            if record.state != ToolReceiptState::Issued {
+                return Err("new tool receipt record must start at ISSUED".into());
+            }
+            records.insert(record.capability_id.clone(), record);
+            Ok(())
+        })
     }
 
     fn update<F>(&mut self, capability_id: &str, mutation: F) -> Result<(), String>
     where
         F: FnOnce(&mut ToolReceiptRecord) -> Result<(), String>,
     {
-        let original = self
-            .records
-            .get(capability_id)
-            .cloned()
-            .ok_or_else(|| "unknown Host invocation capability".to_string())?;
-        mutation(
-            self.records
+        self.mutate_locked(|records| {
+            let record = records
                 .get_mut(capability_id)
-                .expect("record was just found"),
-        )?;
+                .ok_or_else(|| "unknown Host invocation capability".to_string())?;
+            let old_state = record.state;
+            let old_capability_id = record.capability_id.clone();
+            let old_bridge_call_id = record.bridge_call_id.clone();
+            mutation(record)?;
+            if record.capability_id != old_capability_id
+                || record.bridge_call_id != old_bridge_call_id
+            {
+                return Err("tool receipt journal identity fields are immutable".into());
+            }
+            if !old_state.can_transition_to(record.state) {
+                return Err(format!(
+                    "illegal tool receipt journal transition {} -> {}",
+                    old_state.as_str(),
+                    record.state.as_str()
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    fn record(&mut self, capability_id: &str) -> Result<Option<ToolReceiptRecord>, String> {
+        let _lock = lock_private_journal(&self.path)?;
+        self.reload()?;
+        Ok(self.records.get(capability_id).cloned())
+    }
+
+    fn mutate_locked<T, F>(&mut self, mutation: F) -> Result<T, String>
+    where
+        F: FnOnce(&mut HashMap<String, ToolReceiptRecord>) -> Result<T, String>,
+    {
+        let _lock = lock_private_journal(&self.path)?;
+        self.reload()?;
+        let original = self.records.clone();
+        let result = match mutation(&mut self.records) {
+            Ok(result) => result,
+            Err(error) => {
+                self.records = original;
+                return Err(error);
+            }
+        };
         if let Err(error) = self.persist() {
-            self.records.insert(capability_id.to_string(), original);
+            self.records = original;
             return Err(error);
         }
-        Ok(())
+        Ok(result)
     }
+}
+
+struct JournalFileLock(File);
+
+impl Drop for JournalFileLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn lock_private_journal(path: &Path) -> Result<JournalFileLock, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "tool receipt journal path has no parent".to_string())?;
+    let parent_metadata = std::fs::symlink_metadata(parent)
+        .map_err(|error| format!("tool receipt journal parent inspect failed: {error}"))?;
+    if parent_metadata.file_type().is_symlink()
+        || !parent_metadata.is_dir()
+        || parent_metadata.uid() != current_euid()
+        || parent_metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err("tool receipt journal parent must be an owned private directory".into());
+    }
+    let lock_path = parent.join(format!(
+        "{}.lock",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(RECEIPT_JOURNAL_FILE)
+    ));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&lock_path)
+        .map_err(|error| format!("tool receipt journal lock open failed: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("tool receipt journal lock inspect failed: {error}"))?;
+    if !metadata.is_file()
+        || metadata.uid() != current_euid()
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err("tool receipt journal lock must be an owned 0600 regular file".into());
+    }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(format!(
+            "tool receipt journal lock acquisition failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(JournalFileLock(file))
 }
 
 #[derive(Clone)]
@@ -722,15 +845,16 @@ async fn handle_mcp(
         .and_then(|value| value.get("name"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let protected =
-        if tool_name == "run_command" || header_text(&headers, "mcp-name") == Some("run_command") {
-            match parse_protected_run_command(&body) {
-                Ok(value) => Some(value),
-                Err(error) => return text_response(StatusCode::BAD_REQUEST, &error),
-            }
-        } else {
-            None
-        };
+    let protected = if state.inner.tool_receipts.is_some()
+        && (tool_name == "run_command" || header_text(&headers, "mcp-name") == Some("run_command"))
+    {
+        match parse_protected_run_command(&body) {
+            Ok(value) => Some(value),
+            Err(error) => return text_response(StatusCode::BAD_REQUEST, &error),
+        }
+    } else {
+        None
+    };
 
     if let Some(header_method) = header_text(&headers, "mcp-method") {
         if header_method != method {
@@ -854,7 +978,7 @@ async fn handle_mcp(
                 Err(error) => text_response(StatusCode::BAD_GATEWAY, &error),
             }
         }
-        Ok(response) if method == "tools/list" => {
+        Ok(response) if method == "tools/list" && state.inner.tool_receipts.is_some() => {
             match decorate_tools_list_response(response).await {
                 Ok(response) => response,
                 Err(error) => text_response(StatusCode::BAD_GATEWAY, &error),
@@ -1116,9 +1240,8 @@ async fn handle_protected_run_command(
     let capability_id = required_value_text(submitted_capability, "capability_id", "hic_")
         .map_err(|error| FlowError::new(StatusCode::BAD_REQUEST, error))?;
     let record = journal
-        .records
-        .get(&capability_id)
-        .cloned()
+        .record(&capability_id)
+        .map_err(|error| FlowError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?
         .ok_or_else(|| {
             FlowError::new(StatusCode::CONFLICT, "unknown Host invocation capability")
         })?;
@@ -1276,7 +1399,7 @@ async fn handle_protected_run_command(
         }
     };
     let backend_sha = sha256_bytes(&backend.bytes);
-    if let Err(error) = validate_backend_response_id(&backend.bytes, &record.bridge_call_id) {
+    if let Err(error) = validate_backend_response(&backend.bytes, &record.bridge_call_id) {
         mark_result_unknown(
             &mut journal,
             &capability_id,
@@ -1320,21 +1443,19 @@ async fn handle_protected_run_command(
             format!("RESULT_UNKNOWN_AFTER_DISPATCH: {error}"),
         ));
     }
+    let backend_route = state.inner.default_backend.url.path().to_string();
+    let terminal_classification = if backend.status.is_success() {
+        "SUCCESS"
+    } else {
+        "BACKEND_HTTP_ERROR"
+    };
     let mut terminal = receipt_binding_for_record(chain, &state.inner.context, &record);
     terminal["pre_receipt"] = pre_receipt.clone();
     terminal["retry_outer_request_sha256"] = serde_json::Value::String(retry_outer_sha.clone());
-    terminal["backend_route"] =
-        serde_json::Value::String(state.inner.default_backend.url.path().to_string());
+    terminal["backend_route"] = serde_json::Value::String(backend_route.clone());
     terminal["http_status"] = serde_json::json!(backend.status.as_u16());
     terminal["response_body_sha256"] = serde_json::Value::String(backend_sha.clone());
-    terminal["terminal_classification"] = serde_json::Value::String(
-        if backend.status.is_success() {
-            "SUCCESS"
-        } else {
-            "BACKEND_HTTP_ERROR"
-        }
-        .into(),
-    );
+    terminal["terminal_classification"] = serde_json::Value::String(terminal_classification.into());
     let host_terminal = match call_private_ndjson(
         &chain.host_socket,
         with_op(terminal, "tool_receipt_terminal"),
@@ -1403,7 +1524,19 @@ async fn handle_protected_run_command(
         )
     })
     .and_then(|_| require_exact_text(&terminal_receipt, "response_body_sha256", &backend_sha))
-    {
+    .and_then(|_| {
+        validate_terminal_receipt(
+            &terminal_receipt,
+            &pre_receipt,
+            &pre_receipt_id,
+            &record.capability_id,
+            &host_tool_execution_id,
+            &retry_outer_sha,
+            &backend_route,
+            backend.status.as_u16(),
+            terminal_classification,
+        )
+    }) {
         mark_result_unknown(
             &mut journal,
             &capability_id,
@@ -1694,23 +1827,135 @@ fn validate_machine_receipt_fields(value: &serde_json::Value) -> Result<(), Stri
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_terminal_receipt(
+    value: &serde_json::Value,
+    pre_receipt: &serde_json::Value,
+    pre_receipt_id: &str,
+    capability_id: &str,
+    execution_id: &str,
+    retry_outer_sha: &str,
+    backend_route: &str,
+    http_status: u16,
+    terminal_classification: &str,
+) -> Result<(), String> {
+    const TERMINAL_KEYS: &[&str] = &[
+        "schema_version",
+        "provenance",
+        "terminal_receipt_id",
+        "pre_receipt_id",
+        "pre_receipt_sha256",
+        "capability_id",
+        "host_tool_execution_id",
+        "request_digest_profile",
+        "bridge_call_id",
+        "bridge_challenge_nonce",
+        "transport_binding_id",
+        "workspace",
+        "production_release_revision",
+        "production_endpoint_generation",
+        "bridge_principal_id",
+        "bridge_execution_session_id",
+        "bridge_capability_id",
+        "bridge_workspace_id",
+        "tool_name",
+        "outer_request_sha256",
+        "forwarded_request_sha256",
+        "normalized_request_sha256",
+        "conversation_id",
+        "browser_target_id",
+        "top_frame_id",
+        "loader_id",
+        "secure_origin",
+        "generation_anchor_sha256",
+        "extension_binding_sha256",
+        "extension_instance_id_sha256",
+        "extension_loaded_at_ms",
+        "retry_outer_request_sha256",
+        "backend_route",
+        "http_status",
+        "response_body_sha256",
+        "terminal_classification",
+        "issued_at_unix_ms",
+        "host_epoch_binding_sha256",
+        "host_mac_sha256",
+    ];
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Host terminal receipt must be an object".to_string())?;
+    if object.len() != TERMINAL_KEYS.len()
+        || object
+            .keys()
+            .any(|key| !TERMINAL_KEYS.contains(&key.as_str()))
+    {
+        return Err("Host terminal receipt schema is not exact".into());
+    }
+    if value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        return Err("Host terminal receipt schema_version mismatch".into());
+    }
+    required_value_text(value, "terminal_receipt_id", "htr_")?;
+    require_exact_text(value, "pre_receipt_id", pre_receipt_id)?;
+    require_exact_text(
+        value,
+        "pre_receipt_sha256",
+        &sha256_bytes(&canonical_json_bytes(pre_receipt)?),
+    )?;
+    require_exact_text(value, "capability_id", capability_id)?;
+    require_exact_text(value, "host_tool_execution_id", execution_id)?;
+    require_exact_text(value, "retry_outer_request_sha256", retry_outer_sha)?;
+    require_exact_text(value, "backend_route", backend_route)?;
+    if value.get("http_status").and_then(serde_json::Value::as_u64) != Some(u64::from(http_status))
+    {
+        return Err("Host terminal receipt http_status mismatch".into());
+    }
+    require_exact_text(value, "terminal_classification", terminal_classification)?;
+    let issued_at = value
+        .get("issued_at_unix_ms")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "Host terminal receipt issued_at_unix_ms is invalid".to_string())?;
+    let pre_issued_at = pre_receipt
+        .get("issued_at_unix_ms")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "Host pre receipt issued_at_unix_ms is invalid".to_string())?;
+    if issued_at < pre_issued_at {
+        return Err("Host terminal receipt timestamp precedes pre receipt".into());
+    }
+    let pre_epoch = pre_receipt
+        .get("host_epoch_binding_sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Host pre receipt epoch binding is missing".to_string())?;
+    digest_text(pre_epoch, "host_epoch_binding_sha256")?;
+    require_exact_text(value, "host_epoch_binding_sha256", pre_epoch)?;
+    for name in [
+        "conversation_id",
+        "browser_target_id",
+        "top_frame_id",
+        "loader_id",
+        "secure_origin",
+        "generation_anchor_sha256",
+        "extension_binding_sha256",
+        "extension_instance_id_sha256",
+        "extension_loaded_at_ms",
+    ] {
+        if value.get(name) != pre_receipt.get(name) {
+            return Err(format!("Host terminal receipt {name} mismatch"));
+        }
+    }
+    Ok(())
+}
+
 async fn call_private_ndjson(
     path: &Path,
     mut request: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let path = path.to_path_buf();
     let request_id = format!("hr_{}", Uuid::new_v4());
     request["request_id"] = serde_json::Value::String(request_id.clone());
-    tokio::task::spawn_blocking(move || private_ndjson_blocking(&path, &request_id, request))
-        .await
-        .map_err(|error| format!("private receipt client task failed: {error}"))?
-}
-
-fn private_ndjson_blocking(
-    path: &Path,
-    request_id: &str,
-    request: serde_json::Value,
-) -> Result<serde_json::Value, String> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| format!("private receipt socket inspect failed: {error}"))?;
     if metadata.file_type().is_symlink()
@@ -1726,57 +1971,71 @@ fn private_ndjson_blocking(
     if bytes.len() > 64 * 1024 {
         return Err("private receipt request exceeds 64 KiB".into());
     }
-    let mut stream = UnixStream::connect(path)
-        .map_err(|error| format!("private receipt socket connect failed: {error}"))?;
-    let timeout = Some(Duration::from_secs(5));
-    stream
-        .set_read_timeout(timeout)
-        .map_err(|error| format!("private receipt read timeout setup failed: {error}"))?;
-    stream
-        .set_write_timeout(timeout)
-        .map_err(|error| format!("private receipt write timeout setup failed: {error}"))?;
-    stream
-        .write_all(&bytes)
-        .map_err(|error| format!("private receipt write failed: {error}"))?;
-    stream
-        .flush()
-        .map_err(|error| format!("private receipt flush failed: {error}"))?;
-    let reader = BufReader::new(stream);
-    let mut response = Vec::new();
-    reader
-        .take((64 * 1024 + 1) as u64)
-        .read_until(b'\n', &mut response)
-        .map_err(|error| format!("private receipt read failed: {error}"))?;
-    if response.is_empty() || response.len() > 64 * 1024 || !response.ends_with(b"\n") {
-        return Err("private receipt response framing is invalid".into());
-    }
-    let value: serde_json::Value = serde_json::from_slice(&response[..response.len() - 1])
-        .map_err(|error| format!("private receipt response parse failed: {error}"))?;
-    if value.get("request_id").and_then(serde_json::Value::as_str) != Some(request_id) {
-        return Err("private receipt response request_id mismatch".into());
-    }
-    if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-        return Err(value
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("private receipt operation failed")
-            .to_string());
-    }
-    value
-        .get("result")
-        .cloned()
-        .filter(serde_json::Value::is_object)
-        .ok_or_else(|| "private receipt result is invalid".to_string())
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stream = tokio::net::UnixStream::connect(path)
+            .await
+            .map_err(|error| format!("private receipt socket connect failed: {error}"))?;
+        stream
+            .write_all(&bytes)
+            .await
+            .map_err(|error| format!("private receipt write failed: {error}"))?;
+        stream
+            .flush()
+            .await
+            .map_err(|error| format!("private receipt flush failed: {error}"))?;
+        let mut reader = TokioBufReader::new(stream).take((64 * 1024 + 1) as u64);
+        let mut response = Vec::new();
+        reader
+            .read_until(b'\n', &mut response)
+            .await
+            .map_err(|error| format!("private receipt read failed: {error}"))?;
+        if response.is_empty() || response.len() > 64 * 1024 || !response.ends_with(b"\n") {
+            return Err("private receipt response framing is invalid".into());
+        }
+        let value: serde_json::Value = serde_json::from_slice(&response[..response.len() - 1])
+            .map_err(|error| format!("private receipt response parse failed: {error}"))?;
+        if value.get("request_id").and_then(serde_json::Value::as_str) != Some(request_id.as_str())
+        {
+            return Err("private receipt response request_id mismatch".into());
+        }
+        if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err(value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("private receipt operation failed")
+                .to_string());
+        }
+        value
+            .get("result")
+            .cloned()
+            .filter(serde_json::Value::is_object)
+            .ok_or_else(|| "private receipt result is invalid".to_string())
+    })
+    .await
+    .map_err(|_| "private receipt operation exceeded five-second deadline".to_string())?
 }
 
 struct StrictJsonParser<'a> {
     bytes: &'a [u8],
     offset: usize,
+    safe_integers_only: bool,
 }
 
 impl<'a> StrictJsonParser<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
+        Self {
+            bytes,
+            offset: 0,
+            safe_integers_only: true,
+        }
+    }
+
+    fn backend_response(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            safe_integers_only: false,
+        }
     }
 
     fn parse(mut self) -> Result<serde_json::Value, String> {
@@ -1914,11 +2173,38 @@ impl<'a> StrictJsonParser<'a> {
             }
             _ => return Err("protected JSON number is invalid".into()),
         }
-        if matches!(self.peek(), Some(b'.' | b'e' | b'E')) {
+        if self.safe_integers_only && matches!(self.peek(), Some(b'.' | b'e' | b'E')) {
             return Err("protected JSON only supports safe integers".into());
         }
         let text = std::str::from_utf8(&self.bytes[start..self.offset])
             .map_err(|_| "protected JSON number is not UTF-8".to_string())?;
+        if !self.safe_integers_only {
+            if self.peek() == Some(b'.') {
+                self.offset += 1;
+                let fraction_start = self.offset;
+                while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                    self.offset += 1;
+                }
+                if self.offset == fraction_start {
+                    return Err("backend JSON number fraction is invalid".into());
+                }
+            }
+            if matches!(self.peek(), Some(b'e' | b'E')) {
+                self.offset += 1;
+                if matches!(self.peek(), Some(b'+' | b'-')) {
+                    self.offset += 1;
+                }
+                let exponent_start = self.offset;
+                while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                    self.offset += 1;
+                }
+                if self.offset == exponent_start {
+                    return Err("backend JSON number exponent is invalid".into());
+                }
+            }
+            return serde_json::from_slice(&self.bytes[start..self.offset])
+                .map_err(|error| format!("backend JSON number is invalid: {error}"));
+        }
         let number = text
             .parse::<i64>()
             .map_err(|_| "protected JSON integer is out of range".to_string())?;
@@ -2137,11 +2423,48 @@ async fn send_to_backend_buffered(
     })
 }
 
-fn validate_backend_response_id(bytes: &[u8], expected: &str) -> Result<(), String> {
-    let value: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|error| format!("backend response is not JSON: {error}"))?;
-    if !value.is_object() || value.get("id").and_then(serde_json::Value::as_str) != Some(expected) {
+fn validate_backend_response(bytes: &[u8], expected: &str) -> Result<(), String> {
+    let value = StrictJsonParser::backend_response(bytes)
+        .parse()
+        .map_err(|error| format!("backend response is not strict JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "backend response must be a JSON-RPC object".to_string())?;
+    if object.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
+        return Err("backend response jsonrpc version mismatch".into());
+    }
+    if object
+        .keys()
+        .any(|key| !["jsonrpc", "id", "result", "error"].contains(&key.as_str()))
+    {
+        return Err("backend response contains unsupported members".into());
+    }
+    if object.get("id").and_then(serde_json::Value::as_str) != Some(expected) {
         return Err("backend response ID mismatch".into());
+    }
+    let has_result = object.contains_key("result");
+    let has_error = object.contains_key("error");
+    if has_result == has_error {
+        return Err("backend response must contain exactly one of result or error".into());
+    }
+    if let Some(error) = object.get("error") {
+        let error = error
+            .as_object()
+            .ok_or_else(|| "backend JSON-RPC error must be an object".to_string())?;
+        if error
+            .keys()
+            .any(|key| !["code", "message", "data"].contains(&key.as_str()))
+            || error
+                .get("code")
+                .and_then(serde_json::Value::as_i64)
+                .is_none()
+            || error
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+        {
+            return Err("backend JSON-RPC error object is invalid".into());
+        }
     }
     Ok(())
 }
@@ -2349,7 +2672,11 @@ async fn forward_merged_tools_list(
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(merged.to_string()))
         .map_err(|error| format!("merged tools/list response build failed: {error}"))?;
-    decorate_tools_list_response(response).await
+    if state.inner.tool_receipts.is_some() {
+        decorate_tools_list_response(response).await
+    } else {
+        Ok(response)
+    }
 }
 
 fn validate_host_tools_fence(

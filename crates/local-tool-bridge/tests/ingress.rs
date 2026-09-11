@@ -733,9 +733,11 @@ async fn computer_tools_are_capability_gated_routed_and_merged_into_tools_list()
         .iter()
         .find(|tool| tool["name"] == "run_command")
         .unwrap();
-    assert_eq!(
-        run_command["inputSchema"]["properties"]["host_invocation_capability"]["type"],
-        "object"
+    assert!(
+        run_command["inputSchema"]["properties"]
+            .get("host_invocation_capability")
+            .is_none(),
+        "receipt-disabled tools/list must not advertise the protected capability"
     );
     assert_eq!(
         run_command["inputSchema"]["properties"]["command"]["type"],
