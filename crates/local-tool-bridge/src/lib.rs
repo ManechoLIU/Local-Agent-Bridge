@@ -437,11 +437,19 @@ async fn handle_mcp(
         Ok(value) => value,
         Err(error) => return text_response(StatusCode::FORBIDDEN, &error),
     };
-    let request_id = header_text(&headers, "x-request-id")
+    let provided_request_id = header_text(&headers, "x-request-id")
         .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| parsed.get("id").map(|value| value.to_string()))
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+        .map(str::to_string);
+    let request_id = provided_request_id.unwrap_or_else(|| {
+        if is_reconnectable_discovery_method(method, &capability) {
+            Uuid::new_v4().to_string()
+        } else {
+            parsed
+                .get("id")
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| Uuid::new_v4().to_string())
+        }
+    });
     let nonce = Uuid::new_v4().to_string();
     let proof = match sign_request(
         &state.inner.issued,
@@ -788,6 +796,19 @@ fn valid_ingress_key(headers: &HeaderMap, expected: &[u8; 32]) -> bool {
 
 fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+fn is_reconnectable_discovery_method(method: &str, capability: &Capability) -> bool {
+    *capability == Capability::Discovery
+        && (matches!(
+            method,
+            "initialize"
+                | "server/discover"
+                | "tools/list"
+                | "resources/list"
+                | "resources/templates/list"
+                | "ping"
+        ) || method.starts_with("notifications/"))
 }
 
 pub fn required_capability(method: &str, tool_name: &str) -> Result<Capability, String> {

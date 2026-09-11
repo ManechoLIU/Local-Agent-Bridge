@@ -10,6 +10,7 @@ use local_tool_bridge::{BridgeIngress, ProductionReleaseFence};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
+use uuid::Uuid;
 
 const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
 const BACKEND_KEY: &str = "backend-0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -145,6 +146,19 @@ fn mcp_request(body: &str, key: Option<&str>) -> Request<Body> {
     builder.body(Body::from(body.to_string())).unwrap()
 }
 
+fn discovery_request(body: &str, request_id: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header("mcp-protocol-version", "2025-06-18")
+        .header("x-lab-ingress-key", KEY);
+    if let Some(request_id) = request_id {
+        builder = builder.header("x-request-id", request_id);
+    }
+    builder.body(Body::from(body.to_string())).unwrap()
+}
+
 #[tokio::test]
 async fn authenticated_loopback_ingress_forwards_signed_proof_without_secret() {
     let capture = Capture::default();
@@ -229,6 +243,80 @@ async fn missing_capability_fails_before_backend_dispatch() {
 
     let response = app.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(capture.0.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn discovery_reconnects_with_reused_json_rpc_ids_without_request_id_header() {
+    let capture = Capture::default();
+    let backend_url = backend_server(capture.clone()).await;
+    let app = bridge(&backend_url, vec![Capability::Discovery]).router();
+    let cases = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"tunnel","version":"1"}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+    ];
+
+    for body in cases {
+        let first = app
+            .clone()
+            .oneshot(discovery_request(body, None))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let (first_headers, first_body) = capture.0.lock().await.clone().unwrap();
+        assert_eq!(first_body, Bytes::from(body.to_string()));
+        assert_eq!(
+            first_headers.get("mcp-protocol-version").unwrap(),
+            "2025-06-18"
+        );
+        let first_proof_request_id = first_headers
+            .get("x-lab-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(Uuid::parse_str(&first_proof_request_id).is_ok());
+
+        let second = app
+            .clone()
+            .oneshot(discovery_request(body, None))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let (second_headers, second_body) = capture.0.lock().await.clone().unwrap();
+        assert_eq!(second_body, Bytes::from(body.to_string()));
+        let second_proof_request_id = second_headers
+            .get("x-lab-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(Uuid::parse_str(&second_proof_request_id).is_ok());
+        assert_ne!(first_proof_request_id, second_proof_request_id);
+        assert_ne!(second_proof_request_id, "1");
+    }
+}
+
+#[tokio::test]
+async fn discovery_request_id_header_remains_replay_protected() {
+    let capture = Capture::default();
+    let backend_url = backend_server(capture.clone()).await;
+    let app = bridge(&backend_url, vec![Capability::Discovery]).router();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    let request = || discovery_request(body, Some("provider-discovery-123"));
+
+    let first = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let (headers, forwarded_body) = capture.0.lock().await.clone().unwrap();
+    assert_eq!(forwarded_body, Bytes::from(body.to_string()));
+    assert_eq!(
+        headers.get("x-lab-request-id").unwrap(),
+        "provider-discovery-123"
+    );
+    *capture.0.lock().await = None;
+
+    let second = app.oneshot(request()).await.unwrap();
+    assert_eq!(second.status(), StatusCode::FORBIDDEN);
     assert!(capture.0.lock().await.is_none());
 }
 
