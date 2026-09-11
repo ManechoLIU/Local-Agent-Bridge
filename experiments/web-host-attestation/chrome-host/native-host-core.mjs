@@ -159,6 +159,13 @@ function extensionEpochReceipt(epoch) {
   });
 }
 
+function sameExtensionEpoch(left, right) {
+  if (left == null || right == null) return left === right;
+  return left.binding_sha256 === right.binding_sha256 &&
+    left.instance_id_sha256 === right.instance_id_sha256 &&
+    left.loaded_at_ms === right.loaded_at_ms;
+}
+
 export function createNativeHostHandler(options) {
   const secret = options && options.secret;
   const sendBrowserCommand = options && options.sendBrowserCommand;
@@ -212,6 +219,14 @@ export function createNativeHostHandler(options) {
     };
   }
 
+  function recheckExtensionEpoch(before) {
+    const after = requireExtensionReady ? extensionEpochReceipt(requireExtensionReady()) : null;
+    if (!sameExtensionEpoch(before, after)) {
+      throw new Error("HOST_EXTENSION_EPOCH_CHANGED: extension epoch changed during browser request");
+    }
+    return after;
+  }
+
   async function browser(op, fields) {
     const requestId = "hb_" + randomUUID();
     const response = await sendBrowserCommand(Object.assign({
@@ -256,6 +271,8 @@ export function createNativeHostHandler(options) {
       if (!machineContext) {
         throw new Error("HOST_CURRENT_ENTRY_UNAVAILABLE: trusted Host invocation context unavailable");
       }
+      const verifiedEpochReceipt = recheckExtensionEpoch(epochReceipt);
+      const verifiedEpochFields = verifiedEpochReceipt ? { extension_epoch: verifiedEpochReceipt } : {};
       return {
         current_entry: signCurrentEntryEvidence({
           secret: secret,
@@ -264,7 +281,7 @@ export function createNativeHostHandler(options) {
           ownershipGeneration: ownershipGeneration,
           clock: clock
         }),
-        ...epochFields
+        ...verifiedEpochFields
       };
     }
 
@@ -277,9 +294,11 @@ export function createNativeHostHandler(options) {
       const browserResult = await browser(op, {});
       const machineContext = browserResult && browserResult.current_entry_context;
       if (!machineContext) throw new Error("HOST_CURRENT_ENTRY_UNAVAILABLE: trusted Host invocation context unavailable");
-      const input = receiptInput(request, machineContext, epochReceipt);
+      const verifiedEpochReceipt = recheckExtensionEpoch(epochReceipt);
+      const verifiedEpochFields = verifiedEpochReceipt ? { extension_epoch: verifiedEpochReceipt } : {};
+      const input = receiptInput(request, machineContext, verifiedEpochReceipt);
       if (op === "tool_receipt_issue") {
-        return { capability: receiptJournal.issueCapability(input), ...epochFields };
+        return { capability: receiptJournal.issueCapability(input), ...verifiedEpochFields };
       }
       return {
         pre_receipt: receiptJournal.consumeCapability({
@@ -288,7 +307,7 @@ export function createNativeHostHandler(options) {
           retry_outer_request_sha256: request.retry_outer_request_sha256,
           host_tool_execution_id: request.host_tool_execution_id
         }),
-        ...epochFields
+        ...verifiedEpochFields
       };
     }
 

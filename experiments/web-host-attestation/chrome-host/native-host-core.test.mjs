@@ -492,3 +492,102 @@ test("current-entry discovery signs only browser-provided runtime-invocation mac
   assert.equal(result.current_entry.observed_at_unix_ms, 1800000000150);
   assert.match(result.current_entry.host_mac_sha256, /^[0-9a-f]{64}$/);
 });
+
+test("native Host rejects extension epoch rollover across current-entry and receipt boundaries", async function () {
+  const epochA = {
+    instance_id_sha256: "a".repeat(64),
+    loaded_at_ms: 1800000000200,
+    binding_sha256: "b".repeat(64)
+  };
+  const epochB = {
+    instance_id_sha256: "c".repeat(64),
+    loaded_at_ms: 1800000000300,
+    binding_sha256: "d".repeat(64)
+  };
+  let epoch = epochA;
+  let nextEpoch = epochB;
+  let rollDuringBrowser = false;
+  const machineContext = {
+    entry_scope: "runtime_invocation",
+    machine_source: "host_invocation_context_v1",
+    conversation_id: CONVERSATION,
+    browser_target_id: "browser-target-epoch",
+    top_frame_id: "top-frame-epoch",
+    loader_id: "loader-epoch",
+    secure_origin: "https://chatgpt.com",
+    generation_anchor_sha256: "e".repeat(64),
+    observed_at_ms: 1800000000200
+  };
+  const handle = createNativeHostHandler({
+    secret: SECRET,
+    clock: function () { return 1800000000200; },
+    requireExtensionReady: function () { return epoch; },
+    sendBrowserCommand: async function (command) {
+      if (rollDuringBrowser) epoch = nextEpoch;
+      return { request_id: command.request_id, ok: true, result: { current_entry_context: machineContext } };
+    }
+  });
+  const request = {
+    request_digest_profile: "lab_run_command_digest_v1",
+    bridge_call_id: "bc_epoch-rollover",
+    bridge_challenge_nonce: "bridge-challenge-nonce-epoch",
+    transport_binding_id: "tb_epoch-rollover",
+    workspace: "/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge",
+    production_release_revision: "a".repeat(40),
+    production_endpoint_generation: 7,
+    bridge_principal_id: "bridge-principal-epoch",
+    bridge_execution_session_id: "bridge-execution-session-epoch",
+    bridge_capability_id: "bridge-capability-epoch",
+    bridge_workspace_id: "local-agent-bridge-production",
+    tool_name: "run_command",
+    outer_request_sha256: "1".repeat(64),
+    forwarded_request_sha256: "2".repeat(64),
+    normalized_request_sha256: "3".repeat(64)
+  };
+
+  for (const [field, value] of [
+    ["binding_sha256", epochB.binding_sha256],
+    ["instance_id_sha256", epochB.instance_id_sha256],
+    ["loaded_at_ms", epochB.loaded_at_ms]
+  ]) {
+    epoch = epochA;
+    nextEpoch = { ...epochA, [field]: value };
+    rollDuringBrowser = true;
+    await assert.rejects(
+      handle({ op: "discover_current_entry", target_generation: 4, ownership_generation: 8 }),
+      /extension epoch.*changed|epoch.*changed/i
+    );
+  }
+
+  epoch = epochA;
+  nextEpoch = epochB;
+  await assert.rejects(handle({ op: "tool_receipt_issue", ...request }), /extension epoch.*changed|epoch.*changed/i);
+
+  epoch = epochA;
+  rollDuringBrowser = false;
+  const issued = await handle({ op: "tool_receipt_issue", ...request });
+  rollDuringBrowser = true;
+  await assert.rejects(
+    handle({
+      op: "tool_receipt_consume", ...request, capability: issued.capability,
+      retry_outer_request_sha256: "4".repeat(64), host_tool_execution_id: "hte_epoch-rollover"
+    }),
+    /extension epoch.*changed|epoch.*changed/i
+  );
+
+  epoch = epochA;
+  rollDuringBrowser = false;
+  const consumed = await handle({
+    op: "tool_receipt_consume", ...request, capability: issued.capability,
+    retry_outer_request_sha256: "4".repeat(64), host_tool_execution_id: "hte_epoch-rollover"
+  });
+  epoch = epochB;
+  await assert.rejects(
+    handle({
+      op: "tool_receipt_terminal", ...request, pre_receipt: consumed.pre_receipt,
+      retry_outer_request_sha256: "4".repeat(64), backend_route: "/v1/tools/run_command",
+      http_status: 200, response_body_sha256: "5".repeat(64), terminal_classification: "SUCCESS"
+    }),
+    /terminal request mismatch|extension epoch/i
+  );
+});
