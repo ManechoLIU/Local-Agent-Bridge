@@ -292,7 +292,7 @@ git commit -m "fix(bridge): bind Runtime hook to exact tool result"
 
 - [ ] **Step 1: Write failing production contract tests**
 
-Add literal assertions that the immutable release carries the new Host/Bridge state paths and that protected shell activation rejects missing, symlinked, group-writable, wrong-owner, stale-revision, or hash-mismatched Runtime hooks. Preserve the public Host single-tool assertion and the exact AI-Bridge/compute-helper before/after health identity.
+Add literal assertions that the immutable release carries the new Host/Bridge state paths and that protected shell activation rejects missing, symlinked, group-writable, wrong-owner, stale-revision, or hash-mismatched Runtime hooks. Require a canonical Runtime-hook Unix-socket path, start-before-Bridge readiness, exact process identity in runtime state/status, reverse-order verified stop, stale-socket rejection, and rollback cleanup. Preserve the public Host single-tool assertion and the exact AI-Bridge/compute-helper before/after health identity.
 
 ```python
 self.assertEqual(host_tools, ["discover_current_entry"])
@@ -313,7 +313,7 @@ Expected: new contract assertions fail before implementation; all existing asser
 
 - [ ] **Step 3: Implement release wiring**
 
-Generate private state paths under the immutable production runtime, pass only exact canonical paths through component environments, include the new executable and transitive files in release hashes, and validate the Runtime hook immediately before every production start. Do not start, stop, install, refresh, or reconnect production in this task.
+Generate private state paths under the immutable production runtime, pass only exact canonical paths through component environments, include the new executable and transitive files in release hashes, and validate the Runtime hook immediately before every production start. The production launcher starts the hash-pinned Runtime hook with `--serve-unix-socket <canonical path>`, waits for its owned 0600 socket before Bridge, records exact argv/process identity, requires that identity in status, and stops it after Bridge but before Host. AI-Bridge/compute-helper fallback identity and health are sampled before and after without becoming trusted Host/Runtime evidence. Do not install, refresh, reconnect, or activate the production connector in this code task.
 
 - [ ] **Step 4: Run the production and focused cross-component regression**
 
