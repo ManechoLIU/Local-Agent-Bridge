@@ -29,6 +29,7 @@ use std::{
     thread,
     time::Duration,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tower::ServiceExt;
 
@@ -93,13 +94,14 @@ async fn oversized_result_backend(
     capture.0.lock().await.push((headers, body.clone()));
     let parsed: Value = serde_json::from_slice(&body).unwrap();
     let id = serde_json::to_string(&parsed["id"]).unwrap();
-    let stdout = serde_json::to_string(&"x".repeat(63 * 1024)).unwrap();
+    let stdout = serde_json::to_string(&"x".repeat(65 * 1024)).unwrap();
     let raw = format!(
         r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[],"structuredContent":{{"toolName":"run_command","command":"one","cwd":"/tmp","stdout":{stdout},"stderr":"","success":true,"exitCode":0,"elapsedMs":1,"timedOut":false}},"isError":false}}}}"#
     );
     axum::response::Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/json")
+        .header("content-length", raw.len())
         .body(Body::from(raw))
         .unwrap()
 }
@@ -109,6 +111,70 @@ async fn oversized_result_backend_server(capture: BackendCapture) -> String {
     let addr = listener.local_addr().unwrap();
     let app = Router::new()
         .route("/mcp", post(oversized_result_backend))
+        .with_state(capture);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://127.0.0.1:{}/mcp", addr.port())
+}
+
+async fn chunked_oversized_result_backend_server(capture: BackendCapture) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).await;
+        capture
+            .0
+            .lock()
+            .await
+            .push((HeaderMap::new(), Bytes::new()));
+        let first = vec![b'x'; 32 * 1024];
+        let second = vec![b'y'; 32 * 1024 + 1];
+        let _ = stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+            )
+            .await;
+        for chunk in [&first, &second] {
+            let _ = stream
+                .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                .await;
+            let _ = stream.write_all(chunk).await;
+            let _ = stream.write_all(b"\r\n").await;
+        }
+        std::future::pending::<()>().await;
+    });
+    format!("http://127.0.0.1:{}/mcp", addr.port())
+}
+
+async fn boundary_result_backend(
+    State(capture): State<BackendCapture>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    capture.0.lock().await.push((headers, body.clone()));
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    let id = serde_json::to_string(&parsed["id"]).unwrap();
+    let prefix = format!(r#"{{"jsonrpc":"2.0","id":{id},"result":""#);
+    let suffix = "\"}";
+    let raw = format!(
+        "{prefix}{}{suffix}",
+        "x".repeat(64 * 1024 - prefix.len() - suffix.len())
+    );
+    assert_eq!(raw.len(), 64 * 1024);
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .header("content-length", raw.len())
+        .body(Body::from(raw))
+        .unwrap()
+}
+
+async fn boundary_result_backend_server(capture: BackendCapture) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route("/mcp", post(boundary_result_backend))
         .with_state(capture);
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     format!("http://127.0.0.1:{}/mcp", addr.port())
@@ -605,6 +671,16 @@ async fn response_json(response: axum::response::Response) -> Value {
     })
 }
 
+async fn response_text(response: axum::response::Response) -> String {
+    String::from_utf8(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap()
+}
+
 fn challenge_body(id: &str, command: &str) -> String {
     json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
         "name":"run_command","arguments":{"command":command,"cwd":"/tmp","timeout":30}
@@ -1043,7 +1119,7 @@ async fn runtime_intent_that_exceeds_private_envelope_limit_never_dispatches() {
 }
 
 #[tokio::test]
-async fn oversized_terminal_preimage_is_unknown_after_one_dispatch() {
+async fn protected_backend_response_with_large_content_length_is_unknown_after_one_dispatch() {
     let root = tempfile::tempdir().unwrap();
     let host_path = root.path().join("host.sock");
     let runtime_path = root.path().join("runtime.sock");
@@ -1073,8 +1149,107 @@ async fn oversized_terminal_preimage_is_unknown_after_one_dispatch() {
     let retry = retry_body("large-b", "one", capability);
     let response = app.oneshot(call(retry.clone())).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        response_text(response)
+            .await
+            .contains("protected backend response exceeds 64 KiB")
+    );
     assert_eq!(backend_capture.0.lock().await.len(), 1);
-    assert_eq!(runtime_log.lock().unwrap().len(), 1);
+    let runtime_calls = runtime_log.lock().unwrap().clone();
+    assert_eq!(runtime_calls.len(), 1);
+    assert_eq!(runtime_calls[0]["op"], "pre");
+    assert_eq!(
+        ToolReceiptJournal::load(root.path().join("tool-receipt-journal.json"))
+            .unwrap()
+            .state(&bridge_call_id),
+        Some(ToolReceiptState::ResultUnknownAfterDispatch)
+    );
+    let restarted = restarted_bridge(&backend_url, root.path(), &host_path, Some(&runtime_path));
+    assert_eq!(
+        restarted
+            .router()
+            .oneshot(call(retry))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(backend_capture.0.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn protected_backend_response_at_64_kib_is_accepted() {
+    let root = tempfile::tempdir().unwrap();
+    let host_path = root.path().join("host.sock");
+    let host_log = Arc::new(StdMutex::new(Vec::new()));
+    let _host = spawn_ndjson_server(host_path.clone(), 3, host_handler(host_log));
+    while !host_path.exists() {
+        tokio::task::yield_now().await;
+    }
+    let backend_capture = BackendCapture::default();
+    let backend_url = boundary_result_backend_server(backend_capture.clone()).await;
+    let app = bridge(&backend_url, root.path(), &host_path, None).router();
+    let challenge = response_json(
+        app.clone()
+            .oneshot(call(challenge_body("boundary-a", "one")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let retry = retry_body(
+        "boundary-b",
+        "one",
+        challenge["error"]["data"]["host_invocation_capability"].clone(),
+    );
+    let response = app.oneshot(call(retry)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await["id"], "boundary-b");
+    assert_eq!(backend_capture.0.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn protected_backend_chunked_response_without_content_length_is_unknown_after_one_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let host_path = root.path().join("host.sock");
+    let runtime_path = root.path().join("runtime.sock");
+    let host_log = Arc::new(StdMutex::new(Vec::new()));
+    let runtime_log = Arc::new(StdMutex::new(Vec::new()));
+    let _host = spawn_ndjson_server(host_path.clone(), 3, host_handler(host_log));
+    let _runtime = spawn_ndjson_server(
+        runtime_path.clone(),
+        2,
+        runtime_handler(runtime_log.clone(), false, false),
+    );
+    while !host_path.exists() || !runtime_path.exists() {
+        tokio::task::yield_now().await;
+    }
+    let backend_capture = BackendCapture::default();
+    let backend_url = chunked_oversized_result_backend_server(backend_capture.clone()).await;
+    let app = bridge(&backend_url, root.path(), &host_path, Some(&runtime_path)).router();
+    let challenge = response_json(
+        app.clone()
+            .oneshot(call(challenge_body("chunked-a", "one")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let capability = challenge["error"]["data"]["host_invocation_capability"].clone();
+    let bridge_call_id = capability["bridge_call_id"].as_str().unwrap().to_string();
+    let retry = retry_body("chunked-b", "one", capability);
+    let response = tokio::time::timeout(Duration::from_secs(1), app.oneshot(call(retry.clone())))
+        .await
+        .expect("Bridge waited for a chunked response EOF")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        response_text(response)
+            .await
+            .contains("protected backend response exceeds 64 KiB")
+    );
+    assert_eq!(backend_capture.0.lock().await.len(), 1);
+    let runtime_calls = runtime_log.lock().unwrap().clone();
+    assert_eq!(runtime_calls.len(), 1);
+    assert_eq!(runtime_calls[0]["op"], "pre");
     assert_eq!(
         ToolReceiptJournal::load(root.path().join("tool-receipt-journal.json"))
             .unwrap()

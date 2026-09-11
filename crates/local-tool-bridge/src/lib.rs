@@ -40,6 +40,7 @@ const RUNTIME_TOOL_INTENT_PROVENANCE: &str = "runtime_host_tool_intent_v1";
 const RUNTIME_BACKEND_RESPONSE_PROVENANCE: &str = "runtime_host_backend_response_v1";
 const RECEIPT_JOURNAL_FILE: &str = "tool-receipt-journal.json";
 const MAX_PROTECTED_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_PROTECTED_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_PROTECTED_JSON_DEPTH: usize = 32;
 const FORWARDED_HEADERS: &[&str] = &[
     "content-type",
@@ -2455,15 +2456,37 @@ async fn send_to_backend_buffered(
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let bytes = backend
-        .bytes()
-        .await
-        .map_err(|error| format!("backend response read failed: {error}"))?;
+    let bytes = read_protected_backend_response(backend).await?;
     Ok(BufferedBackendResponse {
         status,
         content_type,
         bytes,
     })
+}
+
+async fn read_protected_backend_response(mut backend: reqwest::Response) -> Result<Bytes, String> {
+    if backend
+        .content_length()
+        .is_some_and(|length| length > MAX_PROTECTED_RESPONSE_BYTES as u64)
+    {
+        return Err("protected backend response exceeds 64 KiB".into());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = backend
+        .chunk()
+        .await
+        .map_err(|error| format!("backend response read failed: {error}"))?
+    {
+        let length = bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| "protected backend response exceeds 64 KiB".to_string())?;
+        if length > MAX_PROTECTED_RESPONSE_BYTES {
+            return Err("protected backend response exceeds 64 KiB".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(bytes))
 }
 
 fn validate_backend_response(bytes: &[u8], expected: &str) -> Result<(), String> {
