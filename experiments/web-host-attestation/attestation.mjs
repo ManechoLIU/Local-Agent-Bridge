@@ -615,6 +615,20 @@ function digest(value, name) {
   return text;
 }
 
+const RUN_COMMAND_DIGEST_PROFILE = "lab_run_command_digest_v1";
+
+function requestDigestProfile(value) {
+  const profile = receiptText(value, "request_digest_profile");
+  if (profile !== RUN_COMMAND_DIGEST_PROFILE) {
+    throw new Error("request_digest_profile is unsupported");
+  }
+  return profile;
+}
+
+function retryOuterRequestDigest(input) {
+  return digest(input?.retry_outer_request_sha256, "retry_outer_request_sha256");
+}
+
 function receiptText(value, name, prefix) {
   const text = nonEmpty(value, name);
   if (prefix && !text.startsWith(prefix)) throw new Error(`${name} has an invalid prefix`);
@@ -640,6 +654,7 @@ function normalizeReceiptMachineContext(input) {
 
 function normalizeReceiptBinding(input) {
   const binding = {
+    request_digest_profile: requestDigestProfile(input?.request_digest_profile),
     bridge_call_id: receiptText(input?.bridge_call_id, "bridge_call_id", "bc_"),
     bridge_challenge_nonce: receiptText(input?.bridge_challenge_nonce, "bridge_challenge_nonce"),
     transport_binding_id: receiptText(input?.transport_binding_id, "transport_binding_id", "tb_"),
@@ -695,6 +710,24 @@ function authenticateReceipt(secret, receipt, provenance) {
   return Object.freeze({ ...unsigned, host_mac_sha256: mac });
 }
 
+function validateJournalRecord(secret, record) {
+  if (!record || typeof record !== "object" || !["ISSUED", "HOST_VALIDATED_IN_FLIGHT", "TERMINAL_PENDING", "TERMINAL"].includes(record.state)) {
+    throw new Error("receipt journal state is invalid");
+  }
+  if (!record.binding || record.binding.request_digest_profile !== RUN_COMMAND_DIGEST_PROFILE ||
+      !record.capability || record.capability.request_digest_profile !== RUN_COMMAND_DIGEST_PROFILE) {
+    throw new Error("receipt journal state has an unsupported request_digest_profile");
+  }
+  authenticateReceipt(secret, record.capability, "lab_host_invocation_capability_v1");
+  if (record.pre) {
+    if (record.pre.request_digest_profile !== RUN_COMMAND_DIGEST_PROFILE ||
+        !/^[0-9a-f]{64}$/.test(String(record.retry_outer_request_sha256 || ""))) {
+      throw new Error("receipt journal state has an unsupported pre receipt profile");
+    }
+    authenticateReceipt(secret, record.pre, "lab_host_tool_pre_receipt_v1");
+  }
+}
+
 export class ToolInvocationReceiptJournal {
   constructor(secret, { clock = Date.now, capabilityTtlMs = 15_000, statePath = null } = {}) {
     if (!secret || Buffer.byteLength(secret) < 32) throw new Error("receipt journal secret must be at least 32 bytes");
@@ -711,6 +744,7 @@ export class ToolInvocationReceiptJournal {
     const persisted = loadPrivateState(this.statePath);
     if (persisted && persisted.schema_version !== 1) throw new Error("receipt journal state schema is unsupported");
     this.records = new Map(Array.isArray(persisted?.records) ? persisted.records : []);
+    for (const record of this.records.values()) validateJournalRecord(this.secret, record);
   }
 
   #persist() {
@@ -746,6 +780,7 @@ export class ToolInvocationReceiptJournal {
   consumeCapability(input) {
     const capability = authenticateReceipt(this.secret, input?.capability, "lab_host_invocation_capability_v1");
     const binding = normalizeReceiptBinding(input);
+    const retryOuterRequestSha256 = retryOuterRequestDigest(input);
     const executionId = receiptText(input?.host_tool_execution_id, "host_tool_execution_id", "hte_");
     return this.#mutate(() => {
       const record = this.records.get(receiptText(capability.capability_id, "capability_id", "hic_"));
@@ -764,6 +799,7 @@ export class ToolInvocationReceiptJournal {
         capability_id: capability.capability_id,
         host_tool_execution_id: executionId,
         ...binding,
+        retry_outer_request_sha256: retryOuterRequestSha256,
         pre_nonce: randomBytes(24).toString("hex"),
         issued_at_unix_ms: now,
         host_epoch_binding_sha256: sha256Text(`${binding.extension_binding_sha256}:${binding.extension_instance_id_sha256}:${binding.extension_loaded_at_ms}`)
@@ -771,13 +807,16 @@ export class ToolInvocationReceiptJournal {
       record.state = "HOST_VALIDATED_IN_FLIGHT";
       record.pre = pre;
       record.pre_receipt_sha256 = sha256Text(canonicalJson(pre));
+      record.retry_outer_request_sha256 = retryOuterRequestSha256;
       return structuredClone(pre);
     });
   }
 
   terminalize(input) {
     const pre = authenticateReceipt(this.secret, input?.pre_receipt, "lab_host_tool_pre_receipt_v1");
+    requestDigestProfile(pre.request_digest_profile);
     const binding = normalizeReceiptBinding(input);
+    const retryOuterRequestSha256 = retryOuterRequestDigest(input);
     const backendRoute = receiptText(input?.backend_route, "backend_route");
     if (!backendRoute.startsWith("/")) throw new Error("backend_route must be an absolute path");
     const httpStatus = Number(input?.http_status);
@@ -793,6 +832,10 @@ export class ToolInvocationReceiptJournal {
           record.pre_receipt_sha256 !== sha256Text(canonicalJson(pre))) {
         throw new Error("pre receipt mismatch");
       }
+      if (retryOuterRequestSha256 !== record.retry_outer_request_sha256 ||
+          retryOuterRequestSha256 !== pre.retry_outer_request_sha256) {
+        throw new Error("terminal retry outer request digest mismatch");
+      }
       if (!sameReceiptBinding(record.binding, binding) || pre.host_tool_execution_id !== record.pre.host_tool_execution_id) {
         throw new Error("terminal request mismatch");
       }
@@ -807,6 +850,7 @@ export class ToolInvocationReceiptJournal {
         capability_id: pre.capability_id,
         host_tool_execution_id: pre.host_tool_execution_id,
         ...binding,
+        retry_outer_request_sha256: retryOuterRequestSha256,
         backend_route: backendRoute,
         http_status: httpStatus,
         response_body_sha256: responseBodySha256,

@@ -315,6 +315,7 @@ test("real native Host process bridges Unix socket to Native Messaging and signs
   assert.equal(verified.loader_id, "loader-process");
 
   const receiptRequest = {
+    request_digest_profile: "lab_run_command_digest_v1",
     bridge_call_id: "bc_process",
     bridge_challenge_nonce: "bridge-challenge-nonce-process",
     transport_binding_id: "tb_process",
@@ -337,12 +338,14 @@ test("real native Host process bridges Unix socket to Native Messaging and signs
   const consumed = await requestNativeHost(socketPath, {
     op: "tool_receipt_consume", ...receiptRequest,
     capability: issued.capability,
+    retry_outer_request_sha256: "4".repeat(64),
     host_tool_execution_id: "hte_process"
   }, { timeoutMs: 3000 });
   assert.equal(consumed.pre_receipt.provenance, "lab_host_tool_pre_receipt_v1");
   const terminal = await requestNativeHost(socketPath, {
     op: "tool_receipt_terminal", ...receiptRequest,
     pre_receipt: consumed.pre_receipt,
+    retry_outer_request_sha256: "4".repeat(64),
     backend_route: "/v1/tools/run_command",
     http_status: 200,
     response_body_sha256: "1".repeat(64),

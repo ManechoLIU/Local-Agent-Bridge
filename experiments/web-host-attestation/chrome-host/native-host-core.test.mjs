@@ -411,6 +411,7 @@ test("private receipt operations derive browser identity and produce signed capa
     }
   });
   const request = {
+    request_digest_profile: "lab_run_command_digest_v1",
     bridge_call_id: "bc_receipt",
     bridge_challenge_nonce: "bridge-challenge-nonce-test",
     transport_binding_id: "tb_receipt",
@@ -434,11 +435,13 @@ test("private receipt operations derive browser identity and produce signed capa
   assert.equal(issued.capability.provenance, "lab_host_invocation_capability_v1");
   assert.equal(issued.capability.conversation_id, CONVERSATION);
   const consumed = await handle({
-    op: "tool_receipt_consume", ...request, capability: issued.capability, host_tool_execution_id: "hte_receipt"
+    op: "tool_receipt_consume", ...request, capability: issued.capability,
+    retry_outer_request_sha256: "4".repeat(64), host_tool_execution_id: "hte_receipt"
   });
   assert.equal(consumed.pre_receipt.provenance, "lab_host_tool_pre_receipt_v1");
   const terminal = await handle({
     op: "tool_receipt_terminal", ...request, pre_receipt: consumed.pre_receipt,
+    retry_outer_request_sha256: "4".repeat(64),
     backend_route: "/v1/tools/run_command", http_status: 200,
     response_body_sha256: "1".repeat(64), terminal_classification: "SUCCESS"
   });

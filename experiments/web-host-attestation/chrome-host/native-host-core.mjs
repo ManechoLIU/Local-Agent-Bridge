@@ -183,6 +183,7 @@ export function createNativeHostHandler(options) {
   function receiptInput(request, machineContext, epoch) {
     if (!epoch) throw new Error("HOST_EXTENSION_NOT_READY: receipt operations require a loaded extension epoch");
     return {
+      request_digest_profile: request.request_digest_profile,
       bridge_call_id: request.bridge_call_id,
       bridge_challenge_nonce: request.bridge_challenge_nonce,
       transport_binding_id: request.transport_binding_id,
@@ -284,6 +285,7 @@ export function createNativeHostHandler(options) {
         pre_receipt: receiptJournal.consumeCapability({
           ...input,
           capability: request.capability,
+          retry_outer_request_sha256: request.retry_outer_request_sha256,
           host_tool_execution_id: request.host_tool_execution_id
         }),
         ...epochFields
@@ -307,6 +309,7 @@ export function createNativeHostHandler(options) {
         terminal_receipt: receiptJournal.terminalize({
           ...input,
           pre_receipt: pre,
+          retry_outer_request_sha256: request.retry_outer_request_sha256,
           backend_route: request.backend_route,
           http_status: request.http_status,
           response_body_sha256: request.response_body_sha256,

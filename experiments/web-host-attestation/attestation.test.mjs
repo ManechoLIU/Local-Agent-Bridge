@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { mkdtempSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -1023,6 +1023,7 @@ function receiptMachineContext(overrides = {}) {
 
 function receiptRequest(overrides = {}) {
   return {
+    request_digest_profile: "lab_run_command_digest_v1",
     bridge_call_id: "bc_test-call",
     bridge_challenge_nonce: "bridge-challenge-nonce-test",
     transport_binding_id: "tb_test-transport",
@@ -1042,8 +1043,16 @@ function receiptRequest(overrides = {}) {
   };
 }
 
+function receiptConsumeInput(overrides = {}) {
+  return {
+    ...receiptRequest(),
+    retry_outer_request_sha256: "4".repeat(64),
+    ...overrides
+  };
+}
+
 const CAPABILITY_SCHEMA_KEYS = [
-  "schema_version", "provenance", "capability_id", "bridge_call_id", "bridge_challenge_nonce",
+  "schema_version", "provenance", "request_digest_profile", "capability_id", "bridge_call_id", "bridge_challenge_nonce",
   "transport_binding_id", "workspace", "production_release_revision", "production_endpoint_generation",
   "bridge_principal_id", "bridge_execution_session_id", "bridge_capability_id", "bridge_workspace_id",
   "tool_name", "outer_request_sha256", "forwarded_request_sha256", "normalized_request_sha256",
@@ -1053,22 +1062,22 @@ const CAPABILITY_SCHEMA_KEYS = [
 ].sort();
 
 const PRE_SCHEMA_KEYS = [
-  "schema_version", "provenance", "pre_receipt_id", "capability_id", "host_tool_execution_id",
+  "schema_version", "provenance", "request_digest_profile", "pre_receipt_id", "capability_id", "host_tool_execution_id",
   "bridge_call_id", "bridge_challenge_nonce", "transport_binding_id", "workspace",
   "production_release_revision", "production_endpoint_generation", "bridge_principal_id",
   "bridge_execution_session_id", "bridge_capability_id", "bridge_workspace_id", "tool_name",
-  "outer_request_sha256", "forwarded_request_sha256", "normalized_request_sha256", "conversation_id",
+  "outer_request_sha256", "forwarded_request_sha256", "normalized_request_sha256", "retry_outer_request_sha256", "conversation_id",
   "browser_target_id", "top_frame_id", "loader_id", "generation_anchor_sha256", "secure_origin",
   "extension_binding_sha256", "extension_instance_id_sha256", "extension_loaded_at_ms", "pre_nonce",
   "issued_at_unix_ms", "host_epoch_binding_sha256", "host_mac_sha256"
 ].sort();
 
 const TERMINAL_SCHEMA_KEYS = [
-  "schema_version", "provenance", "terminal_receipt_id", "pre_receipt_id", "pre_receipt_sha256",
+  "schema_version", "provenance", "request_digest_profile", "terminal_receipt_id", "pre_receipt_id", "pre_receipt_sha256",
   "capability_id", "host_tool_execution_id", "bridge_call_id", "bridge_challenge_nonce",
   "transport_binding_id", "workspace", "production_release_revision", "production_endpoint_generation",
   "bridge_principal_id", "bridge_execution_session_id", "bridge_capability_id", "bridge_workspace_id",
-  "tool_name", "outer_request_sha256", "forwarded_request_sha256", "normalized_request_sha256",
+  "tool_name", "outer_request_sha256", "forwarded_request_sha256", "normalized_request_sha256", "retry_outer_request_sha256",
   "conversation_id", "browser_target_id", "top_frame_id", "loader_id", "generation_anchor_sha256",
   "secure_origin", "extension_binding_sha256", "extension_instance_id_sha256", "extension_loaded_at_ms",
   "backend_route", "http_status", "response_body_sha256", "terminal_classification", "issued_at_unix_ms",
@@ -1098,7 +1107,7 @@ test("durable Host receipt journal binds only machine identity and exact request
   const restarted = new ToolInvocationReceiptJournal(SECRET, { clock: time.now, statePath, capabilityTtlMs: 100 });
   assert.throws(
     () => restarted.consumeCapability({
-      ...receiptRequest({ transport_binding_id: "tb_other" }),
+      ...receiptConsumeInput({ transport_binding_id: "tb_other" }),
       capability,
       host_tool_execution_id: "hte_test-execution"
     }),
@@ -1106,7 +1115,7 @@ test("durable Host receipt journal binds only machine identity and exact request
   );
 
   const pre = restarted.consumeCapability({
-    ...receiptRequest(),
+    ...receiptConsumeInput(),
     capability,
     host_tool_execution_id: "hte_test-execution"
   });
@@ -1114,7 +1123,7 @@ test("durable Host receipt journal binds only machine identity and exact request
   assert.deepEqual(Object.keys(pre).sort(), PRE_SCHEMA_KEYS);
   assert.throws(
     () => restarted.consumeCapability({
-      ...receiptRequest(),
+      ...receiptConsumeInput(),
       capability,
       host_tool_execution_id: "hte_test-execution"
     }),
@@ -1123,7 +1132,7 @@ test("durable Host receipt journal binds only machine identity and exact request
 
   assert.throws(
     () => restarted.terminalize({
-      ...receiptRequest(),
+      ...receiptConsumeInput(),
       pre_receipt: { ...pre, pre_receipt_id: "hpr_wrong" },
       backend_route: "/v1/tools/run_command",
       http_status: 200,
@@ -1133,7 +1142,7 @@ test("durable Host receipt journal binds only machine identity and exact request
     /authentication|pre.*mismatch|mismatch.*pre/i
   );
   const terminal = restarted.terminalize({
-    ...receiptRequest(),
+    ...receiptConsumeInput(),
     pre_receipt: pre,
     backend_route: "/v1/tools/run_command",
     http_status: 200,
@@ -1166,7 +1175,7 @@ test("Host receipt journal rejects expiry and every re-observed machine drift", 
     const changed = receiptMachineContext({ [field]: changedValue });
     assert.throws(
       () => journal.consumeCapability({
-        ...receiptRequest({ machine_context: changed }), capability, host_tool_execution_id: "hte_" + field
+        ...receiptConsumeInput({ machine_context: changed }), capability, host_tool_execution_id: "hte_" + field
       }),
       /mismatch|secure origin/i,
       field
@@ -1174,7 +1183,7 @@ test("Host receipt journal rejects expiry and every re-observed machine drift", 
   }
   time.add(10);
   assert.throws(
-    () => journal.consumeCapability({ ...receiptRequest(), capability, host_tool_execution_id: "hte_expired" }),
+    () => journal.consumeCapability({ ...receiptConsumeInput(), capability, host_tool_execution_id: "hte_expired" }),
     /expired/i
   );
 });
@@ -1187,19 +1196,19 @@ test("two receipt journal instances permit exactly one consume after reloading d
   const first = new ToolInvocationReceiptJournal(SECRET, { clock: time.now, statePath });
   const second = new ToolInvocationReceiptJournal(SECRET, { clock: time.now, statePath });
   const pre = first.consumeCapability({
-    ...receiptRequest(), capability, host_tool_execution_id: "hte_instance-one"
+    ...receiptConsumeInput(), capability, host_tool_execution_id: "hte_instance-one"
   });
   assert.equal(pre.host_tool_execution_id, "hte_instance-one");
   assert.throws(
     () => second.consumeCapability({
-      ...receiptRequest(), capability, host_tool_execution_id: "hte_instance-two"
+      ...receiptConsumeInput(), capability, host_tool_execution_id: "hte_instance-two"
     }),
     /replay/i
   );
   const restarted = new ToolInvocationReceiptJournal(SECRET, { clock: time.now, statePath });
   assert.throws(
     () => restarted.consumeCapability({
-      ...receiptRequest(), capability, host_tool_execution_id: "hte_after-restart"
+      ...receiptConsumeInput(), capability, host_tool_execution_id: "hte_after-restart"
     }),
     /replay/i
   );
@@ -1223,10 +1232,73 @@ test("receipt binding rejects each Bridge-private context and request digest dri
   ]) {
     assert.throws(
       () => journal.consumeCapability({
-        ...receiptRequest({ [field]: value }), capability, host_tool_execution_id: "hte_" + field
+        ...receiptConsumeInput({ [field]: value }), capability, host_tool_execution_id: "hte_" + field
       }),
       /mismatch/i,
       field
     );
   }
+});
+
+test("receipt digest profile and retry outer digest are mandatory and terminal-bound", () => {
+  const journal = new ToolInvocationReceiptJournal(SECRET);
+  assert.throws(
+    () => journal.issueCapability(receiptRequest({ request_digest_profile: undefined })),
+    /request_digest_profile/i
+  );
+  assert.throws(
+    () => journal.issueCapability(receiptRequest({ request_digest_profile: "wrong_profile" })),
+    /request_digest_profile/i
+  );
+  const capability = journal.issueCapability(receiptRequest());
+  assert.throws(
+    () => journal.consumeCapability({
+      ...receiptRequest(), capability, host_tool_execution_id: "hte_missing-retry"
+    }),
+    /retry_outer_request_sha256/i
+  );
+  assert.throws(
+    () => journal.consumeCapability({
+      ...receiptConsumeInput({ retry_outer_request_sha256: "not-a-digest" }),
+      capability,
+      host_tool_execution_id: "hte_invalid-retry"
+    }),
+    /retry_outer_request_sha256/i
+  );
+  const pre = journal.consumeCapability({
+    ...receiptConsumeInput(), capability, host_tool_execution_id: "hte_retry-bound"
+  });
+  assert.equal(pre.retry_outer_request_sha256, "4".repeat(64));
+  assert.throws(
+    () => journal.terminalize({
+      ...receiptConsumeInput({ retry_outer_request_sha256: "5".repeat(64) }),
+      pre_receipt: pre,
+      backend_route: "/v1/tools/run_command",
+      http_status: 200,
+      response_body_sha256: "1".repeat(64),
+      terminal_classification: "SUCCESS"
+    }),
+    /retry.*mismatch|mismatch.*retry/i
+  );
+});
+
+test("unprofiled capability and durable receipt state fail closed", () => {
+  const statePath = join(mkdtempSync(join(tmpdir(), "lab-tool-receipt-profile-")), "receipts.json");
+  const journal = new ToolInvocationReceiptJournal(SECRET, { statePath });
+  const capability = journal.issueCapability(receiptRequest());
+  const unprofiledCapability = { ...capability };
+  delete unprofiledCapability.request_digest_profile;
+  assert.throws(
+    () => journal.consumeCapability({
+      ...receiptConsumeInput(), capability: unprofiledCapability, host_tool_execution_id: "hte_old-capability"
+    }),
+    /authentication|profile/i
+  );
+  const persisted = JSON.parse(readFileSync(statePath, "utf8"));
+  delete persisted.records[0][1].binding.request_digest_profile;
+  writeFileSync(statePath, JSON.stringify(persisted));
+  assert.throws(
+    () => new ToolInvocationReceiptJournal(SECRET, { statePath }),
+    /profile|state/i
+  );
 });
