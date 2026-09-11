@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import fcntl
 import glob
 import hashlib
 import ipaddress
@@ -33,6 +34,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -331,8 +333,6 @@ def install_release_bundle(
 ) -> dict[str, Path]:
     _validate_manifest_contract(manifest)
     release_dir = layout["release_dir"]
-    if release_dir.exists():
-        raise RuntimeError(f"immutable production release already exists: {release_dir}")
     required = {
         "bridge_binary",
         "catdesk_binary",
@@ -386,14 +386,44 @@ def install_release_bundle(
     profile = production_tunnel_profile(source_profile, manifest, layout)
     node = _validate_runtime_dependencies(manifest)["node"]
 
-    _private_dir(release_dir.parent)
-    release_dir.mkdir(mode=0o700)
+    install_lock = _production_install_lock(layout["runtime_root"])
+    install_lock.__enter__()
+    published_profile = layout["tunnel_profile"]
+    previous_profile: tuple[str, int] | None = None
+    published_profile_changed = False
+    release_dir_created = False
     try:
+        try:
+            published_profile.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            _validate_private_source(
+                published_profile, "existing production tunnel profile"
+            )
+            try:
+                previous_profile = (
+                    published_profile.read_text(encoding="utf-8"),
+                    stat.S_IMODE(published_profile.stat().st_mode),
+                )
+            except (OSError, UnicodeError) as error:
+                raise RuntimeError(
+                    "existing production tunnel profile is not valid UTF-8"
+                ) from error
+
+        _private_dir(release_dir.parent)
+        if release_dir.exists():
+            raise RuntimeError(
+                f"immutable production release already exists: {release_dir}"
+            )
+        release_dir.mkdir(mode=0o700)
+        release_dir_created = True
         _copy_owned_file(resolved_sources["bridge_binary"], layout["bridge_binary"], 0o700)
         _copy_owned_file(resolved_sources["catdesk_binary"], layout["catdesk_binary"], 0o700)
         _copy_owned_file(
             resolved_sources["catdesk_config"], layout["release_catdesk_config"], 0o600
         )
+        _normalize_production_catdesk_config(layout["release_catdesk_config"])
         _copy_owned_file(
             resolved_sources["catdesk_backend_key"],
             layout["release_catdesk_backend_key"],
@@ -434,20 +464,96 @@ def install_release_bundle(
         _write_json_private(layout["release_manifest"], installed_manifest)
 
         _private_dir(layout["tunnel_dir"])
-        _write_json_private(layout["tunnel_profile"], profile)
+        published_profile_changed = True
+        _write_json_private(published_profile, profile)
         validate_installed_release(layout)
     except Exception as error:
+        cleanup_errors: list[str] = []
         try:
-            shutil.rmtree(release_dir)
-            if release_dir.exists():
+            if release_dir_created and release_dir.exists():
+                shutil.rmtree(release_dir)
+            if release_dir_created and release_dir.exists():
                 raise RuntimeError("partial production release directory still exists")
         except Exception as cleanup_error:
+            cleanup_errors.append(
+                f"incomplete release cleanup failed: {cleanup_error}"
+            )
+        if published_profile_changed:
+            try:
+                if previous_profile is None:
+                    _validate_private_source(
+                        published_profile,
+                        "failed production tunnel profile publication",
+                    )
+                    published_profile.unlink()
+                else:
+                    previous_text, previous_mode = previous_profile
+                    _write_text_private(
+                        published_profile, previous_text, previous_mode
+                    )
+            except Exception as profile_cleanup_error:
+                cleanup_errors.append(
+                    "production tunnel profile rollback failed: "
+                    f"{profile_cleanup_error}"
+                )
+        if cleanup_errors:
             raise RuntimeError(
                 f"production release install failed: {error}; "
-                f"incomplete release cleanup failed: {cleanup_error}"
+                + "; ".join(cleanup_errors)
             ) from error
         raise
+    finally:
+        install_lock.__exit__(None, None, None)
     return layout
+
+
+def _normalize_production_catdesk_config(path: Path) -> None:
+    """Pin the immutable production bundle to CatDesk's no-widget mode.
+
+    Only the copied release artifact is changed.  Requiring one canonical
+    top-level assignment keeps this build-time policy explicit and prevents a
+    malformed, nested, or duplicate TOML key from silently changing behavior.
+    """
+    _validate_private_source(path, "production CatDesk config")
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise RuntimeError(
+            "production CatDesk showDetailMode config is not valid UTF-8"
+        ) from error
+
+    assignment = re.compile(
+        r'^showDetailMode[ \t]*=[ \t]*"(?P<value>expanded|collapsed|disable)"'
+        r"[ \t]*(?:#[^\r\n]*)?$",
+        re.MULTILINE,
+    )
+    matches = list(assignment.finditer(source))
+    if len(matches) != 1:
+        raise RuntimeError(
+            "production CatDesk config must contain exactly one canonical "
+            'top-level showDetailMode = "expanded"|"collapsed"|"disable" assignment'
+        )
+    try:
+        parsed = tomllib.loads(source)
+    except tomllib.TOMLDecodeError as error:
+        raise RuntimeError("production CatDesk showDetailMode config is invalid TOML") from error
+    if parsed.get("showDetailMode") not in {"expanded", "collapsed", "disable"}:
+        raise RuntimeError(
+            "production CatDesk showDetailMode must be a supported top-level string"
+        )
+
+    match = matches[0]
+    start, end = match.span("value")
+    normalized = source[:start] + "disable" + source[end:]
+    try:
+        normalized_parsed = tomllib.loads(normalized)
+    except tomllib.TOMLDecodeError as error:
+        raise RuntimeError(
+            "normalized production CatDesk showDetailMode config is invalid TOML"
+        ) from error
+    if normalized_parsed.get("showDetailMode") != "disable":
+        raise RuntimeError("production CatDesk showDetailMode normalization failed")
+    _write_text_private(path, normalized, 0o600)
 
 
 def validate_installed_release(layout: dict[str, Path]) -> dict[str, Any]:
@@ -3878,6 +3984,33 @@ def _private_dir(path: Path) -> None:
     if path.is_symlink() or not path.is_dir() or info.st_uid != os.geteuid():
         raise RuntimeError(f"private production path is unsafe: {path}")
     path.chmod(0o700)
+
+
+@contextmanager
+def _production_install_lock(runtime_root: Path):
+    """Serialize release publication and rollback under one private lock."""
+    root = Path(runtime_root)
+    _private_dir(root)
+    lock_path = root / ".install.lock"
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) & 0o077
+        ):
+            raise RuntimeError("production install lock is unsafe")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def _validate_private_source(path: Path, label: str) -> None:

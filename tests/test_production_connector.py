@@ -155,7 +155,10 @@ class ProductionConnectorContractTests(unittest.TestCase):
             path.write_bytes(name.encode() * 32)
             path.chmod(0o700)
         for name, content in (
-            ("catdesk-config", b"mcpSlug = 'private-slug'\n"),
+            (
+                "catdesk-config",
+                b"mcpSlug = 'private-slug'\nshowDetailMode = \"expanded\"\n",
+            ),
             ("catdesk-key", b"k" * 64),
             ("attestation-key", b"a" * 32),
         ):
@@ -398,7 +401,14 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 path.write_bytes(name.encode() * 32)
                 path.chmod(0o700)
             for name, content in (
-                ("catdesk-config", b"mcpSlug = 'private-slug'\n"),
+                (
+                    "catdesk-config",
+                    (
+                        b"mcpSlug = 'private-slug'\n"
+                        b"showDetailMode = \"expanded\" # production policy input\n"
+                        b"[usage]\nenabled = true\n"
+                    ),
+                ),
                 ("catdesk-key", b"k" * 64),
                 ("attestation-key", b"a" * 32),
             ):
@@ -438,6 +448,35 @@ class ProductionConnectorContractTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(layout["tunnel_profile"].stat().st_mode), 0o600)
             self.assertTrue(os.access(layout["bridge_binary"], os.X_OK))
             self.assertTrue(os.access(layout["native_host_wrapper"], os.X_OK))
+            self.assertEqual(
+                pc.tomllib.loads(
+                    layout["release_catdesk_config"].read_text(encoding="utf-8")
+                )["showDetailMode"],
+                "disable",
+            )
+            self.assertEqual(
+                pc.tomllib.loads(
+                    sources["catdesk_config"].read_text(encoding="utf-8")
+                )["showDetailMode"],
+                "expanded",
+            )
+            self.assertEqual(
+                layout["release_catdesk_config"].read_text(encoding="utf-8"),
+                "mcpSlug = 'private-slug'\n"
+                'showDetailMode = "disable" # production policy input\n'
+                "[usage]\nenabled = true\n",
+            )
+            pc._materialize_catdesk_runtime(layout)
+            self.assertEqual(
+                pc._sha256_file(layout["catdesk_config"]),
+                pc._sha256_file(layout["release_catdesk_config"]),
+            )
+            self.assertEqual(
+                pc.tomllib.loads(layout["catdesk_config"].read_text(encoding="utf-8"))[
+                    "showDetailMode"
+                ],
+                "disable",
+            )
             installed_manifest = json.loads(layout["release_manifest"].read_text(encoding="utf-8"))
             installed_artifacts = dict(installed_manifest["artifacts_sha256"])
             node = installed_manifest["runtime_dependencies"]["node"]
@@ -470,8 +509,17 @@ class ProductionConnectorContractTests(unittest.TestCase):
             for relative, expected_hash in installed_artifacts.items():
                 self.assertEqual(pc._sha256_file(layout["release_dir"] / relative), expected_hash)
 
+            release_manifest_before_retry = layout["release_manifest"].read_bytes()
+            tunnel_profile_before_retry = layout["tunnel_profile"].read_bytes()
             with self.assertRaisesRegex(RuntimeError, "immutable|already exists"):
                 pc.install_release_bundle(manifest, layout, sources)
+            self.assertTrue(layout["release_dir"].is_dir())
+            self.assertEqual(
+                layout["release_manifest"].read_bytes(), release_manifest_before_retry
+            )
+            self.assertEqual(
+                layout["tunnel_profile"].read_bytes(), tunnel_profile_before_retry
+            )
 
             extra = layout["release_dir"] / "unlisted-evidence.txt"
             extra.write_text("not in release manifest", encoding="utf-8")
@@ -482,6 +530,45 @@ class ProductionConnectorContractTests(unittest.TestCase):
             layout["bridge_binary"].write_bytes(b"tampered")
             with self.assertRaisesRegex(RuntimeError, "hash|artifact"):
                 pc.validate_installed_release(layout)
+
+    def test_install_release_rejects_noncanonical_show_detail_mode_and_cleans_partial_release(self):
+        manifest = self._manifest()
+        invalid_configs = {
+            "missing": "mcpSlug = 'private-slug'\n",
+            "duplicate": (
+                "mcpSlug = 'private-slug'\n"
+                'showDetailMode = "expanded"\n'
+                'showDetailMode = "collapsed"\n'
+            ),
+            "unsupported": (
+                "mcpSlug = 'private-slug'\nshowDetailMode = \"verbose\"\n"
+            ),
+            "non-string": "mcpSlug = 'private-slug'\nshowDetailMode = true\n",
+            "nested": (
+                "mcpSlug = 'private-slug'\n[widget]\n"
+                'showDetailMode = "expanded"\n'
+            ),
+            "single-quoted": (
+                "mcpSlug = 'private-slug'\nshowDetailMode = 'expanded'\n"
+            ),
+        }
+        for case, config in invalid_configs.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as raw_root:
+                root = Path(raw_root)
+                sources = self._release_sources(root)
+                sources["catdesk_config"].write_text(config, encoding="utf-8")
+                sources["catdesk_config"].chmod(0o600)
+                layout = pc.production_layout(
+                    manifest,
+                    runtime_root=root / "runtime",
+                    bridge_socket=root / "socket" / "bridge.sock",
+                )
+                with self.assertRaisesRegex(RuntimeError, "showDetailMode"):
+                    pc.install_release_bundle(manifest, layout, sources)
+                self.assertFalse(layout["release_dir"].exists())
+                self.assertEqual(
+                    sources["catdesk_config"].read_text(encoding="utf-8"), config
+                )
 
     def test_release_source_preflight_rejects_missing_profile_before_creating_release_dir(self):
         manifest = self._manifest()
@@ -538,6 +625,71 @@ class ProductionConnectorContractTests(unittest.TestCase):
             installed = pc.install_release_bundle(manifest, layout, sources)
             self.assertEqual(installed, layout)
             pc.validate_installed_release(layout)
+
+    def test_release_validation_failure_restores_or_removes_published_tunnel_profile(self):
+        manifest = self._manifest()
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as raw_root:
+                root = Path(raw_root)
+                sources = self._release_sources(root)
+                layout = pc.production_layout(
+                    manifest,
+                    runtime_root=root / "runtime",
+                    bridge_socket=root / "socket" / "bridge.sock",
+                )
+                previous = '{"previous": true}\n'
+                if existing:
+                    layout["tunnel_profile"].parent.mkdir(parents=True)
+                    layout["tunnel_profile"].write_text(previous, encoding="utf-8")
+                    layout["tunnel_profile"].chmod(0o600)
+                with patch.object(
+                    pc,
+                    "validate_installed_release",
+                    side_effect=RuntimeError("injected final validation failure"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "final validation failure"):
+                        pc.install_release_bundle(manifest, layout, sources)
+                self.assertFalse(layout["release_dir"].exists())
+                if existing:
+                    self.assertEqual(
+                        layout["tunnel_profile"].read_text(encoding="utf-8"), previous
+                    )
+                    self.assertEqual(
+                        stat.S_IMODE(layout["tunnel_profile"].stat().st_mode), 0o600
+                    )
+                else:
+                    self.assertFalse(layout["tunnel_profile"].exists())
+
+    def test_profile_publication_unknown_after_replace_restores_previous_profile(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            sources = self._release_sources(root)
+            layout = pc.production_layout(
+                manifest,
+                runtime_root=root / "runtime",
+                bridge_socket=root / "socket" / "bridge.sock",
+            )
+            previous = '{"previous": true}\n'
+            layout["tunnel_profile"].parent.mkdir(parents=True)
+            layout["tunnel_profile"].write_text(previous, encoding="utf-8")
+            layout["tunnel_profile"].chmod(0o600)
+            real_write_json = pc._write_json_private
+
+            def replace_then_report_unknown(path, value, **kwargs):
+                real_write_json(path, value, **kwargs)
+                if Path(path) == layout["tunnel_profile"]:
+                    raise OSError("injected directory fsync failure after replace")
+
+            with patch.object(
+                pc, "_write_json_private", side_effect=replace_then_report_unknown
+            ):
+                with self.assertRaisesRegex(OSError, "fsync failure after replace"):
+                    pc.install_release_bundle(manifest, layout, sources)
+            self.assertFalse(layout["release_dir"].exists())
+            self.assertEqual(
+                layout["tunnel_profile"].read_text(encoding="utf-8"), previous
+            )
 
     def test_release_cleanup_failure_reports_original_and_cleanup_errors(self):
         manifest = self._manifest()
