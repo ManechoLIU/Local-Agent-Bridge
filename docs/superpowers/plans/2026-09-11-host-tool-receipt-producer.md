@@ -166,7 +166,62 @@ git add crates/bridge-security-core/src/lib.rs crates/local-tool-bridge/src/lib.
 git commit -m "feat(bridge): gate shell dispatch on Host receipts"
 ```
 
-### Task 3: Production release wiring and compatibility fences
+### Task 3: Runtime verifier v2 receipt commands
+
+**Files:**
+- Modify: `experiments/web-host-attestation/attestation.mjs`
+- Modify: `experiments/web-host-attestation/attestation.test.mjs`
+- Modify: `experiments/web-host-attestation/chrome-host/integration.mjs`
+- Modify: `experiments/web-host-attestation/chrome-host/integration.test.mjs`
+- Modify: `experiments/web-host-attestation/chrome-host/runtime-verifier-cli.mjs`
+- Modify: `experiments/web-host-attestation/chrome-host/runtime-verifier-cli.test.mjs`
+
+**Interfaces:**
+- Consumes: Task 1 signed pre/terminal schemas, Host verification key, current extension binding, and the private current-entry channel.
+- Produces: verifier protocol `runtime_host_verifier_cli_v2` operations `verify_tool_pre` and `verify_tool_terminal`, each returning an exact immutable receipt digest plus freshly verified machine context and never returning the Host key.
+
+- [ ] **Step 1: Write failing verifier boundary tests**
+
+Use literal Task 1 receipts and the real CLI subprocess. Prove exact schema/profile/MAC, bounded freshness, current extension binding/instance, current-entry conversation and generation, all four request digests, execution/pre-chain IDs, terminal outcome and response digest. Reject unknown keys, old unprofiled receipts, forged or stale MACs, wrong current entry, changed pre/terminal chain, and caller-added Runtime Controller/turn fields.
+
+- [ ] **Step 2: Run focused tests and capture RED**
+
+Run:
+
+```bash
+node --test experiments/web-host-attestation/attestation.test.mjs \
+  experiments/web-host-attestation/chrome-host/integration.test.mjs \
+  experiments/web-host-attestation/chrome-host/runtime-verifier-cli.test.mjs
+```
+
+Expected: FAIL because verifier v2 receipt commands do not exist.
+
+- [ ] **Step 3: Implement minimal verifier v2**
+
+Export pure Host receipt authentication helpers from `attestation.mjs`, then expose them through the existing immutable CLI/integration boundary. Reuse the configured private Host key and loaded-extension binding checks. The CLI reads one bounded JSON object and writes one bounded object; it does not accept caller identity as attestation, does not mutate Host journal state, and does not invoke a shell.
+
+```json
+{
+  "protocol": "runtime_host_verifier_cli_v2",
+  "operation": "verify_tool_pre",
+  "receipt_sha256": "<64 hex>",
+  "receipt": {"provenance": "lab_host_tool_pre_receipt_v1"},
+  "current_entry": {"provenance": "runtime_host_current_entry_v1"}
+}
+```
+
+- [ ] **Step 4: Run focused verifier tests GREEN**
+
+Run the Step 2 command plus the complete Task 1 Host suite. Expected: all pass and existing v1 current-entry/re-entry commands remain compatible.
+
+- [ ] **Step 5: Commit Task 3**
+
+```bash
+git add experiments/web-host-attestation/attestation.mjs experiments/web-host-attestation/attestation.test.mjs experiments/web-host-attestation/chrome-host/integration.mjs experiments/web-host-attestation/chrome-host/integration.test.mjs experiments/web-host-attestation/chrome-host/runtime-verifier-cli.mjs experiments/web-host-attestation/chrome-host/runtime-verifier-cli.test.mjs
+git commit -m "feat(host): verify tool receipts for Runtime"
+```
+
+### Task 4: Production release wiring and compatibility fences
 
 **Files:**
 - Modify: `scripts/production_connector.py`
@@ -174,7 +229,7 @@ git commit -m "feat(bridge): gate shell dispatch on Host receipts"
 - Modify: `experiments/web-host-attestation/chrome-host/host-mcp-adapter.test.mjs`
 
 **Interfaces:**
-- Consumes: Task 1 Host state path/operations and Task 2 Bridge env/hook settings.
+- Consumes: Task 1 Host state path/operations, Task 2 Bridge env/hook settings, and Task 3 verifier v2 commands.
 - Produces: immutable release paths for Host receipt state, Bridge receipt journal, Host socket and verification material, and a Runtime hook registration that pins executable, transitive bundle hashes, installed Runtime revision, and protocol `runtime_host_tool_hook_v1`.
 
 - [ ] **Step 1: Write failing production contract tests**
@@ -204,9 +259,9 @@ Generate private state paths under the immutable production runtime, pass only e
 
 - [ ] **Step 4: Run the production and focused cross-component regression**
 
-Run the Step 2 command, Task 1 Node command, and Task 2 Cargo commands. Expected: all pass with unchanged public tool names and unchanged AI-Bridge/compute-helper identity checks.
+Run the Step 2 command, Task 1 and Task 3 Node commands, and Task 2 Cargo commands. Expected: all pass with unchanged public tool names and unchanged AI-Bridge/compute-helper identity checks.
 
-- [ ] **Step 5: Commit Task 3**
+- [ ] **Step 5: Commit Task 4**
 
 ```bash
 git add scripts/production_connector.py tests/test_production_connector.py experiments/web-host-attestation/chrome-host/host-mcp-adapter.test.mjs
