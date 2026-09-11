@@ -211,9 +211,18 @@ Export pure Host receipt authentication helpers from `attestation.mjs`, then exp
   "operation": "verify_tool_pre",
   "receipt_sha256": "<64 hex>",
   "receipt": {"provenance": "lab_host_tool_pre_receipt_v1"},
-  "current_entry": {"provenance": "runtime_host_current_entry_v1"}
+  "expected_target_generation": 7,
+  "expected_ownership_generation": 9,
+  "expected_request_digests": {
+    "outer_request_sha256": "<64 hex>",
+    "forwarded_request_sha256": "<64 hex>",
+    "normalized_request_sha256": "<64 hex>",
+    "retry_outer_request_sha256": "<64 hex>"
+  }
 }
 ```
+
+The verifier obtains `current_entry` and `extension_epoch` itself from one fresh private Host request. It rejects any caller-supplied current entry, Controller identity, Runtime turn identity, or unknown envelope key. The terminal operation additionally requires an exact `expected_pre_chain` containing `pre_receipt_id`, `pre_receipt_sha256`, `capability_id`, and `host_tool_execution_id`.
 
 - [ ] **Step 4: Run focused verifier tests GREEN**
 
