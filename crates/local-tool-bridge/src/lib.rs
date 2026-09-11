@@ -437,19 +437,21 @@ async fn handle_mcp(
         Ok(value) => value,
         Err(error) => return text_response(StatusCode::FORBIDDEN, &error),
     };
-    let provided_request_id = header_text(&headers, "x-request-id")
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let request_id = provided_request_id.unwrap_or_else(|| {
-        if is_reconnectable_discovery_method(method, &capability) {
-            Uuid::new_v4().to_string()
-        } else {
-            parsed
-                .get("id")
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| Uuid::new_v4().to_string())
-        }
-    });
+    let request_id = if is_reconnectable_discovery_method(method, &capability) {
+        // Discovery reconnects may reuse provider request IDs across JSON-RPC
+        // methods. Proof IDs are authority replay keys, so keep them unique.
+        Uuid::new_v4().to_string()
+    } else {
+        header_text(&headers, "x-request-id")
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                parsed
+                    .get("id")
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| Uuid::new_v4().to_string())
+            })
+    };
     let nonce = Uuid::new_v4().to_string();
     let proof = match sign_request(
         &state.inner.issued,
@@ -808,7 +810,8 @@ fn is_reconnectable_discovery_method(method: &str, capability: &Capability) -> b
                 | "resources/list"
                 | "resources/templates/list"
                 | "ping"
-        ) || method.starts_with("notifications/"))
+                | "notifications/initialized"
+        ))
 }
 
 pub fn required_capability(method: &str, tool_name: &str) -> Result<Capability, String> {

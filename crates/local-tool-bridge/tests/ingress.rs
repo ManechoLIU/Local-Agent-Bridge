@@ -298,12 +298,132 @@ async fn discovery_reconnects_with_reused_json_rpc_ids_without_request_id_header
 }
 
 #[tokio::test]
-async fn discovery_request_id_header_remains_replay_protected() {
+async fn discovery_reconnects_when_provider_reuses_request_id_header_across_methods() {
     let capture = Capture::default();
     let backend_url = backend_server(capture.clone()).await;
     let app = bridge(&backend_url, vec![Capability::Discovery]).router();
-    let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
-    let request = || discovery_request(body, Some("provider-discovery-123"));
+    let provider_request_id = "provider-discovery-123";
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    let tools_list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+
+    let first = app
+        .clone()
+        .oneshot(discovery_request(initialize, Some(provider_request_id)))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let (headers, forwarded_body) = capture.0.lock().await.clone().unwrap();
+    assert_eq!(forwarded_body, Bytes::from(initialize.to_string()));
+    let initialize_proof_id = headers
+        .get("x-lab-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(Uuid::parse_str(&initialize_proof_id).is_ok());
+    assert_ne!(initialize_proof_id, provider_request_id);
+    *capture.0.lock().await = None;
+
+    let second = app
+        .oneshot(discovery_request(tools_list, Some(provider_request_id)))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let (headers, forwarded_body) = capture.0.lock().await.clone().unwrap();
+    assert_eq!(forwarded_body, Bytes::from(tools_list.to_string()));
+    let tools_list_proof_id = headers
+        .get("x-lab-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(Uuid::parse_str(&tools_list_proof_id).is_ok());
+    assert_ne!(tools_list_proof_id, provider_request_id);
+    assert_ne!(initialize_proof_id, tools_list_proof_id);
+}
+
+#[tokio::test]
+async fn initialized_notification_reconnects_with_reused_provider_request_id() {
+    let capture = Capture::default();
+    let backend_url = backend_server(capture.clone()).await;
+    let app = bridge(&backend_url, vec![Capability::Discovery]).router();
+    let provider_request_id = "provider-initialized-123";
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    let initialized = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+
+    let first = app
+        .clone()
+        .oneshot(discovery_request(initialize, Some(provider_request_id)))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let (headers, _) = capture.0.lock().await.clone().unwrap();
+    let initialize_proof_id = headers
+        .get("x-lab-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    *capture.0.lock().await = None;
+
+    let second = app
+        .clone()
+        .oneshot(discovery_request(initialized, Some(provider_request_id)))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let (headers, _) = capture.0.lock().await.clone().unwrap();
+    let first_initialized_proof_id = headers
+        .get("x-lab-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    *capture.0.lock().await = None;
+
+    let third = app
+        .oneshot(discovery_request(initialized, Some(provider_request_id)))
+        .await
+        .unwrap();
+    assert_eq!(third.status(), StatusCode::OK);
+    let (headers, _) = capture.0.lock().await.clone().unwrap();
+    let second_initialized_proof_id = headers
+        .get("x-lab-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    for proof_id in [
+        &initialize_proof_id,
+        &first_initialized_proof_id,
+        &second_initialized_proof_id,
+    ] {
+        assert!(Uuid::parse_str(proof_id).is_ok());
+        assert_ne!(proof_id, provider_request_id);
+    }
+    assert_ne!(initialize_proof_id, first_initialized_proof_id);
+    assert_ne!(first_initialized_proof_id, second_initialized_proof_id);
+}
+
+#[tokio::test]
+async fn discovery_capability_tool_call_request_id_header_remains_replay_protected() {
+    let capture = Capture::default();
+    let backend_url = backend_server(capture.clone()).await;
+    let app = bridge(&backend_url, vec![Capability::Discovery]).router();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"catdesk_instruction","arguments":{}}}"#;
+    let request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "catdesk_instruction")
+            .header("x-lab-ingress-key", KEY)
+            .header("x-request-id", "provider-catdesk-instruction-123")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
 
     let first = app.clone().oneshot(request()).await.unwrap();
     assert_eq!(first.status(), StatusCode::OK);
@@ -311,7 +431,30 @@ async fn discovery_request_id_header_remains_replay_protected() {
     assert_eq!(forwarded_body, Bytes::from(body.to_string()));
     assert_eq!(
         headers.get("x-lab-request-id").unwrap(),
-        "provider-discovery-123"
+        "provider-catdesk-instruction-123"
+    );
+    *capture.0.lock().await = None;
+
+    let second = app.oneshot(request()).await.unwrap();
+    assert_eq!(second.status(), StatusCode::FORBIDDEN);
+    assert!(capture.0.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn non_reconnectable_notification_request_id_header_remains_replay_protected() {
+    let capture = Capture::default();
+    let backend_url = backend_server(capture.clone()).await;
+    let app = bridge(&backend_url, vec![Capability::Discovery]).router();
+    let body = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}"#;
+    let request = || discovery_request(body, Some("provider-notification-123"));
+
+    let first = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let (headers, forwarded_body) = capture.0.lock().await.clone().unwrap();
+    assert_eq!(forwarded_body, Bytes::from(body.to_string()));
+    assert_eq!(
+        headers.get("x-lab-request-id").unwrap(),
+        "provider-notification-123"
     );
     *capture.0.lock().await = None;
 
