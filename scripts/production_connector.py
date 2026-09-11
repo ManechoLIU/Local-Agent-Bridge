@@ -682,7 +682,9 @@ def _request_json(request: urllib.request.Request, label: str) -> dict[str, Any]
 MAX_TUNNEL_HEALTH_BODY_BYTES = 1024 * 1024
 TUNNEL_HEALTH_FUTURE_TOLERANCE_SECONDS = 2.0
 TUNNEL_POLL_STATUS_MAX_AGE_SECONDS = 60.0
-TUNNEL_POLL_STARTUP_TIMEOUT_SECONDS = 5.0
+# The control-plane long poll is 30s in tunnel-client 0.0.14.  Readiness must
+# permit one complete fresh poll plus bounded scheduling/network overhead.
+TUNNEL_POLL_STARTUP_TIMEOUT_SECONDS = 35.0
 TUNNEL_POLL_RETRY_INTERVAL_SECONDS = 0.1
 
 

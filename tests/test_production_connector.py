@@ -1384,7 +1384,9 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with patch.object(pc.time, "time", return_value=1003.0), patch.object(
-                pc.time, "monotonic", side_effect=[0.0, 0.0, 6.0]
+                pc.time,
+                "monotonic",
+                side_effect=[0.0, 0.0, pc.TUNNEL_POLL_STARTUP_TIMEOUT_SECONDS + 1.0],
             ), patch.object(pc.time, "sleep") as readiness_sleep, patch.object(
                 pc.TUNNEL_HEALTH_OPENER,
                 "open",
@@ -1554,7 +1556,9 @@ class ProductionConnectorContractTests(unittest.TestCase):
             pending_sleep.assert_called_once()
 
             with patch.object(pc.time, "time", return_value=1003.0), patch.object(
-                pc.time, "monotonic", side_effect=[0.0, 0.0, 6.0]
+                pc.time,
+                "monotonic",
+                side_effect=[0.0, 0.0, pc.TUNNEL_POLL_STARTUP_TIMEOUT_SECONDS + 1.0],
             ), patch.object(pc.time, "sleep") as pending_sleep, patch.object(
                 pc.TUNNEL_HEALTH_OPENER, "open", side_effect=[pending_status, pending_status]
             ):
@@ -1929,7 +1933,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
             )
             fresh_metrics_response.__enter__.return_value = fresh_metrics_response
             with patch.object(pc.time, "time", return_value=1003.0), patch.object(
-                pc.time, "monotonic", side_effect=[0.0, 0.0]
+                pc.time, "monotonic", side_effect=[0.0, 31.0]
             ), patch.object(pc.time, "sleep") as retry_sleep, patch.object(
                 pc.TUNNEL_HEALTH_OPENER,
                 "open",
@@ -1950,7 +1954,9 @@ class ProductionConnectorContractTests(unittest.TestCase):
             retry_sleep.assert_called_once()
 
             with patch.object(pc.time, "time", return_value=1003.0), patch.object(
-                pc.time, "monotonic", side_effect=[0.0, 0.0, 6.0]
+                pc.time,
+                "monotonic",
+                side_effect=[0.0, 0.0, pc.TUNNEL_POLL_STARTUP_TIMEOUT_SECONDS + 1.0],
             ), patch.object(pc.time, "sleep") as retry_sleep, patch.object(
                 pc.TUNNEL_HEALTH_OPENER,
                 "open",
