@@ -2924,7 +2924,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
             )
             layout["runtime_state"].parent.mkdir(parents=True)
             prior = {
-                "release_revision": REVISION,
+                "release_revision": "b" * 40,
                 "endpoint_generation": 7,
                 "workspace": manifest["workspace"],
                 "tunnel_profile_name": pc.TUNNEL_PROFILE_NAME,
@@ -2974,7 +2974,9 @@ class ProductionConnectorContractTests(unittest.TestCase):
                         {"local_runtime_ready": False, "tunnel_ready": True},
                         {"local_runtime_ready": False, "tunnel_ready": True},
                     ],
-                ), patch.object(pc, "_stop_verified_local_runtime"), patch.object(
+                ), patch.object(pc, "_preserved_activation_state", return_value={}), patch.object(
+                    pc, "_stop_prior_local_runtime_for_release_upgrade"
+                ) as stop_prior, patch.object(
                     pc, "_tcp_ready", return_value=False
                 ), patch.object(pc, "_catdesk_slug", return_value="private"), patch.object(
                     pc, "production_component_env", return_value={"host": {}, "bridge": {}}
@@ -2994,6 +2996,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
             finally:
                 bridge_listener.close()
             self.assertEqual(stop.call_count, 3)
+            stop_prior.assert_called_once_with(prior, layout)
             self.assertEqual(spawn.call_args_list[0].args[0][0], str(kernel_python))
             self.assertEqual(
                 capture.call_args_list[0].kwargs["expected_executable"], kernel_python
@@ -3086,6 +3089,206 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "rollback receipt|pin|hash"):
                     pc.start_local_runtime(manifest, layout)
             forbidden_stop.assert_not_called()
+
+    def test_release_upgrade_requires_a_completed_verified_rollback_before_discarding_old_tunnel_state(self):
+        manifest = self._manifest()
+        upgraded_manifest = {**manifest, "release_revision": "b" * 40, "endpoint_generation": 8}
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                upgraded_manifest, runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
+            )
+            old_identity = self._identity(717, ["/opt/tunnel-client", "run"])
+            historical_identity = self._identity(404, ["/opt/tunnel-client", "run", "--profile", "m0"])
+            historical_state_path = root / "historical-runtime.json"
+            historical_state = {
+                "tunnel_pid": 404,
+                "tunnel_id": "tunnel-production",
+                "tunnel_profile_sha256": "a" * 64,
+                "tunnel_process_identity": historical_identity,
+            }
+            pc._write_json_private(historical_state_path, historical_state)
+            receipt = {
+                "schema_version": 1,
+                "status": "armed",
+                "connector_id": pc.CONNECTOR_ID,
+                "contract_version": pc.CONTRACT_VERSION,
+                "release_revision": manifest["release_revision"],
+                "endpoint_generation": manifest["endpoint_generation"],
+                "tunnel_id": "tunnel-production",
+                "production": {
+                    "pid": 717,
+                    "tunnel_id": "tunnel-production",
+                    "process_identity": old_identity,
+                },
+                "historical_runtime_state": str(historical_state_path),
+                "historical_restarted": {
+                    "pid": 404,
+                    "tunnel_id": "tunnel-production",
+                    "profile_sha256": "a" * 64,
+                    "process_identity": historical_identity,
+                },
+            }
+            pc._write_json_private(layout["rollback_receipt"], receipt)
+            prior = {
+                "release_revision": manifest["release_revision"],
+                "endpoint_generation": manifest["endpoint_generation"],
+                "activation_rollback_receipt": str(layout["rollback_receipt"].resolve()),
+                "activation_rollback_receipt_sha256": pc._sha256_file(layout["rollback_receipt"]),
+            }
+            pc._write_json_private(layout["runtime_state"], prior)
+            with self.assertRaisesRegex(RuntimeError, "completed rollback"):
+                pc._preserved_activation_state(upgraded_manifest, layout, prior)
+
+            receipt.update({"status": "rolled_back", "phase": "completed", "rolled_back_at": 1234.0})
+            pc._write_json_private(layout["rollback_receipt"], receipt)
+            prior.update(
+                {
+                    "activation_rollback_receipt_sha256": pc._sha256_file(layout["rollback_receipt"]),
+                    "rollback_completed_at": 1234.0,
+                    "rollback_historical_tunnel_pid": 404,
+                    "rollback_historical_tunnel_id": "tunnel-production",
+                    "rollback_historical_tunnel_process_identity": historical_identity,
+                }
+            )
+            pc._write_json_private(layout["runtime_state"], prior)
+            with patch.object(pc, "_process_identity_matches", side_effect=lambda value: value == historical_identity), patch.object(
+                pc, "_validate_receipt_tunnel_profile"
+            ) as profile, patch.object(pc, "_require_exact_tunnel_id_owners") as owners:
+                self.assertEqual(pc._preserved_activation_state(upgraded_manifest, layout, prior), {})
+            profile.assert_called_once_with(
+                receipt["historical_restarted"],
+                expected_socket=pc.HISTORICAL_M0_BRIDGE_SOCKET,
+                label="completed rollback historical tunnel",
+            )
+            owners.assert_called_once_with(
+                "tunnel-production", {404}, expected_socket=pc.HISTORICAL_M0_BRIDGE_SOCKET
+            )
+
+            malformed = dict(receipt)
+            malformed["production"] = {
+                "tunnel_id": "tunnel-production", "process_identity": {"pid": 717}
+            }
+            pc._write_json_private(layout["rollback_receipt"], malformed)
+            prior["activation_rollback_receipt_sha256"] = pc._sha256_file(layout["rollback_receipt"])
+            pc._write_json_private(layout["runtime_state"], prior)
+            with patch.object(pc, "_process_identity_matches", return_value=True), patch.object(
+                pc, "_validate_receipt_tunnel_profile"
+            ), patch.object(pc, "_require_exact_tunnel_id_owners") as forbidden_owners:
+                with self.assertRaisesRegex(RuntimeError, "process identity"):
+                    pc._preserved_activation_state(upgraded_manifest, layout, prior)
+            forbidden_owners.assert_not_called()
+
+    def test_completed_rollback_historical_profile_tampering_is_rejected_before_upgrade_start(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            profile_dir = root / "historical"
+            profile_name = "m0"
+            profile_path = profile_dir / f"{profile_name}.yaml"
+            profile = {
+                "control_plane": {"tunnel_id": "tunnel-existing", "base_url": "https://api.openai.com"},
+                "mcp": {"server_urls": [{"unix_socket": str(pc.HISTORICAL_M0_BRIDGE_SOCKET)}]},
+            }
+            pc._write_json_private(profile_path, profile)
+            identity = self._identity(
+                404,
+                ["/opt/tunnel-client", "run", "--profile-dir", str(profile_dir), "--profile", profile_name],
+            )
+            item = {
+                "pid": 404,
+                "command": pc.shlex.join(identity["argv"]),
+                "profile_dir": str(profile_dir),
+                "profile_name": profile_name,
+                "profile_path": str(profile_path),
+                "profile_sha256": pc._sha256_file(profile_path),
+                "tunnel_id": "tunnel-existing",
+                "process_identity": identity,
+                "expected_socket": str(pc.HISTORICAL_M0_BRIDGE_SOCKET),
+            }
+            self.assertEqual(
+                pc._validate_receipt_tunnel_profile(
+                    item,
+                    expected_socket=pc.HISTORICAL_M0_BRIDGE_SOCKET,
+                    label="completed rollback historical tunnel",
+                )["tunnel_id"],
+                "tunnel-existing",
+            )
+            for key, value in (
+                ("profile_sha256", "0" * 64),
+                ("profile_path", str(root / "other.yaml")),
+                ("profile_name", "other"),
+            ):
+                with self.subTest(key=key):
+                    tampered = {**item, key: value}
+                    with self.assertRaisesRegex(RuntimeError, "profile|changed|incomplete"):
+                        pc._validate_receipt_tunnel_profile(
+                            tampered,
+                            expected_socket=pc.HISTORICAL_M0_BRIDGE_SOCKET,
+                            label="completed rollback historical tunnel",
+                        )
+
+    def test_release_upgrade_retry_accepts_already_stopped_old_component_pids(self):
+        state = {
+            "bridge_pid": 801,
+            "bridge_process_identity": self._identity(801, ["/private/bridge"]),
+            "host_pid": 802,
+            "host_process_identity": self._identity(802, ["/private/host"]),
+            "catdesk_supervisor_pid": 803,
+            "catdesk_supervisor_process_identity": self._identity(803, ["/private/catdesk"]),
+            "sentinel": "preserve-prior-state",
+        }
+        layout = {"bridge_socket": Path("/tmp/nonexistent-bridge.sock")}
+        with patch.object(pc, "_process_identity_matches", return_value=False), patch.object(
+            pc, "_process_is_running", return_value=False
+        ), patch.object(pc, "_stop_verified_local_runtime") as stop:
+            pc._stop_prior_local_runtime_for_release_upgrade(state, layout)
+        retried_state = stop.call_args.args[0]
+        self.assertEqual(retried_state["sentinel"], "preserve-prior-state")
+        for key in (
+            "bridge_pid", "bridge_process_identity", "host_pid", "host_process_identity",
+            "catdesk_supervisor_pid", "catdesk_supervisor_process_identity",
+        ):
+            self.assertNotIn(key, retried_state)
+
+    def test_cross_release_active_tunnel_without_receipt_refuses_before_stopping(self):
+        manifest = self._manifest()
+        upgraded = {**manifest, "release_revision": "b" * 40, "endpoint_generation": 8}
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                upgraded, runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
+            )
+            prior = {
+                "release_revision": manifest["release_revision"],
+                "endpoint_generation": manifest["endpoint_generation"],
+                "tunnel_pid": 717,
+                "tunnel_id": "tunnel-production",
+                "tunnel_process_identity": self._identity(717, ["/opt/tunnel-client", "run"]),
+            }
+            pc._write_json_private(layout["runtime_state"], prior)
+            with patch.object(pc, "validate_installed_release"), patch.object(
+                pc, "production_status", return_value={"local_runtime_ready": False, "tunnel_ready": False}
+            ), patch.object(pc, "_stop_prior_local_runtime_for_release_upgrade") as forbidden_stop:
+                with self.assertRaisesRegex(RuntimeError, "active tunnel.*rollback receipt"):
+                    pc.start_local_runtime(upgraded, layout)
+            forbidden_stop.assert_not_called()
+
+    def test_cross_release_pure_local_prior_without_receipt_is_upgradeable(self):
+        manifest = self._manifest()
+        upgraded = {**manifest, "release_revision": "b" * 40, "endpoint_generation": 8}
+        prior = {
+            "release_revision": manifest["release_revision"],
+            "endpoint_generation": manifest["endpoint_generation"],
+            "bridge_pid": 801,
+            "host_pid": 802,
+            "catdesk_supervisor_pid": 803,
+        }
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                upgraded, runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
+            )
+            self.assertEqual(pc._preserved_activation_state(upgraded, layout, prior), {})
 
     def test_private_json_write_is_atomic_across_write_flush_fsync_replace_and_dir_fsync_failures(self):
         with tempfile.TemporaryDirectory() as raw_root:

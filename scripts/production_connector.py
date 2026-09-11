@@ -2839,6 +2839,110 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
     }
 
 
+_ACTIVE_PRODUCTION_TUNNEL_STATE_KEYS = (
+    "tunnel_pid",
+    "tunnel_id",
+    "tunnel_profile_sha256",
+    "tunnel_started_at",
+    "tunnel_process_identity",
+)
+
+
+def _completed_rollback_upgrade_gate(
+    manifest: dict[str, Any], layout: dict[str, Path], prior: dict[str, Any]
+) -> None:
+    """Permit a new release only after the old production tunnel is provably rolled back."""
+    receipt_path_value = prior.get("activation_rollback_receipt")
+    receipt_hash = prior.get("activation_rollback_receipt_sha256")
+    if not isinstance(receipt_path_value, str) or not isinstance(receipt_hash, str):
+        raise RuntimeError("release upgrade requires a complete rollback receipt pin")
+    canonical_receipt = layout["rollback_receipt"].expanduser().resolve()
+    if Path(receipt_path_value).expanduser().resolve() != canonical_receipt:
+        raise RuntimeError("release upgrade rollback receipt path is not canonical")
+    _validate_private_source(layout["runtime_state"], "prior production runtime state")
+    _validate_private_source(canonical_receipt, "completed rollback receipt")
+    if _sha256_file(canonical_receipt) != receipt_hash:
+        raise RuntimeError("completed rollback receipt hash does not match its runtime pin")
+    receipt = _read_json_object(canonical_receipt)
+    if receipt.get("status") != "rolled_back" or receipt.get("phase") != "completed":
+        raise RuntimeError("release upgrade requires a completed rollback receipt")
+    if any(
+        receipt.get(key) != expected
+        for key, expected in (
+            ("schema_version", 1),
+            ("connector_id", CONNECTOR_ID),
+            ("contract_version", CONTRACT_VERSION),
+        )
+    ):
+        raise RuntimeError("completed rollback receipt is not a production receipt")
+    if any(
+        receipt.get(key) != prior.get(key)
+        for key in ("release_revision", "endpoint_generation")
+    ):
+        raise RuntimeError("completed rollback receipt does not match the prior production runtime")
+    if any(key in prior for key in _ACTIVE_PRODUCTION_TUNNEL_STATE_KEYS):
+        raise RuntimeError("prior production runtime still contains an active tunnel identity")
+
+    restarted = receipt.get("historical_restarted")
+    production = receipt.get("production")
+    if not isinstance(restarted, dict) or not isinstance(production, dict):
+        raise RuntimeError("completed rollback receipt lacks tunnel identities")
+    production_identity = production.get("process_identity")
+    _validate_process_identity_record(production_identity)
+    restarted_pid = restarted.get("pid")
+    restarted_identity = restarted.get("process_identity")
+    if not isinstance(restarted_pid, int) or not isinstance(restarted_identity, dict):
+        raise RuntimeError("completed rollback receipt historical identity is invalid")
+    if (
+        prior.get("rollback_historical_tunnel_pid") != restarted_pid
+        or prior.get("rollback_historical_tunnel_id") != restarted.get("tunnel_id")
+        or prior.get("rollback_historical_tunnel_process_identity") != restarted_identity
+        or prior.get("rollback_completed_at") != receipt.get("rolled_back_at")
+    ):
+        raise RuntimeError("completed rollback receipt is not reflected in the prior production state")
+    if not isinstance(receipt.get("rolled_back_at"), (int, float)) or isinstance(
+        receipt.get("rolled_back_at"), bool
+    ):
+        raise RuntimeError("completed rollback receipt has no completion time")
+
+    historical_state_value = receipt.get("historical_runtime_state")
+    if not isinstance(historical_state_value, str):
+        raise RuntimeError("completed rollback receipt historical runtime state is invalid")
+    historical_state_path = Path(historical_state_value).expanduser()
+    if not historical_state_path.is_absolute():
+        raise RuntimeError("completed rollback receipt historical runtime state path is invalid")
+    historical_state_path = historical_state_path.resolve()
+    _validate_private_source(historical_state_path, "completed rollback historical runtime state")
+    historical_state = _read_json_object(historical_state_path)
+    if any(
+        historical_state.get(state_key) != restarted.get(receipt_key)
+        for state_key, receipt_key in (
+            ("tunnel_pid", "pid"),
+            ("tunnel_id", "tunnel_id"),
+            ("tunnel_profile_sha256", "profile_sha256"),
+            ("tunnel_process_identity", "process_identity"),
+        )
+    ):
+        raise RuntimeError("completed rollback is not reflected in historical runtime state")
+    if not _process_identity_matches(restarted_identity):
+        raise RuntimeError("completed rollback historical tunnel identity is no longer running")
+    tunnel_id = restarted.get("tunnel_id")
+    if not isinstance(tunnel_id, str) or receipt.get("tunnel_id") != tunnel_id:
+        raise RuntimeError("completed rollback receipt historical tunnel id is invalid")
+    if production.get("tunnel_id") != tunnel_id:
+        raise RuntimeError("completed rollback receipt production tunnel id is invalid")
+    _validate_receipt_tunnel_profile(
+        restarted,
+        expected_socket=HISTORICAL_M0_BRIDGE_SOCKET,
+        label="completed rollback historical tunnel",
+    )
+    _require_exact_tunnel_id_owners(
+        tunnel_id, {restarted_pid}, expected_socket=HISTORICAL_M0_BRIDGE_SOCKET
+    )
+    if _process_identity_matches(production_identity):
+        raise RuntimeError("old production tunnel identity is still running")
+
+
 def _preserved_activation_state(
     manifest: dict[str, Any],
     layout: dict[str, Path],
@@ -2848,7 +2952,15 @@ def _preserved_activation_state(
 ) -> dict[str, Any]:
     receipt_path_value = prior.get("activation_rollback_receipt")
     receipt_hash = prior.get("activation_rollback_receipt_sha256")
+    is_release_upgrade = (
+        prior.get("release_revision") != manifest["release_revision"]
+        or prior.get("endpoint_generation") != manifest["endpoint_generation"]
+    )
     if receipt_path_value is None and receipt_hash is None:
+        if is_release_upgrade:
+            if any(key in prior for key in _ACTIVE_PRODUCTION_TUNNEL_STATE_KEYS):
+                raise RuntimeError("release upgrade with an active tunnel requires a completed rollback receipt")
+            return {}
         return {
             key: value for key, value in prior.items() if key.startswith("tunnel_")
         } if tunnel_ready else {}
@@ -2861,6 +2973,9 @@ def _preserved_activation_state(
     if _sha256_file(canonical_receipt) != receipt_hash:
         raise RuntimeError("armed rollback receipt hash does not match its runtime pin")
     receipt = _read_json_object(canonical_receipt)
+    if is_release_upgrade:
+        _completed_rollback_upgrade_gate(manifest, layout, prior)
+        return {}
     if any(
         receipt.get(key) != expected
         for key, expected in (
@@ -2905,6 +3020,13 @@ def start_local_runtime(manifest: dict[str, Any], layout: dict[str, Path]) -> di
     if current["local_runtime_ready"]:
         return current
     prior = _read_json_object(layout["runtime_state"])
+    is_release_upgrade = bool(
+        prior
+        and (
+            prior.get("release_revision") != manifest["release_revision"]
+            or prior.get("endpoint_generation") != manifest["endpoint_generation"]
+        )
+    )
     preserved_activation_state = _preserved_activation_state(
         manifest,
         layout,
@@ -2912,7 +3034,10 @@ def start_local_runtime(manifest: dict[str, Any], layout: dict[str, Path]) -> di
         tunnel_ready=current.get("tunnel_ready") is True,
     )
     if prior:
-        _stop_verified_local_runtime(prior, layout)
+        if is_release_upgrade:
+            _stop_prior_local_runtime_for_release_upgrade(prior, layout)
+        else:
+            _stop_verified_local_runtime(prior, layout)
     if _tcp_ready("127.0.0.1", PRODUCTION_CATDESK_PORT):
         raise RuntimeError("production CatDesk port is occupied by an unverified process")
     if _tcp_ready("127.0.0.1", PRODUCTION_HOST_MCP_PORT):
@@ -3045,7 +3170,9 @@ def start_local_runtime(manifest: dict[str, Any], layout: dict[str, Path]) -> di
         try:
             observed_state = _read_json_object(layout["runtime_state"])
             if "state" in locals() and observed_state == state:
-                if preserved_activation_state:
+                if is_release_upgrade:
+                    _write_json_private(layout["runtime_state"], prior)
+                elif preserved_activation_state:
                     _write_json_private(
                         layout["runtime_state"],
                         {
@@ -3634,6 +3761,30 @@ def _stop_verified_local_runtime(state: dict[str, Any], layout: dict[str, Path])
         if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid():
             raise RuntimeError("refusing to remove unsafe production Bridge socket")
         layout["bridge_socket"].unlink()
+
+
+def _stop_prior_local_runtime_for_release_upgrade(state: dict[str, Any], layout: dict[str, Path]) -> None:
+    """Stop old live components, but allow a retry after a failed new start already stopped them."""
+    live_state = dict(state)
+    for pid_key, identity_key in (
+        ("bridge_pid", "bridge_process_identity"),
+        ("host_pid", "host_process_identity"),
+        ("catdesk_supervisor_pid", "catdesk_supervisor_process_identity"),
+    ):
+        pid = state.get(pid_key)
+        if not isinstance(pid, int):
+            continue
+        identity = state.get(identity_key)
+        if not isinstance(identity, dict) or identity.get("pid") != pid:
+            raise RuntimeError(f"cannot stop prior production runtime without exact {identity_key}")
+        _validate_process_identity_record(identity)
+        if _process_identity_matches(identity):
+            continue
+        if _process_is_running(pid):
+            raise RuntimeError(f"cannot stop prior production runtime because {identity_key} changed")
+        live_state.pop(pid_key, None)
+        live_state.pop(identity_key, None)
+    _stop_verified_local_runtime(live_state, layout)
 
 
 def _materialize_catdesk_runtime(layout: dict[str, Path]) -> None:
