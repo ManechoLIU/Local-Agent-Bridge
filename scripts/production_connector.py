@@ -191,7 +191,10 @@ def production_layout(
     generation = int(manifest["endpoint_generation"])
     release_dir = root / "releases" / revision / f"generation-{generation}"
     secrets_dir = release_dir / "secrets"
-    catdesk_home = release_dir / "catdesk-home"
+    release_catdesk_home = release_dir / "catdesk-home"
+    runtime_generation_dir = root / "runtime-state" / revision / f"generation-{generation}"
+    catdesk_home = runtime_generation_dir / "catdesk-home"
+    host_socket_dir = Path(bridge_socket).parent / f"{revision}-g{generation}"
     tunnel_dir = root / "tunnel"
     return {
         "runtime_root": root,
@@ -200,6 +203,9 @@ def production_layout(
         "bridge_binary": release_dir / "bin" / "local-tool-bridge",
         "catdesk_binary": release_dir / "bin" / "catdesk",
         "catdesk_runner": release_dir / "bin" / "run-catdesk.py",
+        "release_catdesk_config": release_catdesk_home / ".catdesk" / "config.toml",
+        "release_catdesk_backend_key": release_catdesk_home / ".catdesk" / "backend.key",
+        "runtime_generation_dir": runtime_generation_dir,
         "catdesk_home": catdesk_home,
         "catdesk_config": catdesk_home / ".catdesk" / "config.toml",
         "catdesk_backend_key": catdesk_home / ".catdesk" / "backend.key",
@@ -209,10 +215,11 @@ def production_layout(
         "native_host_wrapper": release_dir / "bin" / "native-host-production",
         "host_backend_key": secrets_dir / "host-backend.key",
         "host_attestation_key": secrets_dir / "host-attestation.key",
-        "host_socket": release_dir / "state" / "host.sock",
-        "host_verifier_state": release_dir / "state" / "runtime-verifier-state.json",
-        "host_reentry_state": release_dir / "state" / "runtime-reentry-state.json",
-        "bridge_state_dir": release_dir / "state" / "bridge",
+        "host_socket_dir": host_socket_dir,
+        "host_socket": host_socket_dir / "host.sock",
+        "host_verifier_state": runtime_generation_dir / "host" / "runtime-verifier-state.json",
+        "host_reentry_state": runtime_generation_dir / "host" / "runtime-reentry-state.json",
+        "bridge_state_dir": runtime_generation_dir / "bridge",
         "bridge_socket": Path(bridge_socket),
         "release_tunnel_profile": release_dir / "tunnel" / f"{TUNNEL_PROFILE_NAME}.yaml",
         "tunnel_dir": tunnel_dir,
@@ -222,7 +229,7 @@ def production_layout(
         "runtime_state": root / "runtime.json",
         "rollback_receipt": root / "activation-rollback.json",
         "logs_dir": root / "logs",
-        "catdesk_child_pid": root / "catdesk-child.pid",
+        "catdesk_child_pid": runtime_generation_dir / "catdesk-child.pid",
     }
 
 
@@ -382,8 +389,14 @@ def install_release_bundle(
     try:
         _copy_owned_file(resolved_sources["bridge_binary"], layout["bridge_binary"], 0o700)
         _copy_owned_file(resolved_sources["catdesk_binary"], layout["catdesk_binary"], 0o700)
-        _copy_owned_file(resolved_sources["catdesk_config"], layout["catdesk_config"], 0o600)
-        _copy_owned_file(resolved_sources["catdesk_backend_key"], layout["catdesk_backend_key"], 0o600)
+        _copy_owned_file(
+            resolved_sources["catdesk_config"], layout["release_catdesk_config"], 0o600
+        )
+        _copy_owned_file(
+            resolved_sources["catdesk_backend_key"],
+            layout["release_catdesk_backend_key"],
+            0o600,
+        )
         _copy_owned_file(resolved_sources["host_attestation_key"], layout["host_attestation_key"], 0o600)
         _copy_owned_tree(resolved_sources["host_source_dir"], layout["host_dir"])
         _private_dir(layout["host_backend_key"].parent)
@@ -2474,7 +2487,11 @@ def start_local_runtime(manifest: dict[str, Any], layout: dict[str, Path]) -> di
     if layout["bridge_socket"].exists():
         raise RuntimeError("production Bridge socket exists without a verified runtime owner")
 
+    catdesk_child_pid_was_absent = not layout["catdesk_child_pid"].exists()
     _private_dir(layout["logs_dir"])
+    _materialize_catdesk_runtime(layout)
+    _prepare_private_unix_socket_path(layout["host_socket"])
+    _private_dir(layout["host_verifier_state"].parent)
     _private_dir(layout["bridge_state_dir"])
     slug = _catdesk_slug(layout["catdesk_config"])
     component_env = production_component_env(manifest, layout, catdesk_slug=slug)
@@ -2567,6 +2584,7 @@ def start_local_runtime(manifest: dict[str, Any], layout: dict[str, Path]) -> di
             raise RuntimeError("production local runtime did not satisfy its post-start status contract")
         return result
     except Exception:
+        all_started_processes_stopped = True
         for process, identity, process_group in reversed(started):
             try:
                 if identity is not None:
@@ -2578,7 +2596,17 @@ def start_local_runtime(manifest: dict[str, Any], layout: dict[str, Path]) -> di
                         process.terminate()
                     process.wait(timeout=5)
             except Exception:
+                all_started_processes_stopped = False
+        if all_started_processes_stopped:
+            try:
+                _unlink_owned_runtime_socket(layout["bridge_socket"])
+            except Exception:
                 pass
+            if catdesk_child_pid_was_absent:
+                try:
+                    _unlink_owned_runtime_pid_file(layout["catdesk_child_pid"])
+                except Exception:
+                    pass
         try:
             observed_state = _read_json_object(layout["runtime_state"])
             if "state" in locals() and observed_state == state:
@@ -3111,6 +3139,71 @@ def _stop_verified_local_runtime(state: dict[str, Any], layout: dict[str, Path])
         layout["bridge_socket"].unlink()
 
 
+def _materialize_catdesk_runtime(layout: dict[str, Path]) -> None:
+    runtime_generation_dir = layout["runtime_generation_dir"]
+    _private_dir(runtime_generation_dir.parent.parent)
+    _private_dir(runtime_generation_dir.parent)
+    _private_dir(runtime_generation_dir)
+    for source_key, destination_key in (
+        ("release_catdesk_config", "catdesk_config"),
+        ("release_catdesk_backend_key", "catdesk_backend_key"),
+    ):
+        source = layout[source_key]
+        destination = layout[destination_key]
+        _validate_private_source(source, f"immutable production {source_key}")
+        try:
+            value = source.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as error:
+            raise RuntimeError(f"immutable production {source_key} is not readable UTF-8") from error
+        _write_text_private(destination, value, 0o600)
+        if _sha256_file(destination) != _sha256_file(source):
+            raise RuntimeError(f"materialized production {destination_key} hash mismatch")
+
+
+def _prepare_private_unix_socket_path(path: Path) -> None:
+    path = Path(path).expanduser()
+    if not path.is_absolute():
+        raise RuntimeError("production Host socket path is not absolute")
+    maximum_bytes = 103 if sys.platform == "darwin" else 107
+    if len(os.fsencode(str(path))) > maximum_bytes:
+        raise RuntimeError("production Host socket path exceeds the platform AF_UNIX limit")
+    _private_dir(path.parent)
+
+
+def _unlink_owned_runtime_socket(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISSOCK(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        raise RuntimeError("refusing to remove unsafe production Bridge socket")
+    path.unlink()
+
+
+def _unlink_owned_runtime_pid_file(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        raise RuntimeError("refusing to remove unsafe production CatDesk child PID file")
+    try:
+        pid = int(path.read_text(encoding="utf-8").strip())
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        raise RuntimeError("production CatDesk child PID file is invalid") from error
+    if pid < 1:
+        raise RuntimeError("production CatDesk child PID file is invalid")
+    path.unlink()
+
+
 def _validate_manifest_contract(manifest: dict[str, Any]) -> None:
     _validate_manifest_identity(manifest)
     _validate_runtime_dependencies(manifest)
@@ -3345,7 +3438,7 @@ binary = Path({str(layout['catdesk_binary'])!r})
 home = Path({str(layout['catdesk_home'])!r})
 workspace = Path({str(manifest['workspace'])!r})
 log_path = Path({str(layout['logs_dir'] / 'catdesk.log')!r})
-pid_path = Path({str(layout['runtime_root'] / 'catdesk-child.pid')!r})
+pid_path = Path({str(layout['catdesk_child_pid'])!r})
 log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 master, slave = pty.openpty()
 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 120, 0, 0))

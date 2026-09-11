@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import stat
 import struct
 import subprocess
@@ -315,6 +316,29 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 layout["release_dir"],
                 root / "releases" / REVISION / "generation-7",
             )
+            runtime_generation_dir = root / "runtime-state" / REVISION / "generation-7"
+            self.assertEqual(layout.get("runtime_generation_dir"), runtime_generation_dir)
+            for key in (
+                "catdesk_home",
+                "host_verifier_state",
+                "host_reentry_state",
+                "bridge_state_dir",
+                "catdesk_child_pid",
+            ):
+                self.assertTrue(layout[key].is_relative_to(runtime_generation_dir), key)
+                self.assertFalse(layout[key].is_relative_to(layout["release_dir"]), key)
+            host_socket_dir = socket.parent / f"{REVISION}-g7"
+            self.assertEqual(layout["host_socket_dir"], host_socket_dir)
+            self.assertEqual(layout["host_socket"], host_socket_dir / "host.sock")
+            self.assertFalse(layout["host_socket"].is_relative_to(layout["release_dir"]))
+            self.assertEqual(
+                layout["release_catdesk_config"],
+                layout["release_dir"] / "catdesk-home" / ".catdesk" / "config.toml",
+            )
+            self.assertEqual(
+                layout["release_catdesk_backend_key"],
+                layout["release_dir"] / "catdesk-home" / ".catdesk" / "backend.key",
+            )
             self.assertEqual(layout["bridge_socket"], socket)
             self.assertEqual(
                 layout["tunnel_profile"],
@@ -358,7 +382,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
 
     def test_install_release_bundle_is_private_immutable_and_hash_verified(self):
         manifest = self._manifest()
-        with tempfile.TemporaryDirectory() as raw_root:
+        with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
             root = Path(raw_root)
             sources_root = root / "sources"
             host = sources_root / "host"
@@ -415,10 +439,36 @@ class ProductionConnectorContractTests(unittest.TestCase):
             self.assertTrue(os.access(layout["bridge_binary"], os.X_OK))
             self.assertTrue(os.access(layout["native_host_wrapper"], os.X_OK))
             installed_manifest = json.loads(layout["release_manifest"].read_text(encoding="utf-8"))
+            installed_artifacts = dict(installed_manifest["artifacts_sha256"])
             node = installed_manifest["runtime_dependencies"]["node"]
             self.assertTrue(Path(node["path"]).is_absolute())
             self.assertEqual(node["sha256"], pc._sha256_file(Path(node["path"])))
             self.assertIn(f"exec {node['path']}", layout["native_host_wrapper"].read_text(encoding="utf-8"))
+
+            # Real components may create these files after install. They must
+            # remain outside the immutable release artifact boundary.
+            for path in (
+                layout["catdesk_home"] / ".catdesk" / "binagotchy" / "runtime.json",
+                layout["host_verifier_state"],
+                layout["host_reentry_state"],
+                layout["bridge_state_dir"] / "authority.json",
+                layout["catdesk_child_pid"],
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("runtime-state\n", encoding="utf-8")
+            host_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                layout["host_socket"].parent.mkdir(parents=True, exist_ok=True)
+                host_listener.bind(str(layout["host_socket"]))
+                try:
+                    observed_manifest = pc.validate_installed_release(layout)
+                except RuntimeError as error:
+                    self.fail(f"runtime state dirtied the immutable release: {error}")
+            finally:
+                host_listener.close()
+            self.assertEqual(observed_manifest["artifacts_sha256"], installed_artifacts)
+            for relative, expected_hash in installed_artifacts.items():
+                self.assertEqual(pc._sha256_file(layout["release_dir"] / relative), expected_hash)
 
             with self.assertRaisesRegex(RuntimeError, "immutable|already exists"):
                 pc.install_release_bundle(manifest, layout, sources)
@@ -1822,7 +1872,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
 
     def test_start_local_post_status_failure_cleans_new_processes_and_preserves_verified_tunnel(self):
         manifest = self._manifest()
-        with tempfile.TemporaryDirectory() as raw_root:
+        with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
             root = Path(raw_root)
             layout = pc.production_layout(
                 manifest, runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
@@ -1844,6 +1894,13 @@ class ProductionConnectorContractTests(unittest.TestCase):
             layout["bridge_binary"].parent.mkdir(parents=True)
             layout["bridge_binary"].write_text("bridge", encoding="utf-8")
             layout["bridge_binary"].chmod(0o700)
+            for key, value in (
+                ("release_catdesk_config", "mcpSlug = 'private'\n"),
+                ("release_catdesk_backend_key", "k" * 64),
+            ):
+                layout[key].parent.mkdir(parents=True, exist_ok=True)
+                layout[key].write_text(value, encoding="utf-8")
+                layout[key].chmod(0o600)
             node = root / "node"
             node.write_text("node", encoding="utf-8")
             node.chmod(0o700)
@@ -1853,30 +1910,44 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 self._identity(process.pid, [f"/private/process-{process.pid}"])
                 for process in processes
             ]
-            with patch.object(pc, "validate_installed_release"), patch.object(
-                pc,
-                "production_status",
-                side_effect=[
-                    {"local_runtime_ready": False, "tunnel_ready": True},
-                    {"local_runtime_ready": False, "tunnel_ready": True},
-                ],
-            ), patch.object(pc, "_stop_verified_local_runtime"), patch.object(
-                pc, "_tcp_ready", return_value=False
-            ), patch.object(pc, "_catdesk_slug", return_value="private"), patch.object(
-                pc, "production_component_env", return_value={"host": {}, "bridge": {}}
-            ), patch.object(
-                pc, "_kernel_python_executable", return_value=kernel_python
-            ), patch.object(
-                pc, "_spawn_logged", side_effect=processes
-            ) as spawn, patch.object(
-                pc, "_capture_process_identity", side_effect=identities
-            ) as capture, patch.object(pc, "_wait_for_tcp"), patch.object(
-                pc, "_wait_for_bridge", return_value=sorted(pc.REQUIRED_TOOLS)
-            ), patch.object(
-                pc, "_validate_runtime_dependencies", return_value={"node": {"path": str(node)}}
-            ), patch.object(pc, "_stop_verified_process_identity") as stop:
-                with self.assertRaisesRegex(RuntimeError, "post-start status"):
-                    pc.start_local_runtime(manifest, layout)
+            bridge_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+            def bridge_became_ready(_process, observed_layout):
+                observed_layout["bridge_socket"].parent.mkdir(parents=True, exist_ok=True)
+                bridge_listener.bind(str(observed_layout["bridge_socket"]))
+                observed_layout["bridge_socket"].chmod(0o600)
+                observed_layout["catdesk_child_pid"].parent.mkdir(parents=True, exist_ok=True)
+                observed_layout["catdesk_child_pid"].write_text("904", encoding="utf-8")
+                observed_layout["catdesk_child_pid"].chmod(0o600)
+                return sorted(pc.REQUIRED_TOOLS)
+
+            try:
+                with patch.object(pc, "validate_installed_release"), patch.object(
+                    pc,
+                    "production_status",
+                    side_effect=[
+                        {"local_runtime_ready": False, "tunnel_ready": True},
+                        {"local_runtime_ready": False, "tunnel_ready": True},
+                    ],
+                ), patch.object(pc, "_stop_verified_local_runtime"), patch.object(
+                    pc, "_tcp_ready", return_value=False
+                ), patch.object(pc, "_catdesk_slug", return_value="private"), patch.object(
+                    pc, "production_component_env", return_value={"host": {}, "bridge": {}}
+                ), patch.object(
+                    pc, "_kernel_python_executable", return_value=kernel_python
+                ), patch.object(
+                    pc, "_spawn_logged", side_effect=processes
+                ) as spawn, patch.object(
+                    pc, "_capture_process_identity", side_effect=identities
+                ) as capture, patch.object(pc, "_wait_for_tcp"), patch.object(
+                    pc, "_wait_for_bridge", side_effect=bridge_became_ready
+                ), patch.object(
+                    pc, "_validate_runtime_dependencies", return_value={"node": {"path": str(node)}}
+                ), patch.object(pc, "_stop_verified_process_identity") as stop:
+                    with self.assertRaisesRegex(RuntimeError, "post-start status"):
+                        pc.start_local_runtime(manifest, layout)
+            finally:
+                bridge_listener.close()
             self.assertEqual(stop.call_count, 3)
             self.assertEqual(spawn.call_args_list[0].args[0][0], str(kernel_python))
             self.assertEqual(
@@ -1889,6 +1960,18 @@ class ProductionConnectorContractTests(unittest.TestCase):
             self.assertEqual(state["tunnel_pid"], 717)
             self.assertEqual(state["tunnel_process_identity"], prior["tunnel_process_identity"])
             self.assertNotIn("bridge_pid", state)
+            self.assertFalse(layout["bridge_socket"].exists())
+            self.assertFalse(layout["catdesk_child_pid"].exists())
+            self.assertEqual(
+                layout["catdesk_config"].read_text(encoding="utf-8"),
+                "mcpSlug = 'private'\n",
+            )
+            self.assertEqual(
+                layout["catdesk_backend_key"].read_text(encoding="utf-8"), "k" * 64
+            )
+            host_state_dir = layout["host_verifier_state"].parent
+            self.assertTrue(host_state_dir.is_dir())
+            self.assertEqual(stat.S_IMODE(host_state_dir.stat().st_mode), 0o700)
 
     def test_start_local_preserves_armed_rollback_pin_when_tunnel_health_is_unready(self):
         manifest = self._manifest()
