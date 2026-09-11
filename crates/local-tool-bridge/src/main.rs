@@ -144,6 +144,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (None, None) => {}
         _ => unreachable!("Host backend pair was validated before release fence loading"),
     }
+    let host_receipt_socket = env::var("LAB_HOST_ADAPTER_SOCKET").ok();
+    let runtime_hook_socket = env::var("LAB_RUNTIME_HOST_TOOL_HOOK_SOCKET").ok();
+    match (
+        host_receipt_socket.as_deref(),
+        runtime_hook_socket.as_deref(),
+    ) {
+        (Some(host_socket), runtime_socket) => {
+            ingress = ingress.with_tool_receipt_chain(
+                Path::new(host_socket),
+                runtime_socket.map(Path::new),
+                production_fence
+                    .clone()
+                    .ok_or("tool receipt chain requires the production release fence")?,
+            )?;
+        }
+        (None, Some(_)) => {
+            return Err(
+                "LAB_RUNTIME_HOST_TOOL_HOOK_SOCKET requires LAB_HOST_ADAPTER_SOCKET".into(),
+            );
+        }
+        (None, None) => {}
+    }
     let computer_backend_url = env::var("LAB_COMPUTER_BACKEND_URL").ok();
     let computer_backend_key_file = env::var("LAB_COMPUTER_BACKEND_KEY_FILE").ok();
     match (
@@ -183,11 +205,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = UnixListener::bind(&socket)?;
     set_socket_private(&socket)?;
     eprintln!(
-        "local-tool-bridge ready socket={} backend={} host_backend={} computer_backend={} capability_id={} production_release={} production_generation={}",
+        "local-tool-bridge ready socket={} backend={} host_backend={} computer_backend={} host_receipts={} runtime_hook={} capability_id={} production_release={} production_generation={}",
         socket.display(),
         backend_url,
         host_backend_url.as_deref().unwrap_or("disabled"),
         computer_backend_url.as_deref().unwrap_or("disabled"),
+        host_receipt_socket.as_deref().unwrap_or("disabled"),
+        runtime_hook_socket.as_deref().unwrap_or("disabled"),
         capability_id,
         production_fence
             .as_ref()

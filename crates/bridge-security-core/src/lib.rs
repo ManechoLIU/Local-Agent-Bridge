@@ -74,6 +74,7 @@ pub struct RequestProof {
     pub principal_id: String,
     pub execution_session_id: String,
     pub workspace_id: String,
+    pub bridge_execution_id: String,
     pub request_id: String,
     pub nonce: String,
     pub method: String,
@@ -93,6 +94,10 @@ impl RequestProof {
                 self.execution_session_id.clone(),
             ),
             ("x-lab-workspace-id".into(), self.workspace_id.clone()),
+            (
+                "x-lab-bridge-execution-id".into(),
+                self.bridge_execution_id.clone(),
+            ),
             ("x-lab-request-id".into(), self.request_id.clone()),
             ("x-lab-request-nonce".into(), self.nonce.clone()),
             ("x-lab-body-sha256".into(), self.body_sha256.clone()),
@@ -118,6 +123,7 @@ impl RequestProof {
             principal_id: required("x-lab-principal-id")?,
             execution_session_id: required("x-lab-execution-session-id")?,
             workspace_id: required("x-lab-workspace-id")?,
+            bridge_execution_id: required("x-lab-bridge-execution-id")?,
             request_id: required("x-lab-request-id")?,
             nonce: required("x-lab-request-nonce")?,
             method: observed_method.into(),
@@ -534,8 +540,36 @@ pub fn sign_request(
     tool_name: &str,
     body: &[u8],
 ) -> Result<RequestProof, String> {
+    let mut execution = [0_u8; 24];
+    OsRng.fill_bytes(&mut execution);
+    sign_request_for_execution(
+        issued,
+        context,
+        &format!("be_{}", hex_encode(&execution)),
+        request_id,
+        nonce,
+        method,
+        tool_name,
+        body,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn sign_request_for_execution(
+    issued: &IssuedCapability,
+    context: &ExecutionContext,
+    bridge_execution_id: &str,
+    request_id: &str,
+    nonce: &str,
+    method: &str,
+    tool_name: &str,
+    body: &[u8],
+) -> Result<RequestProof, String> {
     if request_id.trim().is_empty() || nonce.trim().is_empty() {
         return Err("request id and nonce are required".into());
+    }
+    if bridge_execution_id.trim().is_empty() {
+        return Err("Bridge execution id is required".into());
     }
     let body_sha256 = sha256_hex(body);
     if context.capability_id != issued.capability_id {
@@ -546,6 +580,7 @@ pub fn sign_request(
         principal_id: context.principal_id.clone(),
         execution_session_id: context.execution_session_id.clone(),
         workspace_id: context.workspace_id.clone(),
+        bridge_execution_id: bridge_execution_id.to_string(),
         request_id: request_id.to_string(),
         nonce: nonce.to_string(),
         method: method.to_string(),
@@ -591,11 +626,12 @@ fn derive_capability_secret(
 
 fn request_proof_message(proof: &RequestProof) -> Vec<u8> {
     format!(
-        "v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "v2\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         proof.capability_id,
         proof.principal_id,
         proof.execution_session_id,
         proof.workspace_id,
+        proof.bridge_execution_id,
         proof.request_id,
         proof.nonce,
         proof.method,
@@ -1068,4 +1104,76 @@ pub fn run_home_confined_shell(
     process
         .output()
         .map_err(|error| format!("sandboxed shell failed to start: {error}"))
+}
+
+#[cfg(test)]
+mod request_proof_tests {
+    use super::*;
+
+    fn fixture() -> (CapabilityAuthority, IssuedCapability, ExecutionContext) {
+        let context = ExecutionContext {
+            principal_id: "bridge-principal".into(),
+            execution_session_id: "bridge-session".into(),
+            capability_id: "bridge-capability".into(),
+            workspace_id: "bridge-workspace".into(),
+        };
+        let grant = CapabilityGrant {
+            principal_id: context.principal_id.clone(),
+            execution_session_id: context.execution_session_id.clone(),
+            capability_id: context.capability_id.clone(),
+            workspace_id: context.workspace_id.clone(),
+            capabilities: vec![Capability::Shell],
+        };
+        let mut authority = CapabilityAuthority::new_for_test([91; 32]);
+        let issued = authority.issue(grant, 1, 1_000, 1).unwrap();
+        (authority, issued, context)
+    }
+
+    #[test]
+    fn bridge_execution_identity_is_in_headers_and_mac() {
+        let (mut authority, issued, context) = fixture();
+        let body = br#"{"jsonrpc":"2.0"}"#;
+        let proof = sign_request_for_execution(
+            &issued,
+            &context,
+            "hte_machine",
+            "request-1",
+            "nonce-1",
+            "tools/call",
+            "run_command",
+            body,
+        )
+        .unwrap();
+        assert_eq!(
+            proof.to_headers()["x-lab-bridge-execution-id"],
+            "hte_machine"
+        );
+        authority
+            .verify_request(
+                &proof,
+                body,
+                "tools/call",
+                "run_command",
+                Capability::Shell,
+                2,
+            )
+            .unwrap();
+
+        let (mut fresh_authority, _, _) = fixture();
+        let mut substituted = proof;
+        substituted.bridge_execution_id = "hte_caller".into();
+        assert_eq!(
+            fresh_authority
+                .verify_request(
+                    &substituted,
+                    body,
+                    "tools/call",
+                    "run_command",
+                    Capability::Shell,
+                    2
+                )
+                .unwrap_err(),
+            "request MAC mismatch"
+        );
+    }
 }

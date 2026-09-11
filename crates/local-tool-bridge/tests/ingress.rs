@@ -650,7 +650,15 @@ async fn json_backend(
             }
             host_tools
         } else {
-            vec![serde_json::json!({"name":"read","inputSchema":{"type":"object"}})]
+            vec![
+                serde_json::json!({"name":"read","inputSchema":{"type":"object"}}),
+                serde_json::json!({"name":"run_command","inputSchema":{
+                    "type":"object",
+                    "properties":{"command":{"type":"string"}},
+                    "required":["command"],
+                    "additionalProperties":false
+                }}),
+            ]
         };
         return (
             StatusCode::OK,
@@ -719,6 +727,24 @@ async fn computer_tools_are_capability_gated_routed_and_merged_into_tools_list()
         .filter_map(|tool| tool["name"].as_str())
         .collect();
     assert!(names.contains(&"read"));
+    let run_command = list_json["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "run_command")
+        .unwrap();
+    assert_eq!(
+        run_command["inputSchema"]["properties"]["host_invocation_capability"]["type"],
+        "object"
+    );
+    assert_eq!(
+        run_command["inputSchema"]["properties"]["command"]["type"],
+        "string"
+    );
+    assert_eq!(
+        run_command["inputSchema"]["required"],
+        serde_json::json!(["command"])
+    );
     for expected in [
         "computer_session_open",
         "computer_screenshot",
