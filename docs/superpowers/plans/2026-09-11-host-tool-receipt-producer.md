@@ -171,6 +171,8 @@ git commit -m "feat(bridge): gate shell dispatch on Host receipts"
 **Files:**
 - Modify: `experiments/web-host-attestation/attestation.mjs`
 - Modify: `experiments/web-host-attestation/attestation.test.mjs`
+- Modify: `experiments/web-host-attestation/chrome-host/client.mjs`
+- Modify: `experiments/web-host-attestation/chrome-host/client.test.mjs`
 - Modify: `experiments/web-host-attestation/chrome-host/integration.mjs`
 - Modify: `experiments/web-host-attestation/chrome-host/integration.test.mjs`
 - Modify: `experiments/web-host-attestation/chrome-host/runtime-verifier-cli.mjs`
@@ -182,7 +184,7 @@ git commit -m "feat(bridge): gate shell dispatch on Host receipts"
 
 - [ ] **Step 1: Write failing verifier boundary tests**
 
-Use literal Task 1 receipts and the real CLI subprocess. Prove exact schema/profile/MAC, bounded freshness, current extension binding/instance, current-entry conversation and generation, all four request digests, execution/pre-chain IDs, terminal outcome and response digest. Reject unknown keys, old unprofiled receipts, forged or stale MACs, wrong current entry, changed pre/terminal chain, and caller-added Runtime Controller/turn fields.
+Use literal Task 1 receipts and the real CLI subprocess. Prove exact schema/profile/MAC, bounded freshness, current extension binding/instance/load epoch from the same fresh current-entry request, current-entry conversation and generation, all four request digests, execution/pre-chain IDs, terminal outcome and response digest. Reject unknown keys, old unprofiled receipts, forged or stale MACs, wrong current entry, changed pre/terminal chain, and caller-added Runtime Controller/turn fields.
 
 - [ ] **Step 2: Run focused tests and capture RED**
 
@@ -198,7 +200,7 @@ Expected: FAIL because verifier v2 receipt commands do not exist.
 
 - [ ] **Step 3: Implement minimal verifier v2**
 
-Export pure Host receipt authentication helpers from `attestation.mjs`, then expose them through the existing immutable CLI/integration boundary. Reuse the configured private Host key and loaded-extension binding checks. The CLI reads one bounded JSON object and writes one bounded object; it does not accept caller identity as attestation, does not mutate Host journal state, and does not invoke a shell.
+Export pure Host receipt authentication helpers from `attestation.mjs`, then expose them through the existing immutable CLI/integration boundary. Add a backward-compatible client method that returns current entry and extension epoch from the same private Host response while preserving the legacy method shape. Reuse the configured private Host key and loaded-extension binding checks. The CLI reads one bounded JSON object and writes one bounded object; it does not accept caller identity as attestation, does not mutate Host journal state, and does not invoke a shell.
 
 ```json
 {
@@ -217,7 +219,7 @@ Run the Step 2 command plus the complete Task 1 Host suite. Expected: all pass a
 - [ ] **Step 5: Commit Task 3**
 
 ```bash
-git add experiments/web-host-attestation/attestation.mjs experiments/web-host-attestation/attestation.test.mjs experiments/web-host-attestation/chrome-host/integration.mjs experiments/web-host-attestation/chrome-host/integration.test.mjs experiments/web-host-attestation/chrome-host/runtime-verifier-cli.mjs experiments/web-host-attestation/chrome-host/runtime-verifier-cli.test.mjs
+git add experiments/web-host-attestation/attestation.mjs experiments/web-host-attestation/attestation.test.mjs experiments/web-host-attestation/chrome-host/client.mjs experiments/web-host-attestation/chrome-host/client.test.mjs experiments/web-host-attestation/chrome-host/integration.mjs experiments/web-host-attestation/chrome-host/integration.test.mjs experiments/web-host-attestation/chrome-host/runtime-verifier-cli.mjs experiments/web-host-attestation/chrome-host/runtime-verifier-cli.test.mjs
 git commit -m "feat(host): verify tool receipts for Runtime"
 ```
 
