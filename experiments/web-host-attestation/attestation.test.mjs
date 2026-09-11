@@ -8,6 +8,7 @@ import {
   MACHINE_OBSERVATION_SOURCE,
   RuntimeHostVerifier,
   RuntimeInvocationOriginVerifier,
+  ToolInvocationReceiptJournal,
   WebReentryAdapter,
   machineObservationFromFrameTree,
   signHostAttestation,
@@ -1003,4 +1004,133 @@ test("two concurrent Web conversation receipts cannot cross-consume", () => {
   });
   assert.throws(() => verifier.verifyAndConsume(r1, { invocation_id: "invocation-b" }), /invocation/i);
   assert.throws(() => verifier.verifyAndConsume(r2, { conversation_id: CONVERSATION }), /conversation/i);
+});
+
+function receiptMachineContext(overrides = {}) {
+  return {
+    conversation_id: CONVERSATION,
+    browser_target_id: "browser-target-7",
+    top_frame_id: "frame-top-9",
+    loader_id: "loader-doc-11",
+    secure_origin: "https://chatgpt.com",
+    generation_anchor_sha256: "a".repeat(64),
+    extension_binding_sha256: "b".repeat(64),
+    extension_instance_id_sha256: "c".repeat(64),
+    extension_loaded_at_ms: 1_800_000_000_000,
+    ...overrides
+  };
+}
+
+function receiptRequest(overrides = {}) {
+  return {
+    bridge_call_id: "bc_test-call",
+    transport_binding_id: "tb_test-transport",
+    tool_name: "run_command",
+    outer_request_sha256: "d".repeat(64),
+    forwarded_request_sha256: "e".repeat(64),
+    normalized_request_sha256: "f".repeat(64),
+    machine_context: receiptMachineContext(),
+    ...overrides
+  };
+}
+
+test("durable Host receipt journal binds only machine identity and exact request across restart", () => {
+  const time = clock();
+  const statePath = join(mkdtempSync(join(tmpdir(), "lab-tool-receipt-")), "receipts.json");
+  const journal = new ToolInvocationReceiptJournal(SECRET, {
+    clock: time.now,
+    statePath,
+    capabilityTtlMs: 100
+  });
+  const capability = journal.issueCapability({
+    ...receiptRequest(),
+    conversation_id: "caller-forged-conversation",
+    browser_target_id: "caller-forged-target",
+    caller_identity: "not-evidence"
+  });
+  assert.equal(capability.provenance, "lab_host_invocation_capability_v1");
+  assert.equal(capability.conversation_id, CONVERSATION);
+  assert.equal(Object.hasOwn(capability, "caller_identity"), false);
+  assert.equal(Object.hasOwn(capability, "generation_request_ids"), false);
+
+  const restarted = new ToolInvocationReceiptJournal(SECRET, { clock: time.now, statePath, capabilityTtlMs: 100 });
+  assert.throws(
+    () => restarted.consumeCapability({
+      ...receiptRequest({ transport_binding_id: "tb_other" }),
+      capability,
+      host_tool_execution_id: "hte_test-execution"
+    }),
+    /mismatch/i
+  );
+
+  const pre = restarted.consumeCapability({
+    ...receiptRequest(),
+    capability,
+    host_tool_execution_id: "hte_test-execution"
+  });
+  assert.equal(pre.provenance, "lab_host_tool_pre_receipt_v1");
+  assert.throws(
+    () => restarted.consumeCapability({
+      ...receiptRequest(),
+      capability,
+      host_tool_execution_id: "hte_test-execution"
+    }),
+    /replay|mismatch/i
+  );
+
+  assert.throws(
+    () => restarted.terminalize({
+      ...receiptRequest(),
+      pre_receipt: { ...pre, pre_receipt_id: "hpr_wrong" },
+      backend_route: "/v1/tools/run_command",
+      http_status: 200,
+      response_body_sha256: "1".repeat(64),
+      terminal_classification: "SUCCESS"
+    }),
+    /authentication|pre.*mismatch|mismatch.*pre/i
+  );
+  const terminal = restarted.terminalize({
+    ...receiptRequest(),
+    pre_receipt: pre,
+    backend_route: "/v1/tools/run_command",
+    http_status: 200,
+    response_body_sha256: "1".repeat(64),
+    terminal_classification: "SUCCESS",
+    response_body: "must never persist"
+  });
+  assert.equal(terminal.provenance, "lab_host_tool_terminal_receipt_v1");
+  assert.equal(JSON.stringify(restarted.inspectStateForTest()).includes("must never persist"), false);
+});
+
+test("Host receipt journal rejects expiry and every re-observed machine drift", () => {
+  const time = clock();
+  const journal = new ToolInvocationReceiptJournal(SECRET, { clock: time.now, capabilityTtlMs: 10 });
+  const capability = journal.issueCapability(receiptRequest());
+  for (const field of [
+    "conversation_id", "browser_target_id", "top_frame_id", "loader_id", "generation_anchor_sha256",
+    "secure_origin", "extension_binding_sha256", "extension_instance_id_sha256", "extension_loaded_at_ms"
+  ]) {
+    const changedValue = field === "conversation_id"
+      ? "7b9e4158-cc8c-83ea-9763-05a7fd51f597"
+      : field === "secure_origin"
+        ? "https://chatgpt.com:443"
+        : field === "extension_loaded_at_ms"
+          ? 1_800_000_000_001
+          : field.includes("sha256")
+            ? "9".repeat(64)
+            : "changed-" + field;
+    const changed = receiptMachineContext({ [field]: changedValue });
+    assert.throws(
+      () => journal.consumeCapability({
+        ...receiptRequest({ machine_context: changed }), capability, host_tool_execution_id: "hte_" + field
+      }),
+      /mismatch|secure origin/i,
+      field
+    );
+  }
+  time.add(11);
+  assert.throws(
+    () => journal.consumeCapability({ ...receiptRequest(), capability, host_tool_execution_id: "hte_expired" }),
+    /expired/i
+  );
 });

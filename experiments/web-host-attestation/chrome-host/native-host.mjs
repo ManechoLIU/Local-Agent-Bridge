@@ -28,6 +28,7 @@ import { BROWSER_MACHINE_COMMAND_TIMEOUT_MS } from "./extension/timeout-budget.j
 const defaultRoot = join(homedir(), ".local-agent-bridge", "web-host");
 const socketPath = process.env.LAB_HOST_ADAPTER_SOCKET || join(defaultRoot, "host.sock");
 const keyPath = process.env.LAB_HOST_ATTESTATION_KEY_FILE || join(defaultRoot, "attestation.key");
+const receiptStatePath = process.env.LAB_HOST_TOOL_RECEIPT_STATE_FILE || join(defaultRoot, "tool-receipts.json");
 const bindingPath = String(process.env.LAB_HOST_EXTENSION_BINDING_FILE || "").trim();
 const EXTENSION_ID_PATTERN = /^[a-p]{32}$/;
 const EXTENSION_INSTANCE_ID_PATTERN = /^ei_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -472,6 +473,7 @@ let liveValidationState = null;
 
 const handleRuntimeRequest = createNativeHostHandler({
   secret: secret,
+  receiptStatePath: receiptStatePath,
   sendBrowserCommand: sendBrowserCommand,
   getLiveValidation: function () { return liveValidationState; },
   recordLiveValidation: function (record) {

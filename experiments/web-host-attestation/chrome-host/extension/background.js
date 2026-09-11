@@ -102,7 +102,7 @@ async function withDebugger(target, callback) {
 }
 
 async function discoverCurrentEntryContext() {
-  const candidate = currentEntryRegistry.resolveCurrent();
+  const candidate = await currentEntryRegistry.resolveCurrent();
   if (!candidate) {
     throw new Error("HOST_CURRENT_ENTRY_UNAVAILABLE: no active ChatGPT generation");
   }
@@ -114,7 +114,7 @@ async function discoverCurrentEntryContext() {
       observedAtMs: Date.now()
     });
   });
-  if (!currentEntryRegistry.isStillCurrent(candidate)) {
+  if (!await currentEntryRegistry.isStillCurrent(candidate)) {
     throw new Error("HOST_CURRENT_ENTRY_UNAVAILABLE: generation ended during machine observation");
   }
   return Object.freeze({
@@ -125,6 +125,7 @@ async function discoverCurrentEntryContext() {
     top_frame_id: observation.top_frame_id,
     loader_id: observation.loader_id,
     secure_origin: observation.secure_origin,
+    generation_anchor_sha256: candidate.generation_anchor_sha256,
     observed_at_ms: observation.observed_at_ms
   });
 }
@@ -181,7 +182,7 @@ startupRecovery.then(function (results) {
 
 async function handleCommand(message) {
   const op = String(message && message.op || "");
-  if (op === "discover_current_entry") {
+  if (op === "discover_current_entry" || op === "tool_receipt_issue" || op === "tool_receipt_consume") {
     return await submitTransactions.run(async function () {
       return { current_entry_context: await discoverCurrentEntryContext() };
     });

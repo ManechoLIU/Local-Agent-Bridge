@@ -18,6 +18,12 @@ function validTabId(value) {
   return Number.isInteger(number) && number >= 0 ? number : null;
 }
 
+async function generationAnchorSha256(requestIds) {
+  const bytes = new TextEncoder().encode(JSON.stringify([...requestIds].sort()));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 export function isChatGptGenerationRequest(details) {
   if (!details || String(details.method || "").toUpperCase() !== "POST") return false;
   const tabId = validTabId(details.tabId);
@@ -52,7 +58,7 @@ export function createCurrentEntryRegistry({ clock = Date.now, maxAgeMs = 30 * 6
       return requestId ? active.delete(requestId) : false;
     },
 
-    resolveCurrent() {
+    async resolveCurrent() {
       const now = Number(clock());
       prune(now);
       const byTab = new Map();
@@ -65,16 +71,16 @@ export function createCurrentEntryRegistry({ clock = Date.now, maxAgeMs = 30 * 6
       const [[tabId, requestIds]] = byTab.entries();
       return Object.freeze({
         tab_id: tabId,
-        generation_request_ids: Object.freeze([...requestIds].sort()),
+        generation_anchor_sha256: await generationAnchorSha256(requestIds),
         observed_at_ms: now
       });
     },
 
-    isStillCurrent(candidate) {
-      if (!candidate || !Array.isArray(candidate.generation_request_ids)) return false;
-      const current = this.resolveCurrent();
+    async isStillCurrent(candidate) {
+      if (!candidate || typeof candidate.generation_anchor_sha256 !== "string") return false;
+      const current = await this.resolveCurrent();
       if (!current || current.tab_id !== candidate.tab_id) return false;
-      return candidate.generation_request_ids.some((id) => current.generation_request_ids.includes(id));
+      return candidate.generation_anchor_sha256 === current.generation_anchor_sha256;
     }
   });
 }

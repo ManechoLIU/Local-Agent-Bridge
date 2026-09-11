@@ -153,7 +153,8 @@ test("real native Host process bridges Unix socket to Native Messaging and signs
       LAB_EXTENSION_ORIGIN: "chrome-extension://ikidefdlcddfomimpckflbajjccnmfna/",
       LAB_HOST_ATTESTATION_KEY_FILE: keyPath,
       LAB_HOST_ADAPTER_SOCKET: socketPath,
-      LAB_HOST_EXTENSION_BINDING_FILE: bindingPath
+      LAB_HOST_EXTENSION_BINDING_FILE: bindingPath,
+      LAB_HOST_TOOL_RECEIPT_STATE_FILE: join(root, "tool-receipts.json")
     }),
     stdio: ["pipe", "pipe", "pipe"]
   });
@@ -207,6 +208,26 @@ test("real native Host process bridges Unix socket to Native Messaging and signs
               conversation_id: CONVERSATION,
               observed_at_ms: Date.now(),
               source: "browser_cdp_page_frame_tree_v1"
+            }
+          }
+        }));
+        continue;
+      }
+      if (command.op === "tool_receipt_issue" || command.op === "tool_receipt_consume") {
+        child.stdin.write(encodeNativeMessage({
+          request_id: command.request_id,
+          ok: true,
+          result: {
+            current_entry_context: {
+              entry_scope: "runtime_invocation",
+              machine_source: "host_invocation_context_v1",
+              conversation_id: CONVERSATION,
+              browser_target_id: "browser-target-process",
+              top_frame_id: "top-frame-process",
+              loader_id: "loader-process",
+              secure_origin: "https://chatgpt.com",
+              generation_anchor_sha256: "c".repeat(64),
+              observed_at_ms: Date.now()
             }
           }
         }));
@@ -292,6 +313,34 @@ test("real native Host process bridges Unix socket to Native Messaging and signs
   assert.equal(verified.browser_target_id, "browser-target-process");
   assert.equal(verified.top_frame_id, "top-frame-process");
   assert.equal(verified.loader_id, "loader-process");
+
+  const receiptRequest = {
+    bridge_call_id: "bc_process",
+    transport_binding_id: "tb_process",
+    tool_name: "run_command",
+    outer_request_sha256: "d".repeat(64),
+    forwarded_request_sha256: "e".repeat(64),
+    normalized_request_sha256: "f".repeat(64)
+  };
+  const issued = await requestNativeHost(socketPath, {
+    op: "tool_receipt_issue", ...receiptRequest
+  }, { timeoutMs: 3000 });
+  assert.equal(issued.capability.provenance, "lab_host_invocation_capability_v1");
+  const consumed = await requestNativeHost(socketPath, {
+    op: "tool_receipt_consume", ...receiptRequest,
+    capability: issued.capability,
+    host_tool_execution_id: "hte_process"
+  }, { timeoutMs: 3000 });
+  assert.equal(consumed.pre_receipt.provenance, "lab_host_tool_pre_receipt_v1");
+  const terminal = await requestNativeHost(socketPath, {
+    op: "tool_receipt_terminal", ...receiptRequest,
+    pre_receipt: consumed.pre_receipt,
+    backend_route: "/v1/tools/run_command",
+    http_status: 200,
+    response_body_sha256: "1".repeat(64),
+    terminal_classification: "SUCCESS"
+  }, { timeoutMs: 3000 });
+  assert.equal(terminal.terminal_receipt.provenance, "lab_host_tool_terminal_receipt_v1");
 
   const submit = await requestNativeHost(socketPath, {
     op: "submit_continuation",

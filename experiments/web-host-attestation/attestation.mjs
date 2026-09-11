@@ -1,5 +1,8 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync,
+  readFileSync, renameSync, unlinkSync, writeFileSync
+} from "node:fs";
 import { dirname, join } from "node:path";
 
 export const ATTESTATION_PROVENANCE = "browser_host_machine_attested_v1";
@@ -521,21 +524,238 @@ export class RuntimeInvocationOriginVerifier {
 }
 
 
+function privateOwnerMatches(stat) {
+  return typeof process.getuid !== "function" || stat.uid === process.getuid();
+}
+
+function assertPrivateDirectory(path) {
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  const stat = lstatSync(path);
+  if (!stat.isDirectory() || stat.isSymbolicLink() || !privateOwnerMatches(stat) || (stat.mode & 0o077) !== 0) {
+    throw new Error("private state directory is unsafe");
+  }
+}
+
+function assertPrivateStateFile(path) {
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink() || !privateOwnerMatches(stat) || (stat.mode & 0o077) !== 0) {
+    throw new Error("private state file is unsafe");
+  }
+}
+
 function savePrivateState(path, value) {
   if (!path) return;
   const dir = dirname(path);
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  chmodSync(dir, 0o700);
+  assertPrivateDirectory(dir);
+  if (existsSync(path)) assertPrivateStateFile(path);
   const temp = join(dir, `.${randomUUID()}.tmp`);
-  writeFileSync(temp, JSON.stringify(value), { mode: 0o600, flag: "wx" });
-  chmodSync(temp, 0o600);
-  renameSync(temp, path);
-  chmodSync(path, 0o600);
+  let fd = null;
+  try {
+    fd = openSync(temp, "wx", 0o600);
+    writeFileSync(fd, JSON.stringify(value));
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    renameSync(temp, path);
+    chmodSync(path, 0o600);
+    const dirFd = openSync(dir, "r");
+    try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+  } finally {
+    if (fd != null) closeSync(fd);
+    if (existsSync(temp)) {
+      try { unlinkSync(temp); } catch {}
+    }
+  }
 }
 
 function loadPrivateState(path) {
   if (!path || !existsSync(path)) return null;
-  return JSON.parse(readFileSync(path, "utf8"));
+  assertPrivateDirectory(dirname(path));
+  assertPrivateStateFile(path);
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    throw new Error("private state file is invalid");
+  }
+}
+
+function digest(value, name) {
+  const text = nonEmpty(value, name);
+  if (!/^[0-9a-f]{64}$/.test(text)) throw new Error(`${name} must be a SHA-256 hex digest`);
+  return text;
+}
+
+function receiptText(value, name, prefix) {
+  const text = nonEmpty(value, name);
+  if (prefix && !text.startsWith(prefix)) throw new Error(`${name} has an invalid prefix`);
+  return text;
+}
+
+function normalizeReceiptMachineContext(input) {
+  const context = {
+    conversation_id: nonEmpty(input?.conversation_id, "machine_context.conversation_id"),
+    browser_target_id: nonEmpty(input?.browser_target_id, "machine_context.browser_target_id"),
+    top_frame_id: nonEmpty(input?.top_frame_id, "machine_context.top_frame_id"),
+    loader_id: nonEmpty(input?.loader_id, "machine_context.loader_id"),
+    secure_origin: nonEmpty(input?.secure_origin, "machine_context.secure_origin"),
+    generation_anchor_sha256: digest(input?.generation_anchor_sha256, "machine_context.generation_anchor_sha256"),
+    extension_binding_sha256: digest(input?.extension_binding_sha256, "machine_context.extension_binding_sha256"),
+    extension_instance_id_sha256: digest(input?.extension_instance_id_sha256, "machine_context.extension_instance_id_sha256"),
+    extension_loaded_at_ms: positiveInteger(input?.extension_loaded_at_ms, "machine_context.extension_loaded_at_ms")
+  };
+  if (context.secure_origin !== "https://chatgpt.com") throw new Error("machine_context secure origin is invalid");
+  if (!/^[0-9a-f-]{20,80}$/i.test(context.conversation_id)) throw new Error("machine_context conversation is invalid");
+  return context;
+}
+
+function normalizeReceiptBinding(input) {
+  return {
+    bridge_call_id: receiptText(input?.bridge_call_id, "bridge_call_id", "bc_"),
+    transport_binding_id: receiptText(input?.transport_binding_id, "transport_binding_id", "tb_"),
+    tool_name: receiptText(input?.tool_name, "tool_name"),
+    outer_request_sha256: digest(input?.outer_request_sha256, "outer_request_sha256"),
+    forwarded_request_sha256: digest(input?.forwarded_request_sha256, "forwarded_request_sha256"),
+    normalized_request_sha256: digest(input?.normalized_request_sha256, "normalized_request_sha256"),
+    ...normalizeReceiptMachineContext(input?.machine_context)
+  };
+}
+
+function bindingFromSignedReceipt(receipt) {
+  return normalizeReceiptBinding({ ...receipt, machine_context: receipt });
+}
+
+function sameReceiptBinding(left, right) {
+  return Object.keys(left).every((key) => left[key] === right[key]);
+}
+
+function signedReceipt(secret, value) {
+  return Object.freeze({ ...value, host_mac_sha256: hmac(secret, value) });
+}
+
+function authenticateReceipt(secret, receipt, provenance) {
+  const unsigned = { ...(receipt || {}) };
+  const mac = nonEmpty(unsigned.host_mac_sha256, "host_mac_sha256");
+  delete unsigned.host_mac_sha256;
+  if (unsigned.provenance !== provenance || !secureEqualHex(mac, hmac(secret, unsigned))) {
+    throw new Error("Host receipt authentication failed");
+  }
+  return Object.freeze({ ...unsigned, host_mac_sha256: mac });
+}
+
+export class ToolInvocationReceiptJournal {
+  constructor(secret, { clock = Date.now, capabilityTtlMs = 15_000, statePath = null } = {}) {
+    if (!secret || Buffer.byteLength(secret) < 32) throw new Error("receipt journal secret must be at least 32 bytes");
+    this.secret = secret;
+    this.clock = clock;
+    this.capabilityTtlMs = positiveInteger(capabilityTtlMs, "capabilityTtlMs");
+    this.statePath = statePath;
+    const persisted = loadPrivateState(statePath);
+    if (persisted && persisted.schema_version !== 1) throw new Error("receipt journal state schema is unsupported");
+    this.records = new Map(Array.isArray(persisted?.records) ? persisted.records : []);
+  }
+
+  #persist() {
+    savePrivateState(this.statePath, { schema_version: 1, records: [...this.records.entries()] });
+  }
+
+  issueCapability(input) {
+    const binding = normalizeReceiptBinding(input);
+    const issuedAt = nowMs(this.clock);
+    const capability = signedReceipt(this.secret, {
+      schema_version: 1,
+      provenance: "lab_host_invocation_capability_v1",
+      capability_id: `hic_${randomUUID()}`,
+      ...binding,
+      issued_at_unix_ms: issuedAt,
+      expires_at_unix_ms: issuedAt + this.capabilityTtlMs
+    });
+    this.records.set(capability.capability_id, { state: "ISSUED", binding, capability, pre: null, terminal: null });
+    this.#persist();
+    return structuredClone(capability);
+  }
+
+  consumeCapability(input) {
+    const capability = authenticateReceipt(this.secret, input?.capability, "lab_host_invocation_capability_v1");
+    const record = this.records.get(receiptText(capability.capability_id, "capability_id", "hic_"));
+    if (!record) throw new Error("capability replay or unknown capability");
+    if (record.state !== "ISSUED") throw new Error("capability replayed");
+    const binding = normalizeReceiptBinding(input);
+    if (!sameReceiptBinding(record.binding, binding) ||
+        !sameReceiptBinding(bindingFromSignedReceipt(capability), binding)) {
+      throw new Error("capability request or machine context mismatch");
+    }
+    const now = nowMs(this.clock);
+    if (now > capability.expires_at_unix_ms) {
+      record.state = "EXPIRED";
+      this.#persist();
+      throw new Error("capability expired");
+    }
+    const executionId = receiptText(input?.host_tool_execution_id, "host_tool_execution_id", "hte_");
+    const pre = signedReceipt(this.secret, {
+      schema_version: 1,
+      provenance: "lab_host_tool_pre_receipt_v1",
+      pre_receipt_id: `hpr_${randomUUID()}`,
+      capability_id: capability.capability_id,
+      host_tool_execution_id: executionId,
+      ...binding,
+      pre_nonce: randomBytes(24).toString("hex"),
+      issued_at_unix_ms: now,
+      host_epoch_binding_sha256: sha256Text(`${binding.extension_binding_sha256}:${binding.extension_instance_id_sha256}:${binding.extension_loaded_at_ms}`)
+    });
+    record.state = "HOST_VALIDATED_IN_FLIGHT";
+    record.pre = pre;
+    record.pre_receipt_sha256 = sha256Text(canonicalJson(pre));
+    this.#persist();
+    return structuredClone(pre);
+  }
+
+  terminalize(input) {
+    const pre = authenticateReceipt(this.secret, input?.pre_receipt, "lab_host_tool_pre_receipt_v1");
+    const record = this.records.get(receiptText(pre.capability_id, "pre_receipt.capability_id", "hic_"));
+    if (!record || record.state !== "HOST_VALIDATED_IN_FLIGHT" || !record.pre) {
+      throw new Error("pre receipt replay or mismatch");
+    }
+    if (record.pre.pre_receipt_id !== pre.pre_receipt_id ||
+        record.pre_receipt_sha256 !== sha256Text(canonicalJson(pre))) {
+      throw new Error("pre receipt mismatch");
+    }
+    const binding = normalizeReceiptBinding(input);
+    if (!sameReceiptBinding(record.binding, binding) || pre.host_tool_execution_id !== record.pre.host_tool_execution_id) {
+      throw new Error("terminal request mismatch");
+    }
+    const backendRoute = receiptText(input?.backend_route, "backend_route");
+    if (!backendRoute.startsWith("/")) throw new Error("backend_route must be an absolute path");
+    const httpStatus = Number(input?.http_status);
+    if (!Number.isSafeInteger(httpStatus) || httpStatus < 100 || httpStatus > 599) throw new Error("http_status is invalid");
+    const responseBodySha256 = digest(input?.response_body_sha256, "response_body_sha256");
+    const classification = receiptText(input?.terminal_classification, "terminal_classification");
+    record.state = "TERMINAL_PENDING";
+    this.#persist();
+    const terminal = signedReceipt(this.secret, {
+      schema_version: 1,
+      provenance: "lab_host_tool_terminal_receipt_v1",
+      terminal_receipt_id: `htr_${randomUUID()}`,
+      pre_receipt_id: pre.pre_receipt_id,
+      pre_receipt_sha256: record.pre_receipt_sha256,
+      capability_id: pre.capability_id,
+      host_tool_execution_id: pre.host_tool_execution_id,
+      ...binding,
+      backend_route: backendRoute,
+      http_status: httpStatus,
+      response_body_sha256: responseBodySha256,
+      terminal_classification: classification,
+      issued_at_unix_ms: nowMs(this.clock),
+      host_epoch_binding_sha256: pre.host_epoch_binding_sha256
+    });
+    record.state = "TERMINAL";
+    record.terminal = terminal;
+    this.#persist();
+    return structuredClone(terminal);
+  }
+
+  inspectStateForTest() {
+    return structuredClone({ schema_version: 1, records: [...this.records.entries()] });
+  }
 }
 
 export class RuntimeHostVerifier {

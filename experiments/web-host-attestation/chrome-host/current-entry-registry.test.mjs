@@ -22,41 +22,45 @@ test("registry recognizes only ChatGPT generation requests", () => {
   assert.equal(isChatGptGenerationRequest(req("r5", 7, "https://example.com/backend-api/f/conversation")), false);
 });
 
-test("unique active generation resolves exact tab and completion clears it", () => {
+test("unique active generation resolves exact tab and opaque generation anchor", async () => {
   const time = clock();
   const registry = createCurrentEntryRegistry({ clock: time.now });
   assert.equal(registry.observeStart(req("r1", 11)), true);
-  const candidate = registry.resolveCurrent();
+  const candidate = await registry.resolveCurrent();
   assert.equal(candidate.tab_id, 11);
-  assert.deepEqual(candidate.generation_request_ids, ["r1"]);
-  assert.equal(registry.isStillCurrent(candidate), true);
+  assert.match(candidate.generation_anchor_sha256, /^[0-9a-f]{64}$/);
+  assert.equal(Object.hasOwn(candidate, "generation_request_ids"), false);
+  assert.equal(await registry.isStillCurrent(candidate), true);
   registry.observeFinish({ requestId: "r1" });
-  assert.equal(registry.resolveCurrent(), null);
-  assert.equal(registry.isStillCurrent(candidate), false);
+  assert.equal(await registry.resolveCurrent(), null);
+  assert.equal(await registry.isStillCurrent(candidate), false);
 });
 
-test("multiple requests in same tab remain one current entry", () => {
+test("multiple requests in same tab produce a sorted stable generation anchor", async () => {
   const registry = createCurrentEntryRegistry();
   registry.observeStart(req("r1", 9));
   registry.observeStart(req("r2", 9, "https://chatgpt.com/backend-api/conversation"));
-  const candidate = registry.resolveCurrent();
+  const candidate = await registry.resolveCurrent();
   assert.equal(candidate.tab_id, 9);
-  assert.deepEqual(candidate.generation_request_ids, ["r1", "r2"]);
+  const reordered = createCurrentEntryRegistry();
+  reordered.observeStart(req("r2", 9, "https://chatgpt.com/backend-api/conversation"));
+  reordered.observeStart(req("r1", 9));
+  assert.equal(candidate.generation_anchor_sha256, (await reordered.resolveCurrent()).generation_anchor_sha256);
 });
 
-test("concurrent generations in different tabs fail closed", () => {
+test("concurrent generations in different tabs fail closed", async () => {
   const registry = createCurrentEntryRegistry();
   registry.observeStart(req("r1", 9));
   registry.observeStart(req("r2", 10));
-  assert.throws(() => registry.resolveCurrent(), /AMBIGUOUS/);
+  await assert.rejects(registry.resolveCurrent(), /AMBIGUOUS/);
 });
 
-test("stale unfinished request is pruned instead of becoming current entry", () => {
+test("stale unfinished request is pruned instead of becoming current entry", async () => {
   const time = clock();
   const registry = createCurrentEntryRegistry({ clock: time.now, maxAgeMs: 1000 });
   registry.observeStart(req("r1", 9));
   time.add(1001);
-  assert.equal(registry.resolveCurrent(), null);
+  assert.equal(await registry.resolveCurrent(), null);
 });
 
 import { selectCurrentEntryTarget } from "./extension/current-entry-registry.js";

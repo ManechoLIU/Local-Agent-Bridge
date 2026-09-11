@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   signCurrentEntryEvidence,
   signHostAttestation,
+  ToolInvocationReceiptJournal,
   validateMachineObservation
 } from "../attestation.mjs";
 
@@ -165,6 +166,10 @@ export function createNativeHostHandler(options) {
   const getLiveValidation = options && options.getLiveValidation || function () { return null; };
   const recordLiveValidation = options && options.recordLiveValidation || function () {};
   const requireExtensionReady = options && options.requireExtensionReady || null;
+  const receiptJournal = options && options.receiptJournal || new ToolInvocationReceiptJournal(secret, {
+    clock: clock,
+    statePath: options && options.receiptStatePath || null
+  });
   if (!secret || Buffer.byteLength(secret) < 32) {
     throw new Error("Host attestation key must be at least 32 bytes");
   }
@@ -173,6 +178,29 @@ export function createNativeHostHandler(options) {
   }
   if (requireExtensionReady != null && typeof requireExtensionReady !== "function") {
     throw new Error("requireExtensionReady must be a function");
+  }
+
+  function receiptInput(request, machineContext, epoch) {
+    if (!epoch) throw new Error("HOST_EXTENSION_NOT_READY: receipt operations require a loaded extension epoch");
+    return {
+      bridge_call_id: request.bridge_call_id,
+      transport_binding_id: request.transport_binding_id,
+      tool_name: request.tool_name,
+      outer_request_sha256: request.outer_request_sha256,
+      forwarded_request_sha256: request.forwarded_request_sha256,
+      normalized_request_sha256: request.normalized_request_sha256,
+      machine_context: {
+        conversation_id: machineContext.conversation_id,
+        browser_target_id: machineContext.browser_target_id,
+        top_frame_id: machineContext.top_frame_id,
+        loader_id: machineContext.loader_id,
+        secure_origin: machineContext.secure_origin,
+        generation_anchor_sha256: machineContext.generation_anchor_sha256,
+        extension_binding_sha256: epoch.binding_sha256,
+        extension_instance_id_sha256: epoch.instance_id_sha256,
+        extension_loaded_at_ms: epoch.loaded_at_ms
+      }
+    };
   }
 
   async function browser(op, fields) {
@@ -214,7 +242,7 @@ export function createNativeHostHandler(options) {
       }
       const targetGeneration = positiveInteger(request.target_generation, "target_generation");
       const ownershipGeneration = positiveInteger(request.ownership_generation, "ownership_generation");
-      const browserResult = await browser("discover_current_entry", {});
+      const browserResult = await browser(op, {});
       const machineContext = browserResult && browserResult.current_entry_context;
       if (!machineContext) {
         throw new Error("HOST_CURRENT_ENTRY_UNAVAILABLE: trusted Host invocation context unavailable");
@@ -226,6 +254,55 @@ export function createNativeHostHandler(options) {
           targetGeneration: targetGeneration,
           ownershipGeneration: ownershipGeneration,
           clock: clock
+        }),
+        ...epochFields
+      };
+    }
+
+    if (op === "tool_receipt_issue" || op === "tool_receipt_consume") {
+      if (Object.prototype.hasOwnProperty.call(request, "machine_context") ||
+          Object.prototype.hasOwnProperty.call(request, "conversation_id") ||
+          Object.prototype.hasOwnProperty.call(request, "browser_target_id")) {
+        throw new Error("tool receipt operations do not accept caller machine identity");
+      }
+      const browserResult = await browser(op, {});
+      const machineContext = browserResult && browserResult.current_entry_context;
+      if (!machineContext) throw new Error("HOST_CURRENT_ENTRY_UNAVAILABLE: trusted Host invocation context unavailable");
+      const input = receiptInput(request, machineContext, epochReceipt);
+      if (op === "tool_receipt_issue") {
+        return { capability: receiptJournal.issueCapability(input), ...epochFields };
+      }
+      return {
+        pre_receipt: receiptJournal.consumeCapability({
+          ...input,
+          capability: request.capability,
+          host_tool_execution_id: request.host_tool_execution_id
+        }),
+        ...epochFields
+      };
+    }
+
+    if (op === "tool_receipt_terminal") {
+      const pre = request.pre_receipt;
+      if (!pre || typeof pre !== "object" || Array.isArray(pre)) {
+        throw new Error("pre_receipt is required");
+      }
+      const input = receiptInput(request, {
+        conversation_id: pre.conversation_id,
+        browser_target_id: pre.browser_target_id,
+        top_frame_id: pre.top_frame_id,
+        loader_id: pre.loader_id,
+        secure_origin: pre.secure_origin,
+        generation_anchor_sha256: pre.generation_anchor_sha256
+      }, epochReceipt);
+      return {
+        terminal_receipt: receiptJournal.terminalize({
+          ...input,
+          pre_receipt: pre,
+          backend_route: request.backend_route,
+          http_status: request.http_status,
+          response_body_sha256: request.response_body_sha256,
+          terminal_classification: request.terminal_classification
         }),
         ...epochFields
       };
