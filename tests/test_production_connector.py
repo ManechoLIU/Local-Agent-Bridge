@@ -439,6 +439,10 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 str(layout["runtime_hook_socket"]),
             )
             self.assertEqual(
+                env["bridge"]["LAB_HOST_ADAPTER_SOCKET"],
+                str(layout["host_socket"]),
+            )
+            self.assertEqual(
                 env["bridge"]["LAB_BRIDGE_STATE_DIR"],
                 str(layout["bridge_state_dir"]),
             )

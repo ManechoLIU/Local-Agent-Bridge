@@ -365,6 +365,7 @@ def production_component_env(
         ),
         "LAB_HOST_BACKEND_URL": f"http://127.0.0.1:{PRODUCTION_HOST_MCP_PORT}/mcp",
         "LAB_HOST_BACKEND_KEY_FILE": str(layout["host_backend_key"]),
+        "LAB_HOST_ADAPTER_SOCKET": str(layout["host_socket"]),
         "LAB_RUNTIME_HOST_TOOL_HOOK_SOCKET": str(layout["runtime_hook_socket"]),
     }
     return {"host": host, "bridge": bridge}
