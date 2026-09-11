@@ -89,29 +89,32 @@ export function createChromeHostDriver(options) {
       throw new Error("Host adapter extension epoch does not match current binding");
     }
   }
+
+  async function discoverCurrentEntryWithEpoch(input) {
+    const result = await requestNativeHost(socketPath, {
+      op: "discover_current_entry",
+      target_generation: Number(input && input.target_generation),
+      ownership_generation: Number(input && input.ownership_generation)
+    }, { timeoutMs: timeoutMs });
+    requireExpectedExtensionEpoch(result);
+    return Object.freeze({
+      current_entry: result.current_entry,
+      extension_epoch: Object.freeze({
+        binding_sha256: result.extension_epoch.binding_sha256,
+        instance_id_sha256: result.extension_epoch.instance_id_sha256,
+        loaded_at_ms: result.extension_epoch.loaded_at_ms
+      })
+    });
+  }
+
   return Object.freeze({
     interface_version: 1,
 
     async discoverCurrentEntry(input) {
-      return (await this.discoverCurrentEntryWithEpoch(input)).current_entry;
+      return (await discoverCurrentEntryWithEpoch(input)).current_entry;
     },
 
-    async discoverCurrentEntryWithEpoch(input) {
-      const result = await requestNativeHost(socketPath, {
-        op: "discover_current_entry",
-        target_generation: Number(input && input.target_generation),
-        ownership_generation: Number(input && input.ownership_generation)
-      }, { timeoutMs: timeoutMs });
-      requireExpectedExtensionEpoch(result);
-      return Object.freeze({
-        current_entry: result.current_entry,
-        extension_epoch: Object.freeze({
-          binding_sha256: result.extension_epoch.binding_sha256,
-          instance_id_sha256: result.extension_epoch.instance_id_sha256,
-          loaded_at_ms: result.extension_epoch.loaded_at_ms
-        })
-      });
-    },
+    discoverCurrentEntryWithEpoch,
 
     async attest(challenge) {
       const result = await requestNativeHost(socketPath, {

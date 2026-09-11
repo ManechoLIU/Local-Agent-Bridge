@@ -114,3 +114,25 @@ test("driver accepts only the current native Host extension binding epoch", asyn
     { current_entry: { conversation_id: "current" }, extension_epoch: { binding_sha256: expected, instance_id_sha256: "c".repeat(64), loaded_at_ms: 1 } }
   );
 });
+
+test("destructured legacy current-entry driver method keeps its v1 result shape", async function (t) {
+  const socketPath = await serverFor(t, function (request) {
+    return {
+      request_id: request.request_id,
+      ok: true,
+      result: {
+        current_entry: { conversation_id: "destructured-current" },
+        extension_epoch: {
+          binding_sha256: "a".repeat(64),
+          instance_id_sha256: "c".repeat(64),
+          loaded_at_ms: 1
+        }
+      }
+    };
+  });
+  const { discoverCurrentEntry } = createChromeHostDriver({ socketPath, timeoutMs: 1000 });
+  assert.deepEqual(
+    await discoverCurrentEntry({ target_generation: 1, ownership_generation: 1 }),
+    { conversation_id: "destructured-current" }
+  );
+});
