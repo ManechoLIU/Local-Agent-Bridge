@@ -15,7 +15,7 @@
 - Public Host MCP `tools/list` remains exactly `discover_current_entry`.
 - Caller identity fields and caller request/session IDs are never identity evidence.
 - `bridge_call_id`, `bridge_challenge_nonce`, `transport_binding_id`, and `host_tool_execution_id` are generated inside Bridge/Host, never accepted from tool arguments or incoming headers.
-- The capability binds exact normalized `run_command` arguments, canonical workspace, outer and forwarded request SHA-256, production release revision/generation, Bridge capability context, machine-derived Web entry, active generation anchor, and loaded extension epoch.
+- The capability uses `request_digest_profile=lab_run_command_digest_v1` and binds exact normalized `run_command` arguments, canonical workspace, the first/challenge raw outer SHA-256, frozen capability-neutral forwarded SHA-256, production release revision/generation, Bridge capability context, machine-derived Web entry, active generation anchor, and loaded extension epoch. Pre/terminal additionally bind the retry raw outer SHA-256.
 - Capability and dispatch state are atomically persisted before side effects; post-dispatch uncertainty is terminally `RESULT_UNKNOWN_AFTER_DISPATCH` and never auto-retried.
 - CatDesk source and binary are unchanged; Bridge strips `host_invocation_capability` before forwarding.
 - LAB remains independently runnable without Runtime integration. Production protected shell calls fail closed when the explicitly configured, hash-pinned Runtime hook is unavailable.
@@ -43,7 +43,7 @@
 
 - [ ] **Step 1: Write failing Host receipt tests**
 
-Add behavior tests whose literal fixtures prove: machine-only identity fields; exact normalized request binding; generation-anchor and extension-epoch binding; single-use consume across restart; cross-transport, TTL, target/frame/loader/generation drift rejection; terminal requires the exact consumed pre; terminal does not store response bodies.
+Add behavior tests whose literal fixtures prove: machine-only identity fields; exact normalized request binding; generation-anchor and extension-epoch binding; single-use consume across restart; cross-transport, TTL, target/frame/loader/generation drift rejection; terminal requires the exact consumed pre and retry outer digest; terminal does not store response bodies.
 
 ```js
 assert.equal(capability.provenance, "lab_host_invocation_capability_v1");
@@ -102,7 +102,7 @@ git commit -m "feat(host): sign durable tool execution receipts"
 
 - [ ] **Step 1: Write failing Bridge tests**
 
-Test the real ingress boundary with controlled Host/backend/hook servers. The first protected call must return `HOST_INVOCATION_CAPABILITY_REQUIRED` and make zero backend calls. The exact retry must call Host consume, call Runtime pre, persist dispatch intent, execute the backend once, call Host terminal, call Runtime terminal, and return the buffered response.
+Test the real ingress boundary with controlled Host/backend/hook servers. The first protected call must return `HOST_INVOCATION_CAPABILITY_REQUIRED` and make zero backend calls. The exact retry uses a distinct caller JSON-RPC ID, must call Host consume, call Runtime pre, persist dispatch intent, execute the backend once with the stable Bridge ID and no capability, call Host terminal, call Runtime terminal, map the response back to the retry caller ID, and return the buffered response.
 
 ```rust
 assert_eq!(backend.calls(), 0);
@@ -111,7 +111,7 @@ assert_eq!(backend.calls(), 1);
 assert_eq!(journal.state(call_id), "TERMINAL");
 ```
 
-Add negative tests for caller-supplied execution IDs, changed command/cwd/timeout, cross-binding use, concurrent consume, state persistence failure, pre rejection, backend timeout, Host terminal loss, Runtime terminal rejection, and restart after `DISPATCH_INTENT`.
+Add negative tests for caller-supplied execution IDs, changed command/cwd/timeout, cross-binding use, concurrent consume, state persistence failure, pre rejection, backend timeout, Host terminal loss, Runtime terminal rejection, restart after `DISPATCH_INTENT`, duplicate JSON keys, malformed/null capability, retry outer digest substitution, backend response-ID mismatch, and proof/body mismatch.
 
 - [ ] **Step 2: Run the focused Cargo tests and capture RED**
 
@@ -126,7 +126,7 @@ Expected: FAIL because the receipt client/journal and schema decoration are abse
 
 - [ ] **Step 3: Implement the minimal Bridge flow**
 
-Add a Bridge-only execution identity to `RequestProof` and its fixed HMAC message. Canonicalize `run_command` arguments after removing `host_invocation_capability`; bind both outer and forwarded digests. Buffer backend responses before terminalization.
+Add a Bridge-only execution identity to `RequestProof` and its fixed HMAC message. Strictly parse the protected JSON-RPC profile, canonicalize `run_command` after removing only `host_invocation_capability`, replace the backend envelope ID with `bridge_call_id`, freeze those exact bytes, and bind the challenge outer, frozen forwarded, normalized arguments, and retry outer digests under `lab_run_command_digest_v1`. Sign the backend RequestProof only after the frozen forwarded bytes exist. Buffer and validate backend responses before terminalization, then map only the response ID for the caller after Runtime closure.
 
 ```rust
 pub struct BufferedBackendResponse {
