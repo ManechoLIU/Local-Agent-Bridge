@@ -36,6 +36,8 @@ const PRODUCTION_WORKSPACE: &str = "/Users/echoman/Documents/ChatGPT/Local-Agent
 const PRODUCTION_TUNNEL_PROFILE: &str = "local-agent-bridge-production";
 const RUN_COMMAND_DIGEST_PROFILE: &str = "lab_run_command_digest_v1";
 const RUNTIME_HOOK_PROTOCOL: &str = "runtime_host_tool_hook_v1";
+const RUNTIME_TOOL_INTENT_PROVENANCE: &str = "runtime_host_tool_intent_v1";
+const RUNTIME_BACKEND_RESPONSE_PROVENANCE: &str = "runtime_host_backend_response_v1";
 const RECEIPT_JOURNAL_FILE: &str = "tool-receipt-journal.json";
 const MAX_PROTECTED_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_PROTECTED_JSON_DEPTH: usize = 32;
@@ -1042,6 +1044,27 @@ impl ProtectedRunCommand {
     }
 }
 
+fn runtime_tool_intent(normalized: &[u8]) -> Result<serde_json::Value, String> {
+    let normalized_request_utf8 = std::str::from_utf8(normalized)
+        .map_err(|_| "canonical normalized request is not UTF-8".to_string())?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "provenance": RUNTIME_TOOL_INTENT_PROVENANCE,
+        "request_digest_profile": RUN_COMMAND_DIGEST_PROFILE,
+        "normalized_request_utf8": normalized_request_utf8,
+    }))
+}
+
+fn runtime_backend_response(bytes: &[u8]) -> Result<serde_json::Value, String> {
+    let response_body_utf8 = std::str::from_utf8(bytes)
+        .map_err(|_| "validated backend response is not UTF-8".to_string())?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "provenance": RUNTIME_BACKEND_RESPONSE_PROVENANCE,
+        "response_body_utf8": response_body_utf8,
+    }))
+}
+
 fn parse_protected_run_command(body: &[u8]) -> Result<ProtectedRunCommand, String> {
     if body.len() > MAX_PROTECTED_REQUEST_BYTES {
         return Err("protected run_command request exceeds 64 KiB".into());
@@ -1276,6 +1299,8 @@ async fn handle_protected_run_command(
             "Host invocation capability request mismatch",
         ));
     }
+    let tool_intent = runtime_tool_intent(&normalized)
+        .map_err(|error| FlowError::new(StatusCode::BAD_REQUEST, error))?;
     let retry_outer_sha = sha256_bytes(&raw_body);
     let host_tool_execution_id = format!("hte_{}", Uuid::new_v4());
     let mut consume = receipt_binding_for_record(chain, &state.inner.context, &record);
@@ -1337,6 +1362,7 @@ async fn handle_protected_run_command(
                 "bridge_call_id":record.bridge_call_id,
                 "host_tool_execution_id":host_tool_execution_id,
                 "pre_receipt":pre_receipt,
+                "tool_intent":tool_intent.clone(),
             }),
         )
         .await
@@ -1411,6 +1437,21 @@ async fn handle_protected_run_command(
             format!("RESULT_UNKNOWN_AFTER_DISPATCH: {error}"),
         ));
     }
+    let backend_response = match runtime_backend_response(&backend.bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            mark_result_unknown(
+                &mut journal,
+                &capability_id,
+                Some(backend.status.as_u16()),
+                Some(backend_sha),
+            );
+            return Err(FlowError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("RESULT_UNKNOWN_AFTER_DISPATCH: {error}"),
+            ));
+        }
+    };
     if let Err(error) = journal.update(&capability_id, |record| {
         record.state = ToolReceiptState::BackendResponse;
         record.backend_http_status = Some(backend.status.as_u16());
@@ -1558,6 +1599,8 @@ async fn handle_protected_run_command(
                 "terminal_receipt":terminal_receipt,
                 "backend_http_status":backend.status.as_u16(),
                 "response_body_sha256":backend_sha,
+                "tool_intent":tool_intent,
+                "backend_response":backend_response,
             }),
         )
         .await

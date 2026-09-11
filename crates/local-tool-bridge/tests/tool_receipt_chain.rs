@@ -41,17 +41,20 @@ async fn backend(
     State(capture): State<BackendCapture>,
     headers: HeaderMap,
     body: Bytes,
-) -> (StatusCode, axum::Json<Value>) {
+) -> axum::response::Response {
     capture.0.lock().await.push((headers, body.clone()));
     let parsed: Value = serde_json::from_slice(&body).unwrap();
-    (
-        StatusCode::OK,
-        axum::Json(json!({
-            "jsonrpc": "2.0",
-            "id": parsed["id"],
-            "result": {"content": [{"type":"text", "text":"done"}]}
-        })),
-    )
+    let id = serde_json::to_string(&parsed["id"]).unwrap();
+    let command = serde_json::to_string(&parsed["params"]["arguments"]["command"]).unwrap();
+    let cwd = serde_json::to_string(&parsed["params"]["arguments"]["cwd"]).unwrap();
+    let raw = format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"done"}}],"structuredContent":{{"toolName":"run_command","command":{command},"cwd":{cwd},"stdout":"control-event: allowed","stderr":"","success":true,"exitCode":0,"elapsedMs":1.25,"timedOut":false}},"isError":false}}}}"#
+    );
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(raw))
+        .unwrap()
 }
 
 async fn wrong_id_backend(
@@ -78,6 +81,35 @@ async fn backend_server(capture: BackendCapture, wrong_id: bool) -> String {
             .route("/mcp", post(backend))
             .with_state(capture)
     };
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://127.0.0.1:{}/mcp", addr.port())
+}
+
+async fn oversized_result_backend(
+    State(capture): State<BackendCapture>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> axum::response::Response {
+    capture.0.lock().await.push((headers, body.clone()));
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    let id = serde_json::to_string(&parsed["id"]).unwrap();
+    let stdout = serde_json::to_string(&"x".repeat(63 * 1024)).unwrap();
+    let raw = format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[],"structuredContent":{{"toolName":"run_command","command":"one","cwd":"/tmp","stdout":{stdout},"stderr":"","success":true,"exitCode":0,"elapsedMs":1,"timedOut":false}},"isError":false}}}}"#
+    );
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(raw))
+        .unwrap()
+}
+
+async fn oversized_result_backend_server(capture: BackendCapture) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route("/mcp", post(oversized_result_backend))
+        .with_state(capture);
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     format!("http://127.0.0.1:{}/mcp", addr.port())
 }
@@ -756,6 +788,83 @@ async fn protected_run_command_requires_then_consumes_host_capability_exactly_on
             .collect::<Vec<_>>(),
         ["pre", "terminal"]
     );
+    let runtime_calls = runtime_log.lock().unwrap().clone();
+    let expected_normalized = r#"{"arguments":{"command":"printf ok","cwd":"/tmp","timeout":30},"tool_name":"run_command"}"#;
+    let expected_intent = json!({
+        "schema_version": 1,
+        "provenance": "runtime_host_tool_intent_v1",
+        "request_digest_profile": "lab_run_command_digest_v1",
+        "normalized_request_utf8": expected_normalized,
+    });
+    assert_eq!(runtime_calls[0]["tool_intent"], expected_intent);
+    assert_eq!(runtime_calls[1]["tool_intent"], expected_intent);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(expected_normalized.as_bytes())),
+        runtime_calls[0]["pre_receipt"]["normalized_request_sha256"]
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(expected_normalized.as_bytes())),
+        runtime_calls[1]["terminal_receipt"]["normalized_request_sha256"]
+    );
+    assert_ne!(
+        format!(
+            "{:x}",
+            Sha256::digest(format!("{expected_normalized} ").as_bytes())
+        ),
+        runtime_calls[0]["pre_receipt"]["normalized_request_sha256"]
+    );
+    let normalized: Value = serde_json::from_str(expected_normalized).unwrap();
+    assert_eq!(
+        normalized.as_object().unwrap().keys().collect::<Vec<_>>(),
+        vec!["arguments", "tool_name"]
+    );
+    assert!(
+        normalized["arguments"]
+            .get("host_invocation_capability")
+            .is_none()
+    );
+    let backend_response = &runtime_calls[1]["backend_response"];
+    assert_eq!(
+        backend_response
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["provenance", "response_body_utf8", "schema_version"]
+    );
+    assert_eq!(
+        backend_response["provenance"],
+        "runtime_host_backend_response_v1"
+    );
+    assert_eq!(backend_response["schema_version"], 1);
+    let exact_backend = backend_response["response_body_utf8"].as_str().unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(exact_backend.as_bytes())),
+        runtime_calls[1]["terminal_receipt"]["response_body_sha256"]
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(exact_backend.as_bytes())),
+        runtime_calls[1]["response_body_sha256"]
+    );
+    let exact_backend_json: Value = serde_json::from_str(exact_backend).unwrap();
+    assert_eq!(exact_backend_json["id"], bridge_call_id);
+    assert_eq!(exact_backend_json["result"]["isError"], false);
+    assert_eq!(
+        exact_backend_json["result"]["structuredContent"],
+        json!({
+            "toolName":"run_command", "command":"printf ok", "cwd":"/tmp",
+            "stdout":"control-event: allowed", "stderr":"", "success":true,
+            "exitCode":0, "elapsedMs":1.25, "timedOut":false
+        })
+    );
+    assert_ne!(
+        format!(
+            "{:x}",
+            Sha256::digest(format!("{exact_backend} ").as_bytes())
+        ),
+        runtime_calls[1]["terminal_receipt"]["response_body_sha256"]
+    );
     assert_eq!(
         host_calls
             .iter()
@@ -896,6 +1005,96 @@ async fn runtime_pre_rejection_has_zero_backend_side_effects() {
 }
 
 #[tokio::test]
+async fn runtime_intent_that_exceeds_private_envelope_limit_never_dispatches() {
+    let root = tempfile::tempdir().unwrap();
+    let host_path = root.path().join("host.sock");
+    let runtime_path = root.path().join("runtime.sock");
+    let host_log = Arc::new(StdMutex::new(Vec::new()));
+    let runtime_log = Arc::new(StdMutex::new(Vec::new()));
+    let _host = spawn_ndjson_server(host_path.clone(), 2, host_handler(host_log));
+    let _runtime = spawn_ndjson_server(
+        runtime_path.clone(),
+        1,
+        runtime_handler(runtime_log.clone(), false, false),
+    );
+    while !host_path.exists() || !runtime_path.exists() {
+        tokio::task::yield_now().await;
+    }
+    let backend_capture = BackendCapture::default();
+    let backend_url = backend_server(backend_capture.clone(), false).await;
+    let app = bridge(&backend_url, root.path(), &host_path, Some(&runtime_path)).router();
+    let command = "x".repeat(62 * 1024);
+    let challenge = response_json(
+        app.clone()
+            .oneshot(call(challenge_body("large-a", &command)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let retry = retry_body(
+        "large-b",
+        &command,
+        challenge["error"]["data"]["host_invocation_capability"].clone(),
+    );
+    let response = app.oneshot(call(retry)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(backend_capture.0.lock().await.len(), 0);
+    assert!(runtime_log.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn oversized_terminal_preimage_is_unknown_after_one_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let host_path = root.path().join("host.sock");
+    let runtime_path = root.path().join("runtime.sock");
+    let host_log = Arc::new(StdMutex::new(Vec::new()));
+    let runtime_log = Arc::new(StdMutex::new(Vec::new()));
+    let _host = spawn_ndjson_server(host_path.clone(), 3, host_handler(host_log));
+    let _runtime = spawn_ndjson_server(
+        runtime_path.clone(),
+        2,
+        runtime_handler(runtime_log.clone(), false, false),
+    );
+    while !host_path.exists() || !runtime_path.exists() {
+        tokio::task::yield_now().await;
+    }
+    let backend_capture = BackendCapture::default();
+    let backend_url = oversized_result_backend_server(backend_capture.clone()).await;
+    let app = bridge(&backend_url, root.path(), &host_path, Some(&runtime_path)).router();
+    let challenge = response_json(
+        app.clone()
+            .oneshot(call(challenge_body("large-a", "one")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let capability = challenge["error"]["data"]["host_invocation_capability"].clone();
+    let bridge_call_id = capability["bridge_call_id"].as_str().unwrap().to_string();
+    let retry = retry_body("large-b", "one", capability);
+    let response = app.oneshot(call(retry.clone())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(backend_capture.0.lock().await.len(), 1);
+    assert_eq!(runtime_log.lock().unwrap().len(), 1);
+    assert_eq!(
+        ToolReceiptJournal::load(root.path().join("tool-receipt-journal.json"))
+            .unwrap()
+            .state(&bridge_call_id),
+        Some(ToolReceiptState::ResultUnknownAfterDispatch)
+    );
+    let restarted = restarted_bridge(&backend_url, root.path(), &host_path, Some(&runtime_path));
+    assert_eq!(
+        restarted
+            .router()
+            .oneshot(call(retry))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(backend_capture.0.lock().await.len(), 1);
+}
+
+#[tokio::test]
 async fn concurrent_consumers_have_one_winner_and_one_backend_dispatch() {
     let root = tempfile::tempdir().unwrap();
     let host_path = root.path().join("host.sock");
@@ -954,7 +1153,7 @@ async fn terminal_failures_become_durable_unknown_after_one_dispatch() {
             Some(spawn_ndjson_server(
                 runtime_path.clone(),
                 2,
-                runtime_handler(runtime_log, false, true),
+                runtime_handler(runtime_log.clone(), false, true),
             ))
         } else {
             None
@@ -963,7 +1162,11 @@ async fn terminal_failures_become_durable_unknown_after_one_dispatch() {
             tokio::task::yield_now().await;
         }
         let backend_capture = BackendCapture::default();
-        let backend_url = backend_server(backend_capture.clone(), false).await;
+        let backend_url = if reject_runtime {
+            profile_backend_server(backend_capture.clone(), BackendProfile::LegalError).await
+        } else {
+            backend_server(backend_capture.clone(), false).await
+        };
         let app = bridge(
             &backend_url,
             root.path(),
@@ -986,6 +1189,17 @@ async fn terminal_failures_become_durable_unknown_after_one_dispatch() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(backend_capture.0.lock().await.len(), 1);
+        if reject_runtime {
+            let runtime_calls = runtime_log.lock().unwrap();
+            let exact_backend = runtime_calls[1]["backend_response"]["response_body_utf8"]
+                .as_str()
+                .unwrap();
+            assert!(serde_json::from_str::<Value>(exact_backend).unwrap()["error"].is_object());
+            assert_eq!(
+                format!("{:x}", Sha256::digest(exact_backend.as_bytes())),
+                runtime_calls[1]["terminal_receipt"]["response_body_sha256"]
+            );
+        }
         assert_eq!(
             ToolReceiptJournal::load(root.path().join("tool-receipt-journal.json"))
                 .unwrap()
