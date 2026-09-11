@@ -178,6 +178,7 @@ git commit -m "feat(bridge): gate shell dispatch on Host receipts"
 - Modify: `experiments/web-host-attestation/chrome-host/client.test.mjs`
 - Modify: `experiments/web-host-attestation/chrome-host/integration.mjs`
 - Modify: `experiments/web-host-attestation/chrome-host/integration.test.mjs`
+- Modify: `experiments/web-host-attestation/chrome-host/native-host-core.test.mjs`
 - Modify: `experiments/web-host-attestation/chrome-host/runtime-verifier-cli.mjs`
 - Modify: `experiments/web-host-attestation/chrome-host/runtime-verifier-cli.test.mjs`
 
@@ -233,7 +234,7 @@ Run the Step 2 command plus the complete Task 1 Host suite. Expected: all pass a
 - [ ] **Step 5: Commit Task 3**
 
 ```bash
-git add experiments/web-host-attestation/attestation.mjs experiments/web-host-attestation/attestation.test.mjs experiments/web-host-attestation/chrome-host/client.mjs experiments/web-host-attestation/chrome-host/client.test.mjs experiments/web-host-attestation/chrome-host/integration.mjs experiments/web-host-attestation/chrome-host/integration.test.mjs experiments/web-host-attestation/chrome-host/runtime-verifier-cli.mjs experiments/web-host-attestation/chrome-host/runtime-verifier-cli.test.mjs
+git add experiments/web-host-attestation/attestation.mjs experiments/web-host-attestation/attestation.test.mjs experiments/web-host-attestation/chrome-host/client.mjs experiments/web-host-attestation/chrome-host/client.test.mjs experiments/web-host-attestation/chrome-host/integration.mjs experiments/web-host-attestation/chrome-host/integration.test.mjs experiments/web-host-attestation/chrome-host/native-host-core.test.mjs experiments/web-host-attestation/chrome-host/runtime-verifier-cli.mjs experiments/web-host-attestation/chrome-host/runtime-verifier-cli.test.mjs
 git commit -m "feat(host): verify tool receipts for Runtime"
 ```
 
