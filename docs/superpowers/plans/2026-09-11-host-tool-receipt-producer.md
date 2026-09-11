@@ -30,7 +30,7 @@
 - Modify: `experiments/web-host-attestation/attestation.mjs`
 - Modify: `experiments/web-host-attestation/attestation.test.mjs`
 - Modify: `experiments/web-host-attestation/chrome-host/extension/current-entry-registry.js`
-- Modify: `experiments/web-host-attestation/chrome-host/extension/current-entry-registry.test.mjs`
+- Modify: `experiments/web-host-attestation/chrome-host/current-entry-registry.test.mjs`
 - Modify: `experiments/web-host-attestation/chrome-host/extension/background.js`
 - Modify: `experiments/web-host-attestation/chrome-host/native-host-core.mjs`
 - Modify: `experiments/web-host-attestation/chrome-host/native-host-core.test.mjs`
@@ -64,7 +64,7 @@ Expected: FAIL because the new receipt journal and private operations do not exi
 
 - [ ] **Step 3: Implement the minimal Host state machine**
 
-Use canonical JSON HMAC, private atomic state writes with file and parent-directory fsync, strict owner/symlink/mode checks, and the monotonic state transitions from the spec. `generation_anchor_sha256` is computed from the exact sorted active Chrome generation request IDs and is never returned as raw request IDs.
+Use canonical JSON HMAC, a cross-instance lock plus reload-before-mutate CAS, private atomic state writes with file and parent-directory fsync, strict owner/symlink/mode checks, and the Host-owned monotonic state transitions from the spec. `generation_anchor_sha256` is computed from the exact sorted active Chrome generation request IDs and is never returned as raw request IDs. Exact expiry (`now == expires_at_unix_ms`) is expired.
 
 ```js
 export class ToolInvocationReceiptJournal {

@@ -37,7 +37,15 @@ The first protected `run_command` call has no `host_invocation_capability`. Brid
   "provenance": "lab_host_invocation_capability_v1",
   "capability_id": "hic_<random>",
   "bridge_call_id": "bc_<random>",
+  "bridge_challenge_nonce": "<random>",
   "transport_binding_id": "tb_<random>",
+  "workspace": "/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge",
+  "production_release_revision": "<40 hex>",
+  "production_endpoint_generation": 1,
+  "bridge_principal_id": "<configured Bridge principal>",
+  "bridge_execution_session_id": "<configured Bridge session>",
+  "bridge_capability_id": "<configured Bridge capability>",
+  "bridge_workspace_id": "local-agent-bridge-production",
   "tool_name": "run_command",
   "outer_request_sha256": "<64 hex>",
   "forwarded_request_sha256": "<64 hex>",
@@ -66,12 +74,14 @@ After CatDesk returns, Bridge buffers the exact HTTP status and body, hashes the
 
 ## Durable states
 
-Bridge and Host journals use the same monotonic lifecycle:
+The combined Host-plus-Bridge journals form one monotonic lifecycle:
 
 ```text
 ISSUED -> HOST_VALIDATED_IN_FLIGHT -> RUNTIME_ALLOWED -> DISPATCH_INTENT
        -> BACKEND_RESPONSE -> TERMINAL_PENDING -> TERMINAL
 ```
+
+Host owns and persists `ISSUED`, `HOST_VALIDATED_IN_FLIGHT`, `TERMINAL_PENDING`, and `TERMINAL`. Bridge owns and persists `RUNTIME_ALLOWED`, `DISPATCH_INTENT`, and `BACKEND_RESPONSE`. Neither component fabricates the other's observations or duplicates its state machine.
 
 `ISSUED` may expire without dispatch. Any state at or after `DISPATCH_INTENT` is never automatically re-executed. Re-submitting the same capability is `REPLAY`; a byte-different request is `MISMATCH`. A persisted pre from a prior Host or extension epoch cannot become successful terminal evidence.
 
