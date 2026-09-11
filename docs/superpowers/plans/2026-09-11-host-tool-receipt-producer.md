@@ -238,7 +238,47 @@ git add experiments/web-host-attestation/attestation.mjs experiments/web-host-at
 git commit -m "feat(host): verify tool receipts for Runtime"
 ```
 
-### Task 4: Production release wiring and compatibility fences
+### Task 4: Bridge-to-Runtime intent and result preimages
+
+**Files:**
+- Modify: `crates/local-tool-bridge/src/lib.rs`
+- Modify: `crates/local-tool-bridge/tests/tool_receipt_chain.rs`
+
+**Interfaces:**
+- Consumes: Task 2 protected request canonical bytes, buffered CatDesk response bytes, Task 1 Host-signed normalized request and response digests, and Task 3 verifier-v2 semantics.
+- Produces: exact private `runtime_host_tool_intent_v1` on pre and terminal plus `runtime_host_backend_response_v1` on terminal; neither object is identity evidence until Runtime verifies its bytes against the Host-signed digest.
+
+- [ ] **Step 1: Write failing exact-envelope tests**
+
+Capture real Runtime-hook requests. Require pre and terminal to carry the same bounded UTF-8 canonical normalized request bytes, prove their SHA-256 equals the Host receipt's `normalized_request_sha256`, and prove the canonical object contains only `tool_name: run_command` plus capability-neutral arguments. Terminal additionally carries the exact buffered CatDesk JSON-RPC response bytes; its SHA-256 must equal the terminal receipt's `response_body_sha256` and its structured result must preserve `success`, `exitCode`, `timedOut`, `command`, and `cwd`. Add mutation, oversize, unknown-key, response-error, and retry-ID mapping regressions.
+
+- [ ] **Step 2: Run focused tests and capture RED**
+
+Run:
+
+```bash
+cd crates/local-tool-bridge
+cargo test --test tool_receipt_chain
+```
+
+Expected: the new exact-envelope assertions fail because the private Runtime calls currently carry receipts but not their authenticated preimages.
+
+- [ ] **Step 3: Implement minimal transport**
+
+Serialize the already-produced canonical normalized bytes as exact UTF-8 text; do not reserialize caller input and do not add identity fields. Send the same intent object in pre and terminal. After Bridge's existing strict backend JSON-RPC validation, send the exact buffered response bytes in the terminal response object. Keep the one-shot five-second private UDS deadline, 64 KiB envelope limit, durable no-retry lifecycle, frozen CatDesk request, and final caller-ID mapping unchanged. No Host schema, public MCP tool, Runtime code, or CatDesk code changes belong to this task.
+
+- [ ] **Step 4: Run focused and regression tests GREEN**
+
+Run Task 2 Cargo tests, `bridge-security-core`, and `computer-runtime`. Expected: all pass, receipt-disabled mode remains byte-compatible, and any Runtime pre/terminal failure after dispatch preserves the existing fail-closed/unknown semantics.
+
+- [ ] **Step 5: Commit Task 4**
+
+```bash
+git add crates/local-tool-bridge/src/lib.rs crates/local-tool-bridge/tests/tool_receipt_chain.rs
+git commit -m "fix(bridge): bind Runtime hook to exact tool result"
+```
+
+### Task 5: Production release wiring and compatibility fences
 
 **Files:**
 - Modify: `scripts/production_connector.py`
@@ -246,7 +286,7 @@ git commit -m "feat(host): verify tool receipts for Runtime"
 - Modify: `experiments/web-host-attestation/chrome-host/host-mcp-adapter.test.mjs`
 
 **Interfaces:**
-- Consumes: Task 1 Host state path/operations, Task 2 Bridge env/hook settings, and Task 3 verifier v2 commands.
+- Consumes: Task 1 Host state path/operations, Task 2 and Task 4 Bridge env/hook settings, and Task 3 verifier v2 commands.
 - Produces: immutable release paths for Host receipt state, Bridge receipt journal, Host socket and verification material, and a Runtime hook registration that pins executable, transitive bundle hashes, installed Runtime revision, and protocol `runtime_host_tool_hook_v1`.
 
 - [ ] **Step 1: Write failing production contract tests**
@@ -278,7 +318,7 @@ Generate private state paths under the immutable production runtime, pass only e
 
 Run the Step 2 command, Task 1 and Task 3 Node commands, and Task 2 Cargo commands. Expected: all pass with unchanged public tool names and unchanged AI-Bridge/compute-helper identity checks.
 
-- [ ] **Step 5: Commit Task 4**
+- [ ] **Step 5: Commit Task 5**
 
 ```bash
 git add scripts/production_connector.py tests/test_production_connector.py experiments/web-host-attestation/chrome-host/host-mcp-adapter.test.mjs
