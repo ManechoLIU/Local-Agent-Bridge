@@ -961,6 +961,63 @@ async fn protected_run_command_requires_then_consumes_host_capability_exactly_on
 }
 
 #[tokio::test]
+async fn protected_run_command_accepts_standard_mcp_meta_without_forwarding_it() {
+    let root = tempfile::tempdir().unwrap();
+    let host_path = root.path().join("host.sock");
+    let host_log = Arc::new(StdMutex::new(Vec::new()));
+    let _host_thread = spawn_ndjson_server(host_path.clone(), 3, host_handler(host_log));
+    while !host_path.exists() {
+        tokio::task::yield_now().await;
+    }
+    let backend_capture = BackendCapture::default();
+    let backend_url = backend_server(backend_capture.clone(), false).await;
+    let app = bridge(&backend_url, root.path(), &host_path, None).router();
+
+    let challenge_raw = json!({
+        "jsonrpc":"2.0", "id":"meta-challenge", "method":"tools/call",
+        "params":{
+            "name":"run_command",
+            "arguments":{"command":"printf ok","cwd":"/tmp","timeout":30},
+            "_meta":{"progressToken":"first-token"}
+        }
+    })
+    .to_string();
+    let challenge_response = app
+        .clone()
+        .oneshot(call(challenge_raw))
+        .await
+        .unwrap();
+    assert_eq!(challenge_response.status(), StatusCode::OK);
+    let challenge = response_json(challenge_response).await;
+    let capability = challenge["error"]["data"]["host_invocation_capability"].clone();
+
+    let retry_raw = json!({
+        "jsonrpc":"2.0", "id":"meta-retry", "method":"tools/call",
+        "params":{
+            "name":"run_command",
+            "arguments":{
+                "command":"printf ok","cwd":"/tmp","timeout":30,
+                "host_invocation_capability":capability
+            },
+            "_meta":{"progressToken":"second-token"}
+        }
+    })
+    .to_string();
+    let response = app.oneshot(call(retry_raw)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let captured = backend_capture.0.lock().await;
+    assert_eq!(captured.len(), 1);
+    let forwarded: Value = serde_json::from_slice(&captured[0].1).unwrap();
+    assert!(forwarded["params"].get("_meta").is_none());
+    assert!(
+        forwarded["params"]["arguments"]
+            .get("host_invocation_capability")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn changed_retry_duplicate_keys_null_capability_and_identity_injection_never_dispatch() {
     let root = tempfile::tempdir().unwrap();
     let host_path = root.path().join("host.sock");
@@ -991,6 +1048,7 @@ async fn changed_retry_duplicate_keys_null_capability_and_identity_injection_nev
         r#"{"jsonrpc":"2.0","id":"c","method":"tools/call","params":{"name":"run_command","arguments":{"command":"one","command":"two"}}}"#.into(),
         r#"{"jsonrpc":"2.0","id":"d","method":"tools/call","params":{"name":"run_command","arguments":{"command":"one","host_invocation_capability":null}}}"#.into(),
         r#"{"jsonrpc":"2.0","id":"d2","method":"tools/call","params":{"name":"run_command","arguments":{"command":"one","host_invocation_capability":"not-an-object"}}}"#.into(),
+        r#"{"jsonrpc":"2.0","id":"d3","method":"tools/call","params":{"name":"run_command","arguments":{"command":"one"},"_meta":"not-an-object"}}"#.into(),
         r#"{"jsonrpc":"2.0","id":"e","method":"tools/call","params":{"name":"run_command","arguments":{"command":"one","bridge_call_id":"bc_caller"}}}"#.into(),
         r#"{"jsonrpc":"2.0","id":"f","method":"tools/call","params":{"name":"run_command","arguments":{"command":"one","metadata":{"conversation_id":"caller"}}}}"#.into(),
     ];

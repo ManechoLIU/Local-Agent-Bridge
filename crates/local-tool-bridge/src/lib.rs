@@ -1019,9 +1019,13 @@ impl ProtectedRunCommand {
     fn forwarded_for(&self, bridge_call_id: &str) -> Result<Vec<u8>, String> {
         let mut value = self.value.clone();
         value["id"] = serde_json::Value::String(bridge_call_id.to_string());
-        let arguments = value
+        let params = value
             .get_mut("params")
-            .and_then(|value| value.get_mut("arguments"))
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| "protected run_command params are invalid".to_string())?;
+        params.remove("_meta");
+        let arguments = params
+            .get_mut("arguments")
             .and_then(serde_json::Value::as_object_mut)
             .ok_or_else(|| "protected run_command arguments are invalid".to_string())?;
         arguments.remove("host_invocation_capability");
@@ -1097,9 +1101,15 @@ fn parse_protected_run_command(body: &[u8]) -> Result<ProtectedRunCommand, Strin
         .ok_or_else(|| "protected run_command params must be an object".to_string())?;
     if params
         .keys()
-        .any(|key| !["name", "arguments"].contains(&key.as_str()))
+        .any(|key| !["name", "arguments", "_meta"].contains(&key.as_str()))
     {
         return Err("protected run_command contains unsupported params members".into());
+    }
+    if params
+        .get("_meta")
+        .is_some_and(|value| !value.is_object())
+    {
+        return Err("protected run_command params._meta must be an object".into());
     }
     if params.get("name").and_then(serde_json::Value::as_str) != Some("run_command") {
         return Err("protected profile is only valid for run_command".into());
