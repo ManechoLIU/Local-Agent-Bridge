@@ -3288,12 +3288,32 @@ def _observe_current_production_for_rollback_adoption(
     expected_receipt_pin: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     installed = validate_installed_release(layout)
-    if any(installed.get(key) != value for key, value in manifest.items()):
+    installed_host = installed.get("host")
+    requested_host = manifest.get("host")
+    if not isinstance(installed_host, dict) or not isinstance(requested_host, dict):
+        raise RuntimeError("installed production release does not match the exact requested manifest")
+    installed_minimum_extension_version = installed_host.get(
+        "minimum_extension_version"
+    )
+    if not isinstance(installed_minimum_extension_version, str):
+        raise RuntimeError(
+            "installed production release Host minimum extension version is invalid"
+        )
+    _version_tuple(installed_minimum_extension_version)
+    expected_installed_host = {
+        **requested_host,
+        "minimum_extension_version": installed_minimum_extension_version,
+    }
+    if installed_host != expected_installed_host or any(
+        installed.get(key) != value
+        for key, value in manifest.items()
+        if key != "host"
+    ):
         raise RuntimeError("installed production release does not match the exact requested manifest")
     if not isinstance(installed.get("artifacts_sha256"), dict) or not installed["artifacts_sha256"]:
         raise RuntimeError("installed production release has no verified artifact pins")
 
-    status = production_status(manifest, layout)
+    status = production_status(installed, layout)
     required_ready = (
         "release_installed",
         "runtime_state_matches",
@@ -3324,7 +3344,7 @@ def _observe_current_production_for_rollback_adoption(
     verify_caller_conversation_id_rejected(layout)
     validate_native_messaging_manifests(
         layout,
-        manifest,
+        installed,
         home_dir=home_dir,
         native_user_data_dirs=native_user_data_dirs,
     )

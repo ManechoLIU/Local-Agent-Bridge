@@ -456,6 +456,33 @@ class ProductionConnectorContractTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             pc.release_manifest(pc.canonical_workspace(), release_revision=REVISION, endpoint_generation=0)
 
+    def test_install_native_still_rejects_extension_below_current_manifest_minimum(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest,
+                runtime_root=root / "runtime",
+                bridge_socket=root / "bridge.sock",
+            )
+            layout["native_host_wrapper"].parent.mkdir(parents=True)
+            layout["native_host_wrapper"].write_text(
+                "#!/bin/sh\nexit 0\n",
+                encoding="utf-8",
+            )
+            layout["native_host_wrapper"].chmod(0o700)
+            extension_manifest = (
+                layout["host_dir"] / "chrome-host" / "extension" / "manifest.json"
+            )
+            extension_manifest.parent.mkdir(parents=True)
+            extension_manifest.write_text(
+                json.dumps({"version": "0.1.1"}),
+                encoding="utf-8",
+            )
+            with patch.object(pc, "_validate_immutable_native_wrapper"):
+                with self.assertRaisesRegex(RuntimeError, "extension version is stale"):
+                    pc._install_native_messaging_manifests_unlocked(layout, manifest)
+
     def test_handshake_accepts_only_same_contract_revision_generation_workspace_and_surface(self):
         manifest = self._manifest()
         healthy = self._healthy(manifest)
@@ -3768,7 +3795,14 @@ class ProductionConnectorContractTests(unittest.TestCase):
             )
             prior_receipt_sha256 = pc._sha256_file(layout["rollback_receipt"])
             runtime_before_sha256 = pc._sha256_file(layout["runtime_state"])
-            installed = {**manifest, "artifacts_sha256": {"bin/bridge": "f" * 64}}
+            installed = {
+                **manifest,
+                "host": {
+                    **manifest["host"],
+                    "minimum_extension_version": "0.1.1",
+                },
+                "artifacts_sha256": {"bin/bridge": "f" * 64},
+            }
             fallback = {
                 "ready": True,
                 "health_url": "http://127.0.0.1:52354",
@@ -3800,11 +3834,11 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 pc, "validate_installed_release", return_value=installed
             ), patch.object(
                 pc, "production_status", return_value=ready
-            ), patch.object(
+            ) as status_guard, patch.object(
                 pc, "verify_caller_conversation_id_rejected"
             ), patch.object(
                 pc, "validate_native_messaging_manifests", return_value={}
-            ), patch.object(
+            ) as native_guard, patch.object(
                 pc, "_verify_ai_bridge_fallback", return_value=fallback
             ), patch.object(
                 pc, "_validate_tunnel_profile", side_effect=profile
@@ -3831,6 +3865,13 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 )
 
             self.assertTrue(result["adopted"])
+            status_guard.assert_called_with(installed, layout)
+            native_guard.assert_called_with(
+                layout,
+                installed,
+                home_dir=root / "home",
+                native_user_data_dirs=(),
+            )
             forbidden_stop.assert_not_called()
             forbidden_start.assert_not_called()
             socket_owner.assert_has_calls(
@@ -3888,6 +3929,9 @@ class ProductionConnectorContractTests(unittest.TestCase):
             "not_ready",
             "profile",
             "status_drift",
+            "installed_manifest_contract_drift",
+            "installed_host_contract_drift",
+            "installed_minimum_version_type",
         )
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as raw_root:
@@ -3923,6 +3967,27 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 receipt_before = layout["rollback_receipt"].read_bytes()
                 state_before = layout["runtime_state"].read_bytes()
                 installed = {**manifest, "artifacts_sha256": {"bin/bridge": "f" * 64}}
+                if case == "installed_manifest_contract_drift":
+                    installed = {
+                        **installed,
+                        "required_tools": ["discover_current_entry"],
+                    }
+                if case == "installed_host_contract_drift":
+                    installed = {
+                        **installed,
+                        "host": {
+                            **installed["host"],
+                            "machine_source": "caller_claimed_context",
+                        },
+                    }
+                if case == "installed_minimum_version_type":
+                    installed = {
+                        **installed,
+                        "host": {
+                            **installed["host"],
+                            "minimum_extension_version": 1,
+                        },
+                    }
 
                 status_values = [dict(ready), dict(ready), dict(ready)]
                 if case == "not_ready":
