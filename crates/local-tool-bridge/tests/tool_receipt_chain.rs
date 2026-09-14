@@ -982,11 +982,7 @@ async fn protected_run_command_accepts_standard_mcp_meta_without_forwarding_it()
         }
     })
     .to_string();
-    let challenge_response = app
-        .clone()
-        .oneshot(call(challenge_raw))
-        .await
-        .unwrap();
+    let challenge_response = app.clone().oneshot(call(challenge_raw)).await.unwrap();
     assert_eq!(challenge_response.status(), StatusCode::OK);
     let challenge = response_json(challenge_response).await;
     let capability = challenge["error"]["data"]["host_invocation_capability"].clone();

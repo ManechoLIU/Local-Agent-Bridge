@@ -15,21 +15,48 @@ import { createSubmitTransactionQueue } from "./submit-transaction-queue.js";
 import { createCurrentEntryRegistry, selectCurrentEntryTarget } from "./current-entry-registry.js";
 
 const NATIVE_HOST = "com.local_agent_bridge.web_host";
+const CURRENT_ENTRY_REGISTRY_PROTOCOL_VERSION = 2;
 const submitJournal = createChromeSubmitJournal(chrome);
 const submitTransactions = createSubmitTransactionQueue();
-const currentEntryRegistry = createCurrentEntryRegistry();
+const currentEntryRegistry = createCurrentEntryRegistry({
+  sessionStore: chrome.storage.session
+});
 
 const currentEntryRequestFilter = {
   urls: ["https://chatgpt.com/backend-api/*"]
 };
+function reportCurrentEntryMutationFailure(operation, error) {
+  const message = "current_entry_registry_" + operation + "_failed: " +
+    String(error && error.message || error || "current-entry mutation failed");
+  console.error(message, error);
+  globalThis.__LAB_HOST_CURRENT_ENTRY_REGISTRY_STATE = Object.freeze({
+    state: "degraded",
+    error: message,
+    updated_at_ms: Date.now()
+  });
+}
+
+function observeCurrentEntryMutation(operation, details) {
+  let mutation;
+  try {
+    mutation = currentEntryRegistry[operation](details);
+  } catch (error) {
+    reportCurrentEntryMutationFailure(operation, error);
+    return;
+  }
+  Promise.resolve(mutation).catch(function (error) {
+    reportCurrentEntryMutationFailure(operation, error);
+  });
+}
+
 chrome.webRequest.onBeforeRequest.addListener(function (details) {
-  currentEntryRegistry.observeStart(details);
+  observeCurrentEntryMutation("observeStart", details);
 }, currentEntryRequestFilter);
 chrome.webRequest.onCompleted.addListener(function (details) {
-  currentEntryRegistry.observeFinish(details);
+  observeCurrentEntryMutation("observeFinish", details);
 }, currentEntryRequestFilter);
 chrome.webRequest.onErrorOccurred.addListener(function (details) {
-  currentEntryRegistry.observeFinish(details);
+  observeCurrentEntryMutation("observeFinish", details);
 }, currentEntryRequestFilter);
 
 function setNativeDiagnostic(state, error, details) {
@@ -56,7 +83,9 @@ try {
     request_id: extensionHelloId,
     op: "extension_hello",
     interface_version: 1,
-    extension_id: chrome.runtime.id
+    extension_id: chrome.runtime.id,
+    extension_version: chrome.runtime.getManifest().version,
+    current_entry_registry_protocol_version: CURRENT_ENTRY_REGISTRY_PROTOCOL_VERSION
   });
   setNativeDiagnostic("handshake_sent", null);
 } catch (error) {

@@ -1105,10 +1105,7 @@ fn parse_protected_run_command(body: &[u8]) -> Result<ProtectedRunCommand, Strin
     {
         return Err("protected run_command contains unsupported params members".into());
     }
-    if params
-        .get("_meta")
-        .is_some_and(|value| !value.is_object())
-    {
+    if params.get("_meta").is_some_and(|value| !value.is_object()) {
         return Err("protected run_command params._meta must be an object".into());
     }
     if params.get("name").and_then(serde_json::Value::as_str) != Some("run_command") {

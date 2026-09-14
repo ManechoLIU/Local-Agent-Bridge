@@ -256,6 +256,26 @@ test("real native Host process bridges Unix socket to Native Messaging and signs
     /extension.*ready|extension.*hello/i
   );
 
+  for (const [label, fields, expectedError] of [
+    ["missing release metadata", {}, /extension.*version|required|registry.*protocol/i],
+    ["old extension release", { extension_version: "0.1.1", current_entry_registry_protocol_version: 2 }, /extension.*version/i],
+    ["old registry protocol", { extension_version: "0.1.2", current_entry_registry_protocol_version: 1 }, /registry.*protocol/i]
+  ]) {
+    const requestId = "eh_" + crypto.randomUUID();
+    const rejection = nextHelloAck(requestId);
+    child.stdin.write(encodeNativeMessage({
+      request_id: requestId,
+      op: "extension_hello",
+      interface_version: 1,
+      extension_id: "ikidefdlcddfomimpckflbajjccnmfna",
+      extension_instance_id: "ei_" + requestId.slice(3),
+      ...fields
+    }));
+    const hello = await rejection;
+    assert.equal(hello.ok, false, label);
+    assert.match(hello.error, expectedError, label);
+  }
+
   const staleHelloAck = nextHelloAck("eh_stale");
   child.stdin.write(encodeNativeMessage({
     request_id: "eh_stale",
@@ -263,7 +283,9 @@ test("real native Host process bridges Unix socket to Native Messaging and signs
     interface_version: 1,
     extension_id: "ikidefdlcddfomimpckflbajjccnmfna",
     extension_instance_id: "ei_00000000-0000-4000-8000-000000000001",
-    loaded_at_ms: bindingCreatedAtMs - 1
+    loaded_at_ms: bindingCreatedAtMs - 1,
+    extension_version: "0.1.2",
+    current_entry_registry_protocol_version: 2
   }));
   const staleHello = await staleHelloAck;
   assert.equal(staleHello.ok, false);
@@ -279,9 +301,19 @@ test("real native Host process bridges Unix socket to Native Messaging and signs
     request_id: currentHelloId,
     op: "extension_hello",
     interface_version: 1,
-    extension_id: "ikidefdlcddfomimpckflbajjccnmfna"
+    extension_id: "ikidefdlcddfomimpckflbajjccnmfna",
+    extension_version: "0.1.2",
+    current_entry_registry_protocol_version: 2
   }));
   const hello = await helloAck;
+  const expectedExtensionEpoch = {
+    extension_version: "0.1.2",
+    current_entry_registry_protocol_version: 2,
+    binding_sha256: sha256File(bindingPath),
+    instance_id_sha256: createHash("sha256")
+      .update("ei_00000000-0000-4000-8000-000000000002").digest("hex"),
+    loaded_at_ms: hello.result.extension_epoch.loaded_at_ms
+  };
   assert.deepEqual(hello, {
     kind: "extension_hello_ack",
     request_id: currentHelloId,
@@ -289,9 +321,12 @@ test("real native Host process bridges Unix socket to Native Messaging and signs
     result: {
       status: "native_host_ready",
       interface_version: 1,
-      socket_path: socketPath
+      socket_path: socketPath,
+      extension_epoch: expectedExtensionEpoch
     }
   });
+  assert.equal(JSON.stringify(hello).includes(SECRET), false);
+  assert.equal(JSON.stringify(hello).includes(binding.value.extension_dir), false);
 
   const verifier = new RuntimeHostVerifier(SECRET);
   const challenge = verifier.issueChallenge({
@@ -335,6 +370,7 @@ test("real native Host process bridges Unix socket to Native Messaging and signs
     op: "tool_receipt_issue", ...receiptRequest
   }, { timeoutMs: 3000 });
   assert.equal(issued.capability.provenance, "lab_host_invocation_capability_v1");
+  assert.deepEqual(issued.extension_epoch, expectedExtensionEpoch);
   const consumed = await requestNativeHost(socketPath, {
     op: "tool_receipt_consume", ...receiptRequest,
     capability: issued.capability,
@@ -372,6 +408,9 @@ test("real native Host process bridges Unix socket to Native Messaging and signs
   assert.match(health.extension_instance_id_sha256, /^[0-9a-f]{64}$/);
   assert.equal(health.extension_loaded_at_ms >= bindingCreatedAtMs, true);
   assert.match(health.extension_binding_sha256, /^[0-9a-f]{64}$/);
+  assert.equal(health.extension_version, "0.1.2");
+  assert.equal(health.current_entry_registry_protocol_version, 2);
+  assert.deepEqual(health.extension_epoch, expectedExtensionEpoch);
   assert.equal(JSON.stringify(health).includes(bindingPath), false);
   assert.equal(stderr, "");
 

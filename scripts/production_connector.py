@@ -47,7 +47,7 @@ TUNNEL_PROFILE_NAME = "local-agent-bridge-production"
 HISTORICAL_TUNNEL_PROFILE_NAMES = ("local-agent-bridge-poc",)
 HISTORICAL_CONNECTOR_NAMES = ("Local Bridge Identity Probe",)
 HOST_EXTENSION_ID = "ikidefdlcddfomimpckflbajjccnmfna"
-MIN_HOST_EXTENSION_VERSION = "0.1.1"
+MIN_HOST_EXTENSION_VERSION = "0.1.2"
 PRODUCTION_RUNTIME_ROOT = Path.home() / ".local-agent-bridge" / "production-connector"
 PRODUCTION_BRIDGE_SOCKET = Path("/tmp/local-agent-bridge-production/bridge.sock")
 PRODUCTION_CATDESK_PORT = 33331
@@ -728,7 +728,7 @@ def _validate_rollback_release(
     return installed
 
 
-def install_native_messaging_manifests(
+def _install_native_messaging_manifests_unlocked(
     layout: dict[str, Path],
     manifest: dict[str, Any],
     *,
@@ -3176,6 +3176,440 @@ def _write_activation_rollback_receipt(
     return {"path": str(layout["rollback_receipt"].resolve()), "sha256": receipt_sha256}
 
 
+def _decode_private_json_snapshot(snapshot: tuple[bytes, int] | None, label: str) -> dict[str, Any]:
+    if snapshot is None:
+        raise RuntimeError(f"{label} is missing")
+    try:
+        value = json.loads(snapshot[0].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"{label} is not valid UTF-8 JSON") from error
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{label} must be a JSON object")
+    return value
+
+
+def _completed_receipt_historical_baseline(
+    receipt: dict[str, Any], manifest: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any], Path, str]:
+    if any(
+        receipt.get(key) != expected
+        for key, expected in (
+            ("schema_version", 1),
+            ("status", "rolled_back"),
+            ("phase", "completed"),
+            ("connector_id", CONNECTOR_ID),
+            ("contract_version", CONTRACT_VERSION),
+        )
+    ):
+        raise RuntimeError("canonical prior rollback receipt is not completed production rollback evidence")
+    prior_revision = _release_revision(str(receipt.get("release_revision") or ""))
+    prior_generation = _endpoint_generation(receipt.get("endpoint_generation"))
+    current_revision = _release_revision(str(manifest.get("release_revision") or ""))
+    current_generation = _endpoint_generation(manifest.get("endpoint_generation"))
+    if prior_revision == current_revision:
+        raise RuntimeError("canonical prior rollback receipt must identify an older production release")
+    if prior_generation != current_generation - 1:
+        raise RuntimeError("canonical prior rollback receipt generation is not the direct predecessor")
+    historical = receipt.get("historical_restarted")
+    historical_bridge = receipt.get("historical_bridge")
+    if not isinstance(historical, dict) or not isinstance(historical_bridge, dict):
+        raise RuntimeError("canonical prior rollback receipt lacks the historical M0 baseline")
+    tunnel_id = receipt.get("tunnel_id")
+    if historical.get("tunnel_id") != tunnel_id:
+        raise RuntimeError("canonical prior rollback receipt historical tunnel id mismatch")
+    _validate_receipt_tunnel_profile(
+        historical,
+        expected_socket=HISTORICAL_M0_BRIDGE_SOCKET,
+        label="completed rollback historical tunnel",
+    )
+    historical_identity = historical.get("process_identity")
+    _validate_process_identity_record(historical_identity)
+    if _process_identity_matches(historical_identity):
+        raise RuntimeError("historical M0 tunnel is still running; current production cannot be adopted")
+    running_historical = _discover_tunnel_processes(
+        profile_dir=Path(str(historical["profile_dir"])),
+        profile_name=str(historical["profile_name"]),
+        expected_socket=HISTORICAL_M0_BRIDGE_SOCKET,
+    )
+    if running_historical:
+        raise RuntimeError("historical M0 tunnel is currently running; current production cannot be adopted")
+
+    bridge_identity = historical_bridge.get("process_identity")
+    _validate_process_identity_record(bridge_identity)
+    try:
+        bridge_argv = shlex.split(str(historical_bridge.get("command") or ""))
+    except ValueError as error:
+        raise RuntimeError("canonical prior rollback receipt historical Bridge command is malformed") from error
+    if (
+        historical_bridge.get("pid") != bridge_identity.get("pid")
+        or bridge_identity.get("argv") != bridge_argv
+        or len(bridge_argv) != 1
+        or Path(bridge_argv[0]).name != "local-tool-bridge"
+        or historical_bridge.get("socket") != str(HISTORICAL_M0_BRIDGE_SOCKET)
+        or not _process_identity_matches(bridge_identity)
+    ):
+        raise RuntimeError("historical M0 Bridge identity is no longer live and exact")
+    _verify_process_owned_unix_socket(
+        bridge_identity, HISTORICAL_M0_BRIDGE_SOCKET, "historical M0 Bridge"
+    )
+
+    raw_historical_state = receipt.get("historical_runtime_state")
+    if not isinstance(raw_historical_state, str) or not Path(raw_historical_state).is_absolute():
+        raise RuntimeError("canonical prior rollback receipt historical runtime state path is invalid")
+    historical_state_path = Path(raw_historical_state).expanduser().resolve()
+    historical_state_snapshot = _private_file_snapshot(
+        historical_state_path, "historical M0 runtime state"
+    )
+    historical_state = _decode_private_json_snapshot(
+        historical_state_snapshot, "historical M0 runtime state"
+    )
+    if any(
+        historical_state.get(state_key) != historical.get(receipt_key)
+        for state_key, receipt_key in (
+            ("tunnel_pid", "pid"),
+            ("tunnel_id", "tunnel_id"),
+            ("tunnel_profile_name", "profile_name"),
+            ("tunnel_profile_sha256", "profile_sha256"),
+            ("tunnel_process_identity", "process_identity"),
+        )
+    ):
+        raise RuntimeError("historical M0 runtime state does not match the completed rollback receipt")
+    historical_state_sha256 = hashlib.sha256(historical_state_snapshot[0]).hexdigest()
+    return historical, historical_bridge, historical_state_path, historical_state_sha256
+
+
+def _observe_current_production_for_rollback_adoption(
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+    *,
+    home_dir: Path,
+    native_user_data_dirs: tuple[Path, ...],
+    fallback_health_url_file: Path,
+    expected_receipt_pin: tuple[str, str] | None = None,
+) -> dict[str, Any]:
+    installed = validate_installed_release(layout)
+    if any(installed.get(key) != value for key, value in manifest.items()):
+        raise RuntimeError("installed production release does not match the exact requested manifest")
+    if not isinstance(installed.get("artifacts_sha256"), dict) or not installed["artifacts_sha256"]:
+        raise RuntimeError("installed production release has no verified artifact pins")
+
+    status = production_status(manifest, layout)
+    required_ready = (
+        "release_installed",
+        "runtime_state_matches",
+        "runtime_verifier_config_ready",
+        "backend_ready",
+        "host_ready",
+        "runtime_hook_ready",
+        "bridge_ready",
+        "local_runtime_ready",
+        "manifest_has_artifacts",
+        "tunnel_ready",
+    )
+    if any(status.get(key) is not True for key in required_ready):
+        raise RuntimeError("current production status is not completely ready")
+    if any(
+        status.get(key) != expected
+        for key, expected in (
+            ("connector_id", CONNECTOR_ID),
+            ("contract_version", CONTRACT_VERSION),
+            ("release_revision", manifest["release_revision"]),
+            ("endpoint_generation", manifest["endpoint_generation"]),
+            ("workspace", manifest["workspace"]),
+            ("tunnel_profile_name", TUNNEL_PROFILE_NAME),
+        )
+    ):
+        raise RuntimeError("current production status identity drifted")
+
+    verify_caller_conversation_id_rejected(layout)
+    validate_native_messaging_manifests(
+        layout,
+        manifest,
+        home_dir=home_dir,
+        native_user_data_dirs=native_user_data_dirs,
+    )
+    state_snapshot = _private_file_snapshot(
+        layout["runtime_state"], "production runtime state for rollback adoption"
+    )
+    state = _decode_private_json_snapshot(
+        state_snapshot, "production runtime state for rollback adoption"
+    )
+    observed_receipt_pin = (
+        state.get("activation_rollback_receipt"),
+        state.get("activation_rollback_receipt_sha256"),
+    )
+    if expected_receipt_pin is None:
+        if observed_receipt_pin != (None, None):
+            raise RuntimeError("current production already has a rollback receipt pin")
+    elif observed_receipt_pin != expected_receipt_pin:
+        raise RuntimeError("current production rollback receipt pin drifted after adoption")
+
+    profile = _validate_tunnel_profile(
+        layout["tunnel_profile"],
+        profile_name=TUNNEL_PROFILE_NAME,
+        expected_socket=layout["bridge_socket"],
+    )
+    discovered = _discover_tunnel_processes(
+        profile_dir=layout["tunnel_dir"],
+        profile_name=TUNNEL_PROFILE_NAME,
+        expected_socket=layout["bridge_socket"],
+    )
+    if len(discovered) != 1:
+        raise RuntimeError("current production tunnel is not the unique exact profile owner")
+    production = discovered[0]
+    _validate_receipt_tunnel_profile(
+        production,
+        expected_socket=layout["bridge_socket"],
+        label="observed current production tunnel",
+    )
+    production_identity = production.get("process_identity")
+    if not _process_identity_matches(production_identity):
+        raise RuntimeError("current production tunnel process identity is no longer live")
+    if any(
+        state.get(state_key) != production.get(receipt_key)
+        for state_key, receipt_key in (
+            ("tunnel_pid", "pid"),
+            ("tunnel_id", "tunnel_id"),
+            ("tunnel_profile_sha256", "profile_sha256"),
+            ("tunnel_process_identity", "process_identity"),
+        )
+    ) or profile.get("tunnel_id") != production.get("tunnel_id") or profile.get(
+        "profile_sha256"
+    ) != production.get("profile_sha256"):
+        raise RuntimeError("current production tunnel identity or profile drifted from runtime state")
+    if status.get("tunnel_pid") != production.get("pid") or status.get(
+        "tunnel_id"
+    ) != production.get("tunnel_id"):
+        raise RuntimeError("current production tunnel identity drifted from ready status")
+    _require_exact_tunnel_id_owners(
+        str(production["tunnel_id"]),
+        {int(production["pid"])},
+        expected_socket=layout["bridge_socket"],
+    )
+
+    component_identities: dict[str, dict[str, Any]] = {}
+    for component in ("catdesk_supervisor", "host", "runtime_hook", "bridge"):
+        pid = state.get(f"{component}_pid")
+        identity = state.get(f"{component}_process_identity")
+        _validate_process_identity_record(identity)
+        if not isinstance(pid, int) or identity.get("pid") != pid or not _process_identity_matches(identity):
+            raise RuntimeError(f"current production {component} process identity drifted")
+        component_identities[component] = identity
+    _verify_process_owned_unix_socket(
+        component_identities["bridge"], layout["bridge_socket"], "current production Bridge"
+    )
+
+    fallback = _verify_ai_bridge_fallback(fallback_health_url_file)
+    fallback_identity = {
+        key: fallback.get(key)
+        for key in (
+            "health_url",
+            "compute_url",
+            "compute_host",
+            "compute_port",
+            "tools",
+            "status_sha256",
+            "stable_identity",
+            "ai_bridge_is_trusted_receipt_source",
+        )
+    }
+    if fallback.get("ready") is not True or fallback.get("ai_bridge_is_trusted_receipt_source") is not False:
+        raise RuntimeError("AI-Bridge fallback is not ready with the required trust boundary")
+    return {
+        "installed": installed,
+        "status": status,
+        "state": state,
+        "state_snapshot": state_snapshot,
+        "production": production,
+        "component_identities": component_identities,
+        "fallback_identity": fallback_identity,
+    }
+
+
+def adopt_current_production_rollback(
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+    *,
+    home_dir: Path = Path.home(),
+    native_user_data_dirs: Iterable[Path] = (),
+    fallback_health_url_file: Path = AI_BRIDGE_FALLBACK_HEALTH_URL_FILE,
+) -> dict[str, Any]:
+    """Arm rollback for an already-running exact production without inventing activation history."""
+    managed_dirs = tuple(Path(path).expanduser() for path in native_user_data_dirs)
+    with _production_install_lock(layout["runtime_root"]):
+        canonical_receipt = layout["rollback_receipt"].expanduser().resolve()
+        prior_receipt_snapshot = _private_file_snapshot(
+            canonical_receipt, "canonical prior completed rollback receipt"
+        )
+        prior_receipt = _decode_private_json_snapshot(
+            prior_receipt_snapshot, "canonical prior completed rollback receipt"
+        )
+        prior_receipt_sha256 = hashlib.sha256(prior_receipt_snapshot[0]).hexdigest()
+        historical, historical_bridge, historical_state_path, historical_state_sha256 = (
+            _completed_receipt_historical_baseline(prior_receipt, manifest)
+        )
+        first = _observe_current_production_for_rollback_adoption(
+            manifest,
+            layout,
+            home_dir=home_dir,
+            native_user_data_dirs=managed_dirs,
+            fallback_health_url_file=fallback_health_url_file,
+        )
+        runtime_snapshot = first["state_snapshot"]
+        runtime_before_sha256 = hashlib.sha256(runtime_snapshot[0]).hexdigest()
+        if historical.get("tunnel_id") != first["production"].get("tunnel_id"):
+            raise RuntimeError("historical M0 and current production tunnel ids do not match")
+
+        second = _observe_current_production_for_rollback_adoption(
+            manifest,
+            layout,
+            home_dir=home_dir,
+            native_user_data_dirs=managed_dirs,
+            fallback_health_url_file=fallback_health_url_file,
+        )
+        for key in (
+            "installed",
+            "status",
+            "state",
+            "production",
+            "component_identities",
+            "fallback_identity",
+        ):
+            if second[key] != first[key]:
+                raise RuntimeError(f"current production {key} drifted during rollback adoption")
+        historical_recheck = _completed_receipt_historical_baseline(prior_receipt, manifest)
+        if historical_recheck != (
+            historical,
+            historical_bridge,
+            historical_state_path,
+            historical_state_sha256,
+        ):
+            raise RuntimeError("historical M0 rollback baseline drifted during adoption")
+        if _read_private_bytes_if_present(
+            canonical_receipt, "canonical prior completed rollback receipt CAS"
+        ) != prior_receipt_snapshot[0]:
+            raise RuntimeError("canonical prior completed rollback receipt changed during adoption")
+        if _read_private_bytes_if_present(
+            layout["runtime_state"], "production runtime state rollback adoption CAS"
+        ) != runtime_snapshot[0]:
+            raise RuntimeError("production runtime state changed during rollback adoption")
+        historical_state_readback = _read_private_bytes_if_present(
+            historical_state_path, "historical M0 runtime state rollback adoption CAS"
+        )
+        if (
+            historical_state_readback is None
+            or hashlib.sha256(historical_state_readback).hexdigest() != historical_state_sha256
+        ):
+            raise RuntimeError("historical M0 runtime state changed during rollback adoption")
+
+        adopted_at = time.time()
+        receipt = {
+            "schema_version": 1,
+            "status": "armed",
+            "connector_id": CONNECTOR_ID,
+            "contract_version": CONTRACT_VERSION,
+            "release_revision": manifest["release_revision"],
+            "endpoint_generation": manifest["endpoint_generation"],
+            "tunnel_id": first["production"]["tunnel_id"],
+            "historical": historical,
+            "production": first["production"],
+            "historical_bridge": historical_bridge,
+            "historical_runtime_state": str(historical_state_path),
+            "historical_runtime_state_sha256": historical_state_sha256,
+            "provenance": "observed_current_production",
+            "original_pre_activation_baseline": "unknown",
+            "prior_canonical_completed_rollback_receipt_sha256": prior_receipt_sha256,
+            "adoption_runtime_state_before_sha256": runtime_before_sha256,
+            "created_at": adopted_at,
+            "adopted_at": adopted_at,
+        }
+        receipt_write_started = False
+        state_write_started = False
+        try:
+            receipt_write_started = True
+            _write_json_private(canonical_receipt, receipt)
+            receipt_sha256 = _sha256_file(canonical_receipt)
+            if _read_private_bytes_if_present(
+                layout["runtime_state"], "production runtime state rollback adoption pin CAS"
+            ) != runtime_snapshot[0]:
+                raise RuntimeError("production runtime state changed before rollback adoption pin")
+            state = dict(first["state"])
+            state.update(
+                {
+                    "activation_rollback_receipt": str(canonical_receipt),
+                    "activation_rollback_receipt_sha256": receipt_sha256,
+                }
+            )
+            state_write_started = True
+            _write_json_private(layout["runtime_state"], state)
+            receipt_readback = _read_private_bytes_if_present(
+                canonical_receipt, "adopted rollback receipt readback"
+            )
+            state_readback = _read_private_bytes_if_present(
+                layout["runtime_state"], "adopted production runtime state readback"
+            )
+            if (
+                receipt_readback is None
+                or hashlib.sha256(receipt_readback).hexdigest() != receipt_sha256
+                or receipt_readback
+                != (json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            ):
+                raise RuntimeError("adopted rollback receipt readback mismatch")
+            if state_readback != (
+                json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+            ).encode("utf-8"):
+                raise RuntimeError("adopted production runtime state pin readback mismatch")
+            post_pin = _observe_current_production_for_rollback_adoption(
+                manifest,
+                layout,
+                home_dir=home_dir,
+                native_user_data_dirs=managed_dirs,
+                fallback_health_url_file=fallback_health_url_file,
+                expected_receipt_pin=(str(canonical_receipt), receipt_sha256),
+            )
+            for key in (
+                "installed",
+                "status",
+                "production",
+                "component_identities",
+                "fallback_identity",
+            ):
+                if post_pin[key] != first[key]:
+                    raise RuntimeError(
+                        f"current production {key} drifted during post-pin rollback adoption verification"
+                    )
+        except Exception as error:
+            rollback_errors: list[str] = []
+            if state_write_started:
+                try:
+                    _restore_private_file_snapshot(
+                        layout["runtime_state"], runtime_snapshot, private_parent=True
+                    )
+                except Exception as rollback_error:
+                    rollback_errors.append(f"runtime state restore failed: {rollback_error}")
+            if receipt_write_started:
+                try:
+                    _restore_private_file_snapshot(
+                        canonical_receipt, prior_receipt_snapshot, private_parent=True
+                    )
+                except Exception as rollback_error:
+                    rollback_errors.append(f"receipt restore failed: {rollback_error}")
+            if rollback_errors:
+                raise RuntimeError(f"{error}; {'; '.join(rollback_errors)}") from error
+            raise
+        return {
+            "adopted": True,
+            "release_revision": manifest["release_revision"],
+            "endpoint_generation": manifest["endpoint_generation"],
+            "production_tunnel_pid": first["production"]["pid"],
+            "historical_bridge_pid": historical_bridge["pid"],
+            "rollback_receipt": {
+                "path": str(canonical_receipt),
+                "sha256": receipt_sha256,
+            },
+        }
+
+
 def _validate_receipt_tunnel_profile(
     item: dict[str, Any], *, expected_socket: Path, label: str
 ) -> dict[str, Any]:
@@ -3285,7 +3719,7 @@ def _resume_rollback_tunnel_switch(
     return _restart_verified_historical_tunnel(historical)
 
 
-def rollback_production_activation(
+def _rollback_production_activation_unlocked(
     manifest: dict[str, Any],
     layout: dict[str, Path],
     *,
@@ -3497,7 +3931,7 @@ def rollback_production_activation(
     }
 
 
-def activate_production_tunnel(
+def _activate_production_tunnel_unlocked(
     manifest: dict[str, Any],
     layout: dict[str, Path],
     *,
@@ -3897,7 +4331,9 @@ def _preserved_activation_state(
     }
 
 
-def start_local_runtime(manifest: dict[str, Any], layout: dict[str, Path]) -> dict[str, Any]:
+def _start_local_runtime_unlocked(
+    manifest: dict[str, Any], layout: dict[str, Path]
+) -> dict[str, Any]:
     validate_installed_release(layout)
     current = production_status(manifest, layout)
     if current["local_runtime_ready"]:
@@ -5017,6 +5453,69 @@ def _production_install_lock(runtime_root: Path):
             os.close(fd)
 
 
+def install_native_messaging_manifests(
+    layout: dict[str, Path],
+    manifest: dict[str, Any],
+    *,
+    home_dir: Path = Path.home(),
+    native_user_data_dirs: Iterable[Path] = (),
+    browser_executables: Iterable[Path] = (),
+) -> dict[str, Path]:
+    with _production_install_lock(layout["runtime_root"]):
+        return _install_native_messaging_manifests_unlocked(
+            layout,
+            manifest,
+            home_dir=home_dir,
+            native_user_data_dirs=native_user_data_dirs,
+            browser_executables=browser_executables,
+        )
+
+
+def rollback_production_activation(
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+    *,
+    receipt_path: Path | None = None,
+) -> dict[str, Any]:
+    with _production_install_lock(layout["runtime_root"]):
+        return _rollback_production_activation_unlocked(
+            manifest, layout, receipt_path=receipt_path
+        )
+
+
+def activate_production_tunnel(
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+    *,
+    historical_profile_dir: Path,
+    historical_profile_name: str,
+    historical_runtime_state: Path = HISTORICAL_M0_RUNTIME_STATE,
+    home_dir: Path = Path.home(),
+    native_user_data_dirs: Iterable[Path] = (),
+    tunnel_client: Path | None = None,
+    fallback_health_url_file: Path = AI_BRIDGE_FALLBACK_HEALTH_URL_FILE,
+) -> dict[str, Any]:
+    with _production_install_lock(layout["runtime_root"]):
+        return _activate_production_tunnel_unlocked(
+            manifest,
+            layout,
+            historical_profile_dir=historical_profile_dir,
+            historical_profile_name=historical_profile_name,
+            historical_runtime_state=historical_runtime_state,
+            home_dir=home_dir,
+            native_user_data_dirs=native_user_data_dirs,
+            tunnel_client=tunnel_client,
+            fallback_health_url_file=fallback_health_url_file,
+        )
+
+
+def start_local_runtime(
+    manifest: dict[str, Any], layout: dict[str, Path]
+) -> dict[str, Any]:
+    with _production_install_lock(layout["runtime_root"]):
+        return _start_local_runtime_unlocked(manifest, layout)
+
+
 def _validate_private_source(path: Path, label: str) -> None:
     try:
         info = path.lstat()
@@ -5736,7 +6235,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Local Agent Bridge production connector contract")
     parser.add_argument(
         "action",
-        choices=("manifest", "validate-handshake", "install", "start-local", "status", "smoke", "install-native", "activate-tunnel", "rollback-tunnel"),
+        choices=("manifest", "validate-handshake", "install", "start-local", "status", "smoke", "install-native", "activate-tunnel", "adopt-current-rollback", "rollback-tunnel"),
     )
     parser.add_argument("--release-revision", required=True)
     parser.add_argument("--endpoint-generation", required=True, type=int)
@@ -5800,6 +6299,13 @@ def main(argv: list[str] | None = None) -> int:
             native_user_data_dirs=args.native_user_data_dir,
             browser_executables=args.browser_executable,
         ).items()}
+    elif args.action == "adopt-current-rollback":
+        result = adopt_current_production_rollback(
+            manifest,
+            layout,
+            native_user_data_dirs=args.native_user_data_dir,
+            fallback_health_url_file=args.fallback_health_url_file,
+        )
     elif args.action == "rollback-tunnel":
         result = rollback_production_activation(
             manifest,

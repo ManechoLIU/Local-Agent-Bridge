@@ -138,13 +138,29 @@ function extensionEpochHealthSummary(epoch) {
   const loadedAt = Number.isSafeInteger(epoch.loaded_at_ms) && epoch.loaded_at_ms > 0
     ? epoch.loaded_at_ms
     : null;
-  if (!instanceHash || !bindingHash || !loadedAt) return {};
+  const extensionVersion = currentExtensionVersion(epoch.extension_version);
+  const registryProtocol = epoch.current_entry_registry_protocol_version;
+  if (!instanceHash || !bindingHash || !loadedAt || !extensionVersion || registryProtocol !== 2) return {};
   return {
     extension_ready: true,
     extension_instance_id_sha256: instanceHash,
     extension_loaded_at_ms: loadedAt,
-    extension_binding_sha256: bindingHash
+    extension_binding_sha256: bindingHash,
+    extension_version: extensionVersion,
+    current_entry_registry_protocol_version: registryProtocol
   };
+}
+
+function currentExtensionVersion(value) {
+  const text = typeof value === "string" ? value : "";
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?$/.exec(text);
+  if (!match) return null;
+  const parts = match.slice(1).filter((part) => part != null).map(Number);
+  if (!parts.every(Number.isSafeInteger)) return null;
+  for (const [index, required] of [0, 1, 2].entries()) {
+    if (parts[index] !== required) return parts[index] > required ? text : null;
+  }
+  return text;
 }
 
 function extensionEpochReceipt(epoch) {
@@ -155,7 +171,9 @@ function extensionEpochReceipt(epoch) {
   return Object.freeze({
     binding_sha256: summary.extension_binding_sha256,
     instance_id_sha256: summary.extension_instance_id_sha256,
-    loaded_at_ms: summary.extension_loaded_at_ms
+    loaded_at_ms: summary.extension_loaded_at_ms,
+    extension_version: summary.extension_version,
+    current_entry_registry_protocol_version: summary.current_entry_registry_protocol_version
   });
 }
 
@@ -163,7 +181,9 @@ function sameExtensionEpoch(left, right) {
   if (left == null || right == null) return left === right;
   return left.binding_sha256 === right.binding_sha256 &&
     left.instance_id_sha256 === right.instance_id_sha256 &&
-    left.loaded_at_ms === right.loaded_at_ms;
+    left.loaded_at_ms === right.loaded_at_ms &&
+    left.extension_version === right.extension_version &&
+    left.current_entry_registry_protocol_version === right.current_entry_registry_protocol_version;
 }
 
 export function createNativeHostHandler(options) {

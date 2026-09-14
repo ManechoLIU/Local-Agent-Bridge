@@ -33,6 +33,8 @@ const bindingPath = String(process.env.LAB_HOST_EXTENSION_BINDING_FILE || "").tr
 const EXTENSION_ID_PATTERN = /^[a-p]{32}$/;
 const EXTENSION_INSTANCE_ID_PATTERN = /^ei_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const EXTENSION_HELLO_ID_PATTERN = /^eh_([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/;
+const MINIMUM_EXTENSION_VERSION = Object.freeze([0, 1, 2]);
+const CURRENT_ENTRY_REGISTRY_PROTOCOL_VERSION = 2;
 const EXTENSION_BUNDLE_RELATIVE_PATHS = Object.freeze([
   "timeout-budget.js", "manifest.json", "background.js", "current-entry-registry.js",
   "debugger-session.js", "observation.js", "browser-submit.js", "submit-page.js",
@@ -370,9 +372,42 @@ function sendBrowserCommand(message) {
   });
 }
 
+function parseExtensionVersion(value) {
+  const text = typeof value === "string" ? value : "";
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?$/.exec(text);
+  if (!match) return null;
+  const parts = match.slice(1).filter((part) => part != null).map(Number);
+  return parts.every(Number.isSafeInteger) ? Object.freeze({ text, parts }) : null;
+}
+
+function extensionVersionAtLeast(version, minimum) {
+  for (let index = 0; index < minimum.length; index += 1) {
+    const observed = version.parts[index] || 0;
+    if (observed !== minimum[index]) return observed > minimum[index];
+  }
+  return true;
+}
+
+function extensionEpochPublicReceipt(epoch) {
+  return Object.freeze({
+    extension_version: epoch.extension_version,
+    current_entry_registry_protocol_version: epoch.current_entry_registry_protocol_version,
+    binding_sha256: epoch.binding_sha256,
+    instance_id_sha256: epoch.instance_id_sha256,
+    loaded_at_ms: epoch.loaded_at_ms
+  });
+}
+
 function acceptExtensionHello(message) {
   if (extensionBinding) validateCurrentProductionBinding(extensionBinding);
   if (message.interface_version !== 1) throw new Error("extension hello interface_version is invalid");
+  const extensionVersion = parseExtensionVersion(message.extension_version);
+  if (!extensionVersion || !extensionVersionAtLeast(extensionVersion, MINIMUM_EXTENSION_VERSION)) {
+    throw new Error("extension hello extension_version must be at least 0.1.2");
+  }
+  if (message.current_entry_registry_protocol_version !== CURRENT_ENTRY_REGISTRY_PROTOCOL_VERSION) {
+    throw new Error("extension hello current_entry_registry_protocol_version is invalid");
+  }
   const extensionId = String(message.extension_id || "");
   if (!EXTENSION_ID_PATTERN.test(extensionId)) {
     throw new Error("extension hello extension_id is invalid");
@@ -400,6 +435,8 @@ function acceptExtensionHello(message) {
     ? extensionBinding.binding_sha256
     : createHash("sha256").update("unbound-extension:" + extensionId).digest("hex");
   readyExtensionEpoch = Object.freeze({
+    extension_version: extensionVersion.text,
+    current_entry_registry_protocol_version: CURRENT_ENTRY_REGISTRY_PROTOCOL_VERSION,
     instance_id: instanceId,
     loaded_at_ms: loadedAtMs,
     binding_sha256: bindingSha256,
@@ -434,7 +471,8 @@ function consumeBrowserInput(chunk) {
           result: {
             status: "native_host_ready",
             interface_version: 1,
-            socket_path: socketPath
+            socket_path: socketPath,
+            extension_epoch: extensionEpochPublicReceipt(readyExtensionEpoch)
           }
         });
       } catch (error) {

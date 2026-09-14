@@ -215,6 +215,8 @@ test("health exposes only hashed loaded extension epoch summary", async function
     secret: SECRET,
     requireExtensionReady: function () {
       return {
+        extension_version: "0.1.2",
+        current_entry_registry_protocol_version: 2,
         instance_id: "ei_00000000-0000-4000-8000-000000000002",
         instance_id_sha256: "a".repeat(64),
         loaded_at_ms: 1800000000200,
@@ -231,8 +233,42 @@ test("health exposes only hashed loaded extension epoch summary", async function
   assert.equal(health.extension_instance_id_sha256, "a".repeat(64));
   assert.equal(health.extension_loaded_at_ms, 1800000000200);
   assert.equal(health.extension_binding_sha256, "b".repeat(64));
+  assert.equal(health.extension_version, "0.1.2");
+  assert.equal(health.current_entry_registry_protocol_version, 2);
+  assert.deepEqual(health.extension_epoch, {
+    extension_version: "0.1.2",
+    current_entry_registry_protocol_version: 2,
+    instance_id_sha256: "a".repeat(64),
+    loaded_at_ms: 1800000000200,
+    binding_sha256: "b".repeat(64)
+  });
   assert.equal(JSON.stringify(health).includes("/private/extension-binding.json"), false);
   assert.equal(JSON.stringify(health).includes("ei_00000000-0000-4000-8000-000000000002"), false);
+});
+
+test("extension readiness rejects epoch release metadata outside the loaded-worker contract", async function () {
+  const validEpoch = {
+    extension_version: "0.1.2",
+    current_entry_registry_protocol_version: 2,
+    instance_id_sha256: "a".repeat(64),
+    loaded_at_ms: 1800000000200,
+    binding_sha256: "b".repeat(64)
+  };
+  for (const epoch of [
+    { ...validEpoch, extension_version: undefined },
+    { ...validEpoch, extension_version: "0.1.1" },
+    { ...validEpoch, extension_version: "0.1.2.9007199254740992" },
+    { ...validEpoch, current_entry_registry_protocol_version: 1 }
+  ]) {
+    const handle = createNativeHostHandler({
+      secret: SECRET,
+      requireExtensionReady: () => epoch,
+      sendBrowserCommand: async function () {
+        throw new Error("browser must not be called for an invalid extension epoch");
+      }
+    });
+    await assert.rejects(handle({ op: "health" }), /loaded extension epoch is invalid/);
+  }
 });
 
 test("confirmed live submit records validation but uncertain submit does not", async function () {
@@ -383,6 +419,8 @@ test("current-entry discovery rejects caller conversation and requires browser m
 
 test("private receipt operations derive browser identity and produce signed capability, pre, and terminal receipts", async function () {
   const epoch = {
+    extension_version: "0.1.2",
+    current_entry_registry_protocol_version: 2,
     instance_id_sha256: "a".repeat(64),
     loaded_at_ms: 1800000000200,
     binding_sha256: "b".repeat(64)
@@ -495,11 +533,15 @@ test("current-entry discovery signs only browser-provided runtime-invocation mac
 
 test("native Host rejects extension epoch rollover across current-entry and receipt boundaries", async function () {
   const epochA = {
+    extension_version: "0.1.2",
+    current_entry_registry_protocol_version: 2,
     instance_id_sha256: "a".repeat(64),
     loaded_at_ms: 1800000000200,
     binding_sha256: "b".repeat(64)
   };
   const epochB = {
+    extension_version: "0.1.3",
+    current_entry_registry_protocol_version: 2,
     instance_id_sha256: "c".repeat(64),
     loaded_at_ms: 1800000000300,
     binding_sha256: "d".repeat(64)
@@ -548,7 +590,8 @@ test("native Host rejects extension epoch rollover across current-entry and rece
   for (const [field, value] of [
     ["binding_sha256", epochB.binding_sha256],
     ["instance_id_sha256", epochB.instance_id_sha256],
-    ["loaded_at_ms", epochB.loaded_at_ms]
+    ["loaded_at_ms", epochB.loaded_at_ms],
+    ["extension_version", epochB.extension_version]
   ]) {
     epoch = epochA;
     nextEpoch = { ...epochA, [field]: value };

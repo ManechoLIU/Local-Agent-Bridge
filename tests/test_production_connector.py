@@ -162,7 +162,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
         (chrome_host / "native-host.mjs").write_text("#!/usr/bin/env node\n", encoding="utf-8")
         (chrome_host / "host-mcp-adapter.mjs").write_text("#!/usr/bin/env node\n", encoding="utf-8")
         (chrome_host / "extension" / "manifest.json").write_text(
-            json.dumps({"version": "0.1.1"}), encoding="utf-8"
+            json.dumps({"version": pc.MIN_HOST_EXTENSION_VERSION}), encoding="utf-8"
         )
         for relative in pc.RUNTIME_VERIFIER_BUNDLE_RELATIVE_PATHS:
             path = host / relative
@@ -265,6 +265,138 @@ class ProductionConnectorContractTests(unittest.TestCase):
             "argv": argv,
         }
 
+    def _rollback_adoption_fixture(self, root, manifest, layout):
+        historical_identity = self._identity(
+            101,
+            [
+                "/opt/tunnel-client",
+                "run",
+                "--profile-dir",
+                str(root / "m0-profile"),
+                "--profile",
+                "local-agent-bridge-poc",
+            ],
+        )
+        historical = {
+            "pid": 101,
+            "command": " ".join(historical_identity["argv"]),
+            "profile_dir": str(root / "m0-profile"),
+            "profile_name": "local-agent-bridge-poc",
+            "profile_path": str(root / "m0-profile" / "local-agent-bridge-poc.yaml"),
+            "profile_sha256": "a" * 64,
+            "tunnel_id": "tunnel-existing",
+            "process_identity": historical_identity,
+            "expected_socket": str(pc.HISTORICAL_M0_BRIDGE_SOCKET),
+        }
+        historical_state_path = root / "m0-runtime.json"
+        pc._write_json_private(
+            historical_state_path,
+            {
+                "bridge_pid": 202,
+                "tunnel_pid": historical["pid"],
+                "tunnel_id": historical["tunnel_id"],
+                "tunnel_profile_name": historical["profile_name"],
+                "tunnel_profile_sha256": historical["profile_sha256"],
+                "tunnel_process_identity": historical["process_identity"],
+            },
+        )
+        bridge_identity = self._identity(202, ["/opt/local-tool-bridge"])
+        prior_receipt = {
+            "schema_version": 1,
+            "status": "rolled_back",
+            "phase": "completed",
+            "connector_id": pc.CONNECTOR_ID,
+            "contract_version": pc.CONTRACT_VERSION,
+            "release_revision": "9" * 40,
+            "endpoint_generation": manifest["endpoint_generation"] - 1,
+            "tunnel_id": historical["tunnel_id"],
+            "historical": {**historical, "pid": 91},
+            "historical_restarted": historical,
+            "production": {
+                "pid": 93,
+                "tunnel_id": historical["tunnel_id"],
+                "process_identity": self._identity(93, ["/opt/tunnel-client", "run"]),
+            },
+            "historical_bridge": {
+                "pid": 202,
+                "command": "/opt/local-tool-bridge",
+                "socket": str(pc.HISTORICAL_M0_BRIDGE_SOCKET),
+                "process_identity": bridge_identity,
+            },
+            "historical_runtime_state": str(historical_state_path.resolve()),
+            "historical_runtime_state_sha256": "0" * 64,
+            "created_at": 1.0,
+            "rolled_back_at": 2.0,
+        }
+        pc._write_json_private(layout["rollback_receipt"], prior_receipt)
+
+        production_identity = self._identity(
+            303,
+            [
+                "/opt/tunnel-client",
+                "run",
+                "--profile-dir",
+                str(layout["tunnel_dir"]),
+                "--profile",
+                pc.TUNNEL_PROFILE_NAME,
+            ],
+        )
+        production = {
+            "pid": 303,
+            "command": " ".join(production_identity["argv"]),
+            "profile_dir": str(layout["tunnel_dir"]),
+            "profile_name": pc.TUNNEL_PROFILE_NAME,
+            "profile_path": str(layout["tunnel_profile"]),
+            "profile_sha256": "b" * 64,
+            "tunnel_id": historical["tunnel_id"],
+            "process_identity": production_identity,
+            "expected_socket": str(layout["bridge_socket"]),
+        }
+        state = {
+            "schema_version": 1,
+            "connector_id": pc.CONNECTOR_ID,
+            "contract_version": pc.CONTRACT_VERSION,
+            "release_revision": manifest["release_revision"],
+            "endpoint_generation": manifest["endpoint_generation"],
+            "workspace": manifest["workspace"],
+            "tunnel_profile_name": pc.TUNNEL_PROFILE_NAME,
+            "tunnel_pid": production["pid"],
+            "tunnel_id": production["tunnel_id"],
+            "tunnel_profile_sha256": production["profile_sha256"],
+            "tunnel_started_at": 3.0,
+            "tunnel_process_identity": production["process_identity"],
+        }
+        for name, pid in (
+            ("catdesk_supervisor", 401),
+            ("host", 402),
+            ("runtime_hook", 403),
+            ("bridge", 404),
+        ):
+            state[f"{name}_pid"] = pid
+            state[f"{name}_process_identity"] = self._identity(pid, [f"/opt/{name}"])
+        pc._write_json_private(layout["runtime_state"], state)
+        ready = {
+            "connector_id": pc.CONNECTOR_ID,
+            "contract_version": pc.CONTRACT_VERSION,
+            "release_revision": manifest["release_revision"],
+            "endpoint_generation": manifest["endpoint_generation"],
+            "workspace": manifest["workspace"],
+            "tunnel_profile_name": pc.TUNNEL_PROFILE_NAME,
+            "release_installed": True,
+            "runtime_state_matches": True,
+            "runtime_verifier_config_ready": True,
+            "backend_ready": True,
+            "host_ready": True,
+            "runtime_hook_ready": True,
+            "bridge_ready": True,
+            "local_runtime_ready": True,
+            "manifest_has_artifacts": True,
+            "tunnel_ready": True,
+            "tunnel_pid": production["pid"],
+            "tunnel_id": production["tunnel_id"],
+        }
+        return prior_receipt, historical, production, state, ready
+
     def test_canonical_workspace_is_exact_real_project_root_not_repair_worktree(self):
         root = pc.canonical_workspace()
         expected = Path("/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge").resolve()
@@ -310,6 +442,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
         self.assertEqual(manifest["host"]["tool"], "discover_current_entry")
         self.assertFalse(manifest["host"]["accepts_caller_conversation_id"])
         self.assertEqual(manifest["host"]["secure_origin"], "https://chatgpt.com")
+        self.assertEqual(manifest["host"]["minimum_extension_version"], "0.1.2")
         self.assertIn("read", manifest["required_tools"])
         self.assertIn("run_command", manifest["required_tools"])
         self.assertIn("discover_current_entry", manifest["required_tools"])
@@ -889,7 +1022,9 @@ class ProductionConnectorContractTests(unittest.TestCase):
                     else 0o600
                 )
             extension_manifest = layout["host_dir"] / "chrome-host" / "extension" / "manifest.json"
-            extension_manifest.write_text(json.dumps({"version": "0.1.1"}), encoding="utf-8")
+            extension_manifest.write_text(
+                json.dumps({"version": pc.MIN_HOST_EXTENSION_VERSION}), encoding="utf-8"
+            )
             extension_manifest.chmod(0o600)
             installed_release = json.loads(json.dumps(manifest))
             installed_release["artifacts_sha256"] = {
@@ -3563,6 +3698,554 @@ class ProductionConnectorContractTests(unittest.TestCase):
                     )
             self.assertEqual(calls, [("stop", 101), ("stop", 303), ("rollback", 101)])
 
+    def test_adopt_current_rollback_arms_observed_production_without_inventing_activation(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest,
+                runtime_root=root / "runtime",
+                bridge_socket=root / "bridge.sock",
+            )
+            prior, historical, production, state, ready = self._rollback_adoption_fixture(
+                root, manifest, layout
+            )
+            prior_receipt_sha256 = pc._sha256_file(layout["rollback_receipt"])
+            runtime_before_sha256 = pc._sha256_file(layout["runtime_state"])
+            installed = {**manifest, "artifacts_sha256": {"bin/bridge": "f" * 64}}
+            fallback = {
+                "ready": True,
+                "health_url": "http://127.0.0.1:52354",
+                "compute_url": "http://127.0.0.1:52342/mcp",
+                "compute_host": "127.0.0.1",
+                "compute_port": 52342,
+                "tools": ["computer", "shell_command"],
+                "status_sha256": "e" * 64,
+                "ai_bridge_is_trusted_receipt_source": False,
+            }
+
+            def tunnel_processes(*, profile_dir, profile_name, expected_socket):
+                del profile_dir, expected_socket
+                return [] if profile_name == historical["profile_name"] else [production]
+
+            def profile(_path, *, profile_name, expected_socket):
+                del expected_socket
+                if profile_name == historical["profile_name"]:
+                    return {
+                        "profile_sha256": historical["profile_sha256"],
+                        "tunnel_id": historical["tunnel_id"],
+                    }
+                return {
+                    "profile_sha256": production["profile_sha256"],
+                    "tunnel_id": production["tunnel_id"],
+                }
+
+            with patch.object(
+                pc, "validate_installed_release", return_value=installed
+            ), patch.object(
+                pc, "production_status", return_value=ready
+            ), patch.object(
+                pc, "verify_caller_conversation_id_rejected"
+            ), patch.object(
+                pc, "validate_native_messaging_manifests", return_value={}
+            ), patch.object(
+                pc, "_verify_ai_bridge_fallback", return_value=fallback
+            ), patch.object(
+                pc, "_validate_tunnel_profile", side_effect=profile
+            ), patch.object(
+                pc, "_discover_tunnel_processes", side_effect=tunnel_processes
+            ), patch.object(
+                pc,
+                "_process_identity_matches",
+                side_effect=lambda identity: identity.get("pid") != historical["pid"],
+            ), patch.object(
+                pc, "_require_exact_tunnel_id_owners"
+            ), patch.object(
+                pc, "_verify_process_owned_unix_socket"
+            ) as socket_owner, patch.object(
+                pc, "_stop_verified_tunnel"
+            ) as forbidden_stop, patch.object(
+                pc, "_start_production_tunnel"
+            ) as forbidden_start:
+                result = pc.adopt_current_production_rollback(
+                    manifest,
+                    layout,
+                    home_dir=root / "home",
+                    fallback_health_url_file=root / "fallback-health-url",
+                )
+
+            self.assertTrue(result["adopted"])
+            forbidden_stop.assert_not_called()
+            forbidden_start.assert_not_called()
+            socket_owner.assert_has_calls(
+                [
+                    call(
+                        prior["historical_bridge"]["process_identity"],
+                        pc.HISTORICAL_M0_BRIDGE_SOCKET,
+                        "historical M0 Bridge",
+                    ),
+                    call(
+                        state["bridge_process_identity"],
+                        layout["bridge_socket"],
+                        "current production Bridge",
+                    ),
+                ],
+                any_order=True,
+            )
+            receipt = json.loads(layout["rollback_receipt"].read_text(encoding="utf-8"))
+            self.assertEqual(receipt["status"], "armed")
+            self.assertEqual(receipt["provenance"], "observed_current_production")
+            self.assertEqual(receipt["original_pre_activation_baseline"], "unknown")
+            self.assertEqual(receipt["historical"], historical)
+            self.assertEqual(receipt["historical_bridge"], prior["historical_bridge"])
+            self.assertEqual(
+                receipt["prior_canonical_completed_rollback_receipt_sha256"],
+                prior_receipt_sha256,
+            )
+            self.assertEqual(
+                receipt["adoption_runtime_state_before_sha256"],
+                runtime_before_sha256,
+            )
+            self.assertNotIn("activated_at", receipt)
+            self.assertNotEqual(receipt.get("created_at"), prior["created_at"])
+            updated_state = json.loads(layout["runtime_state"].read_text(encoding="utf-8"))
+            self.assertEqual(
+                updated_state["activation_rollback_receipt"],
+                str(layout["rollback_receipt"].resolve()),
+            )
+            self.assertEqual(
+                updated_state["activation_rollback_receipt_sha256"],
+                pc._sha256_file(layout["rollback_receipt"]),
+            )
+            for key, value in state.items():
+                self.assertEqual(updated_state[key], value)
+
+    def test_adopt_current_rollback_rejects_receipt_identity_pin_ready_profile_and_status_drift_without_writes(self):
+        manifest = self._manifest()
+        cases = (
+            "prior_receipt_not_completed",
+            "prior_generation_not_predecessor",
+            "prior_release_same_current",
+            "component_identity",
+            "receipt_pin_only",
+            "receipt_hash_only",
+            "not_ready",
+            "profile",
+            "status_drift",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as raw_root:
+                root = Path(raw_root)
+                layout = pc.production_layout(
+                    manifest,
+                    runtime_root=root / "runtime",
+                    bridge_socket=root / "bridge.sock",
+                )
+                prior, historical, production, state, ready = self._rollback_adoption_fixture(
+                    root, manifest, layout
+                )
+                if case == "prior_receipt_not_completed":
+                    pc._write_json_private(
+                        layout["rollback_receipt"], {**prior, "status": "armed", "phase": "intent"}
+                    )
+                if case == "prior_generation_not_predecessor":
+                    pc._write_json_private(
+                        layout["rollback_receipt"],
+                        {**prior, "endpoint_generation": manifest["endpoint_generation"] - 2},
+                    )
+                if case == "prior_release_same_current":
+                    pc._write_json_private(
+                        layout["rollback_receipt"],
+                        {**prior, "release_revision": manifest["release_revision"]},
+                    )
+                if case == "receipt_pin_only":
+                    state["activation_rollback_receipt"] = str(layout["rollback_receipt"].resolve())
+                    pc._write_json_private(layout["runtime_state"], state)
+                if case == "receipt_hash_only":
+                    state["activation_rollback_receipt_sha256"] = "d" * 64
+                    pc._write_json_private(layout["runtime_state"], state)
+                receipt_before = layout["rollback_receipt"].read_bytes()
+                state_before = layout["runtime_state"].read_bytes()
+                installed = {**manifest, "artifacts_sha256": {"bin/bridge": "f" * 64}}
+
+                status_values = [dict(ready), dict(ready), dict(ready)]
+                if case == "not_ready":
+                    status_values[0]["tunnel_ready"] = False
+                if case == "status_drift":
+                    status_values[1]["tunnel_pid"] = 909
+
+                def tunnel_processes(*, profile_dir, profile_name, expected_socket):
+                    del profile_dir, expected_socket
+                    return [] if profile_name == historical["profile_name"] else [production]
+
+                def profile(_path, *, profile_name, expected_socket):
+                    del expected_socket
+                    if profile_name == historical["profile_name"]:
+                        return {
+                            "profile_sha256": historical["profile_sha256"],
+                            "tunnel_id": historical["tunnel_id"],
+                        }
+                    return {
+                        "profile_sha256": "0" * 64 if case == "profile" else production["profile_sha256"],
+                        "tunnel_id": production["tunnel_id"],
+                    }
+
+                def identity_matches(identity):
+                    if identity.get("pid") == historical["pid"]:
+                        return False
+                    if case == "component_identity" and identity.get("pid") == state["host_pid"]:
+                        return False
+                    return True
+
+                fallback = {
+                    "ready": True,
+                    "health_url": "http://127.0.0.1:52354",
+                    "compute_url": "http://127.0.0.1:52342/mcp",
+                    "compute_host": "127.0.0.1",
+                    "compute_port": 52342,
+                    "tools": ["computer", "shell_command"],
+                    "status_sha256": "e" * 64,
+                    "ai_bridge_is_trusted_receipt_source": False,
+                }
+                with patch.object(
+                    pc, "validate_installed_release", return_value=installed
+                ), patch.object(
+                    pc, "production_status", side_effect=status_values
+                ), patch.object(
+                    pc, "verify_caller_conversation_id_rejected"
+                ), patch.object(
+                    pc, "validate_native_messaging_manifests", return_value={}
+                ), patch.object(
+                    pc, "_verify_ai_bridge_fallback", return_value=fallback
+                ), patch.object(
+                    pc, "_validate_tunnel_profile", side_effect=profile
+                ), patch.object(
+                    pc, "_discover_tunnel_processes", side_effect=tunnel_processes
+                ), patch.object(
+                    pc, "_process_identity_matches", side_effect=identity_matches
+                ), patch.object(
+                    pc, "_require_exact_tunnel_id_owners"
+                ), patch.object(
+                    pc, "_verify_process_owned_unix_socket"
+                ):
+                    with self.assertRaises(RuntimeError):
+                        pc.adopt_current_production_rollback(
+                            manifest,
+                            layout,
+                            home_dir=root / "home",
+                            fallback_health_url_file=root / "fallback-health-url",
+                        )
+                self.assertEqual(layout["rollback_receipt"].read_bytes(), receipt_before)
+                self.assertEqual(layout["runtime_state"].read_bytes(), state_before)
+
+    def test_adopt_current_rollback_restores_receipt_and_runtime_bytes_when_pin_write_fails_after_replace(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest,
+                runtime_root=root / "runtime",
+                bridge_socket=root / "bridge.sock",
+            )
+            prior, historical, production, state, ready = self._rollback_adoption_fixture(
+                root, manifest, layout
+            )
+            receipt_before = layout["rollback_receipt"].read_bytes()
+            state_before = layout["runtime_state"].read_bytes()
+            observation = {
+                "installed": {**manifest, "artifacts_sha256": {"bin/bridge": "f" * 64}},
+                "status": ready,
+                "state": state,
+                "state_snapshot": (state_before, 0o600),
+                "production": production,
+                "component_identities": {
+                    name: state[f"{name}_process_identity"]
+                    for name in ("catdesk_supervisor", "host", "runtime_hook", "bridge")
+                },
+                "fallback_identity": {"status_sha256": "e" * 64},
+            }
+            original_write = pc._write_json_private
+
+            def fail_after_runtime_replace(path, value, **kwargs):
+                original_write(path, value, **kwargs)
+                if path == layout["runtime_state"] and "activation_rollback_receipt" in value:
+                    raise RuntimeError("injected runtime pin persistence failure")
+
+            with patch.object(
+                pc,
+                "_completed_receipt_historical_baseline",
+                return_value=(
+                    historical,
+                    prior["historical_bridge"],
+                    Path(prior["historical_runtime_state"]),
+                    pc._sha256_file(Path(prior["historical_runtime_state"])),
+                ),
+            ), patch.object(
+                pc,
+                "_observe_current_production_for_rollback_adoption",
+                return_value=observation,
+            ), patch.object(
+                pc, "_write_json_private", side_effect=fail_after_runtime_replace
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected runtime pin persistence failure"):
+                    pc.adopt_current_production_rollback(manifest, layout)
+            self.assertEqual(layout["rollback_receipt"].read_bytes(), receipt_before)
+            self.assertEqual(layout["runtime_state"].read_bytes(), state_before)
+
+    def test_adopt_current_rollback_restores_receipt_when_receipt_write_fails_after_replace(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest,
+                runtime_root=root / "runtime",
+                bridge_socket=root / "bridge.sock",
+            )
+            prior, historical, production, state, ready = self._rollback_adoption_fixture(
+                root, manifest, layout
+            )
+            receipt_before = layout["rollback_receipt"].read_bytes()
+            state_before = layout["runtime_state"].read_bytes()
+            observation = {
+                "installed": {**manifest, "artifacts_sha256": {"bin/bridge": "f" * 64}},
+                "status": ready,
+                "state": state,
+                "state_snapshot": (state_before, 0o600),
+                "production": production,
+                "component_identities": {
+                    name: state[f"{name}_process_identity"]
+                    for name in ("catdesk_supervisor", "host", "runtime_hook", "bridge")
+                },
+                "fallback_identity": {"status_sha256": "e" * 64},
+            }
+            original_write = pc._write_json_private
+
+            def fail_after_receipt_replace(path, value, **kwargs):
+                original_write(path, value, **kwargs)
+                if (
+                    path.resolve() == layout["rollback_receipt"].resolve()
+                    and value.get("status") == "armed"
+                ):
+                    raise RuntimeError("injected receipt persistence failure")
+
+            with patch.object(
+                pc,
+                "_completed_receipt_historical_baseline",
+                return_value=(
+                    historical,
+                    prior["historical_bridge"],
+                    Path(prior["historical_runtime_state"]),
+                    pc._sha256_file(Path(prior["historical_runtime_state"])),
+                ),
+            ), patch.object(
+                pc,
+                "_observe_current_production_for_rollback_adoption",
+                return_value=observation,
+            ), patch.object(
+                pc, "_write_json_private", side_effect=fail_after_receipt_replace
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected receipt persistence failure"):
+                    pc.adopt_current_production_rollback(manifest, layout)
+            self.assertEqual(layout["rollback_receipt"].read_bytes(), receipt_before)
+            self.assertEqual(layout["runtime_state"].read_bytes(), state_before)
+
+    def test_adopt_current_rollback_restores_both_files_when_post_pin_identity_recheck_drifts(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest,
+                runtime_root=root / "runtime",
+                bridge_socket=root / "bridge.sock",
+            )
+            prior, historical, production, state, ready = self._rollback_adoption_fixture(
+                root, manifest, layout
+            )
+            receipt_before = layout["rollback_receipt"].read_bytes()
+            state_before = layout["runtime_state"].read_bytes()
+            observation = {
+                "installed": {**manifest, "artifacts_sha256": {"bin/bridge": "f" * 64}},
+                "status": ready,
+                "state": state,
+                "state_snapshot": (state_before, 0o600),
+                "production": production,
+                "component_identities": {
+                    name: state[f"{name}_process_identity"]
+                    for name in ("catdesk_supervisor", "host", "runtime_hook", "bridge")
+                },
+                "fallback_identity": {"status_sha256": "e" * 64},
+            }
+            drifted = {
+                **observation,
+                "production": {**production, "pid": 909},
+            }
+            with patch.object(
+                pc,
+                "_completed_receipt_historical_baseline",
+                return_value=(
+                    historical,
+                    prior["historical_bridge"],
+                    Path(prior["historical_runtime_state"]),
+                    pc._sha256_file(Path(prior["historical_runtime_state"])),
+                ),
+            ), patch.object(
+                pc,
+                "_observe_current_production_for_rollback_adoption",
+                side_effect=[observation, observation, drifted],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "post-pin|drift"):
+                    pc.adopt_current_production_rollback(manifest, layout)
+            self.assertEqual(layout["rollback_receipt"].read_bytes(), receipt_before)
+            self.assertEqual(layout["runtime_state"].read_bytes(), state_before)
+
+    def test_adopted_current_production_receipt_is_consumed_by_existing_rollback_gate(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest,
+                runtime_root=root / "runtime",
+                bridge_socket=root / "bridge.sock",
+            )
+            _prior, historical, production, _state, ready = self._rollback_adoption_fixture(
+                root, manifest, layout
+            )
+            installed = {**manifest, "artifacts_sha256": {"bin/bridge": "f" * 64}}
+            fallback = {
+                "ready": True,
+                "health_url": "http://127.0.0.1:52354",
+                "compute_url": "http://127.0.0.1:52342/mcp",
+                "compute_host": "127.0.0.1",
+                "compute_port": 52342,
+                "tools": ["computer", "shell_command"],
+                "status_sha256": "e" * 64,
+                "ai_bridge_is_trusted_receipt_source": False,
+            }
+
+            def tunnel_processes(*, profile_dir, profile_name, expected_socket):
+                del profile_dir, expected_socket
+                return [] if profile_name == historical["profile_name"] else [production]
+
+            def profile(_path, *, profile_name, expected_socket):
+                del expected_socket
+                return {
+                    "profile_sha256": (
+                        historical["profile_sha256"]
+                        if profile_name == historical["profile_name"]
+                        else production["profile_sha256"]
+                    ),
+                    "tunnel_id": production["tunnel_id"],
+                }
+
+            with patch.object(
+                pc, "validate_installed_release", return_value=installed
+            ), patch.object(
+                pc, "production_status", return_value=ready
+            ), patch.object(
+                pc, "verify_caller_conversation_id_rejected"
+            ), patch.object(
+                pc, "validate_native_messaging_manifests", return_value={}
+            ), patch.object(
+                pc, "_verify_ai_bridge_fallback", return_value=fallback
+            ), patch.object(
+                pc, "_validate_tunnel_profile", side_effect=profile
+            ), patch.object(
+                pc, "_discover_tunnel_processes", side_effect=tunnel_processes
+            ), patch.object(
+                pc,
+                "_process_identity_matches",
+                side_effect=lambda identity: identity.get("pid") != historical["pid"],
+            ), patch.object(
+                pc, "_require_exact_tunnel_id_owners"
+            ), patch.object(
+                pc, "_verify_process_owned_unix_socket"
+            ):
+                pc.adopt_current_production_rollback(
+                    manifest,
+                    layout,
+                    home_dir=root / "home",
+                    fallback_health_url_file=root / "fallback-health-url",
+                )
+
+            restarted = {
+                **historical,
+                "pid": 505,
+                "process_identity": self._identity(505, historical["process_identity"]["argv"]),
+            }
+            with patch.object(pc, "_validate_rollback_release"), patch.object(
+                pc, "_process_identity_matches", return_value=True
+            ), patch.object(
+                pc, "_validate_tunnel_profile", side_effect=profile
+            ), patch.object(
+                pc, "_resume_rollback_tunnel_switch", return_value=restarted
+            ) as switch, patch.object(
+                pc, "_require_exact_tunnel_id_owners"
+            ):
+                result = pc.rollback_production_activation(manifest, layout)
+            self.assertTrue(result["rolled_back"])
+            self.assertFalse(result["already_rolled_back"])
+            switch.assert_called_once()
+            completed = json.loads(layout["rollback_receipt"].read_text(encoding="utf-8"))
+            self.assertEqual(completed["status"], "rolled_back")
+            self.assertEqual(completed["provenance"], "observed_current_production")
+
+    def test_all_public_production_state_mutators_take_the_shared_install_lock_first(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest,
+                runtime_root=root / "runtime",
+                bridge_socket=root / "bridge.sock",
+            )
+
+            cases = (
+                (
+                    "install-native",
+                    "_validate_manifest_contract",
+                    lambda: pc.install_native_messaging_manifests(layout, manifest),
+                ),
+                (
+                    "rollback",
+                    "_validate_rollback_release",
+                    lambda: pc.rollback_production_activation(manifest, layout),
+                ),
+                (
+                    "activate",
+                    "validate_installed_release",
+                    lambda: pc.activate_production_tunnel(
+                        manifest,
+                        layout,
+                        historical_profile_dir=root / "m0-profile",
+                        historical_profile_name="local-agent-bridge-poc",
+                    ),
+                ),
+                (
+                    "start-local",
+                    "validate_installed_release",
+                    lambda: pc.start_local_runtime(manifest, layout),
+                ),
+            )
+            for name, first_validation, invoke in cases:
+                with self.subTest(action=name):
+                    locked_roots = []
+
+                    @contextmanager
+                    def record_lock(runtime_root):
+                        locked_roots.append(Path(runtime_root))
+                        yield
+
+                    with patch.object(
+                        pc, "_production_install_lock", side_effect=record_lock
+                    ), patch.object(
+                        pc,
+                        first_validation,
+                        side_effect=RuntimeError("stop after lock probe"),
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "stop after lock probe"):
+                            invoke()
+                    self.assertEqual(locked_roots, [layout["runtime_root"]])
+
     def test_post_e2e_rollback_uses_pinned_receipt_and_updates_both_states_idempotently(self):
         manifest = self._manifest()
         with tempfile.TemporaryDirectory() as raw_root:
@@ -4381,6 +5064,34 @@ class ProductionConnectorContractTests(unittest.TestCase):
         self.assertEqual(requested["release_revision"], manifest["release_revision"])
         self.assertEqual(requested["endpoint_generation"], manifest["endpoint_generation"])
         rollback.assert_called_once_with(requested, layout, receipt_path=None)
+
+    def test_adopt_current_rollback_cli_routes_to_read_only_observation_api(self):
+        manifest = self._manifest()
+        layout = {"runtime_root": Path("/private/runtime")}
+        fallback = Path("/private/fallback-health-url")
+        argv = [
+            "adopt-current-rollback",
+            "--release-revision",
+            REVISION,
+            "--endpoint-generation",
+            "7",
+            "--fallback-health-url-file",
+            str(fallback),
+        ]
+        with patch.object(pc, "release_manifest", return_value=manifest), patch.object(
+            pc, "production_layout", return_value=layout
+        ), patch.object(
+            pc,
+            "adopt_current_production_rollback",
+            return_value={"adopted": True},
+        ) as adopt, patch("builtins.print"):
+            self.assertEqual(pc.main(argv), 0)
+        adopt.assert_called_once_with(
+            manifest,
+            layout,
+            native_user_data_dirs=[],
+            fallback_health_url_file=fallback,
+        )
 
     def test_process_command_match_requires_exact_executable_and_required_arguments(self):
         command = "/private/release/bin/local-tool-bridge --serve production"
