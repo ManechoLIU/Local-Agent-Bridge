@@ -1635,6 +1635,43 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 pc._stop_verified_tunnel(item)
         kill.assert_not_called()
 
+    @unittest.skipUnless(
+        Path("/tmp").is_symlink()
+        and Path("/tmp").resolve() == Path("/private/tmp"),
+        "requires the macOS /tmp -> /private/tmp system alias",
+    )
+    def test_process_owned_unix_socket_accepts_only_the_macos_tmp_alias(self):
+        raw_root = tempfile.mkdtemp(prefix="lab-socket-alias-", dir="/tmp")
+        root = Path(raw_root)
+        live_socket = root / "bridge.sock"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            server.bind(str(live_socket))
+            live_socket.chmod(0o600)
+            identity = pc._capture_process_identity(os.getpid())
+            pc._verify_process_owned_unix_socket(identity, live_socket, "test Bridge")
+
+            real_parent = root / "real-parent"
+            real_parent.mkdir()
+            linked_parent = root / "linked-parent"
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+            linked_socket = real_parent / "linked.sock"
+            second = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                second.bind(str(linked_socket))
+                linked_socket.chmod(0o600)
+                with self.assertRaisesRegex(RuntimeError, "Unix socket is unsafe"):
+                    pc._verify_process_owned_unix_socket(
+                        identity,
+                        linked_parent / linked_socket.name,
+                        "symlinked Bridge",
+                    )
+            finally:
+                second.close()
+        finally:
+            server.close()
+            shutil.rmtree(root, ignore_errors=True)
+
     def test_managed_http_direct_tunnel_uses_owned_health_status_only_to_classify_id(self):
         managed = [
             "/Applications/AI-Bridge.app/Contents/MacOS/tunnel-client",

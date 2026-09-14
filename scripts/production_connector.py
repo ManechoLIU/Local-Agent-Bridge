@@ -5072,9 +5072,21 @@ def _verify_process_owned_unix_socket(
         resolved = path.resolve(strict=True)
     except FileNotFoundError as error:
         raise RuntimeError(f"{label} Unix socket is missing") from error
+    canonical_path = path
+    macos_tmp = Path("/tmp")
+    macos_private_tmp = Path("/private/tmp")
     if (
-        path.is_symlink()
-        or resolved != path
+        sys.platform == "darwin"
+        and path.is_absolute()
+        and (path == macos_tmp or macos_tmp in path.parents)
+        and macos_tmp.is_symlink()
+        and macos_tmp.resolve(strict=True) == macos_private_tmp
+    ):
+        canonical_path = macos_private_tmp / path.relative_to(macos_tmp)
+    if (
+        not path.is_absolute()
+        or path.is_symlink()
+        or resolved != canonical_path
         or not stat.S_ISSOCK(info.st_mode)
         or info.st_uid != os.geteuid()
         or stat.S_IMODE(info.st_mode) & 0o022
