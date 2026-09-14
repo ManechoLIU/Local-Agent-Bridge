@@ -447,6 +447,14 @@ class ProductionConnectorContractTests(unittest.TestCase):
         self.assertIn("run_command", manifest["required_tools"])
         self.assertIn("discover_current_entry", manifest["required_tools"])
         self.assertEqual(manifest["tunnel"]["profile_name"], "local-agent-bridge-production")
+        self.assertEqual(
+            manifest["bridge"]["capability_ttl_ms"],
+            pc.PRODUCTION_BRIDGE_CAPABILITY_TTL_MS,
+        )
+        self.assertEqual(
+            manifest["bridge"]["capability_renew_before_ms"],
+            pc.PRODUCTION_BRIDGE_CAPABILITY_RENEW_BEFORE_MS,
+        )
         self.assertIn("local-agent-bridge-poc", manifest["tunnel"]["legacy_profile_names_forbidden"])
         self.assertIn("Local Bridge Identity Probe", manifest["historical_connectors_forbidden"])
 
@@ -455,6 +463,20 @@ class ProductionConnectorContractTests(unittest.TestCase):
             pc.release_manifest(pc.canonical_workspace(), release_revision="dirty", endpoint_generation=1)
         with self.assertRaises(RuntimeError):
             pc.release_manifest(pc.canonical_workspace(), release_revision=REVISION, endpoint_generation=0)
+        manifest = self._manifest()
+        for ttl_ms, renew_before_ms in (
+            (0, 1),
+            (pc.PRODUCTION_BRIDGE_CAPABILITY_TTL_MS + 1, 1),
+            (1_000, 100),
+            (1_000, 0),
+            (1_000, 1_000),
+        ):
+            broken = json.loads(json.dumps(manifest))
+            broken["bridge"]["capability_ttl_ms"] = ttl_ms
+            broken["bridge"]["capability_renew_before_ms"] = renew_before_ms
+            with self.subTest(ttl_ms=ttl_ms, renew_before_ms=renew_before_ms):
+                with self.assertRaisesRegex(RuntimeError, "renewal policy"):
+                    pc._validate_manifest_contract(broken)
 
     def test_install_native_still_rejects_extension_below_current_manifest_minimum(self):
         manifest = self._manifest()
@@ -606,6 +628,14 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 env["bridge"]["LAB_BRIDGE_STATE_DIR"],
                 str(layout["bridge_state_dir"]),
             )
+            self.assertEqual(
+                env["bridge"]["LAB_BRIDGE_CAPABILITY_TTL_MS"],
+                str(pc.PRODUCTION_BRIDGE_CAPABILITY_TTL_MS),
+            )
+            self.assertEqual(
+                env["bridge"]["LAB_BRIDGE_CAPABILITY_RENEW_BEFORE_MS"],
+                str(pc.PRODUCTION_BRIDGE_CAPABILITY_RENEW_BEFORE_MS),
+            )
             self.assertEqual(env["bridge"]["LAB_PRODUCTION_WORKSPACE"], str(pc.canonical_workspace()))
             self.assertEqual(env["bridge"]["LAB_PRODUCTION_TUNNEL_PROFILE_NAME"], pc.TUNNEL_PROFILE_NAME)
             self.assertIn("host_attestation", env["bridge"]["LAB_BRIDGE_CAPABILITIES"])
@@ -630,6 +660,170 @@ class ProductionConnectorContractTests(unittest.TestCase):
             self.assertIn("local-agent-bridge-production", profile["health"]["url_file"])
             self.assertIn("local-agent-bridge-production", profile["log"]["file"])
 
+    def test_bridge_capability_lease_status_reads_exact_active_bounded_lease(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest, runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
+            )
+            state = {
+                "bridge_capability_id": "bridge-cap-production-test",
+                "bridge_execution_session_id": "bridge-session-production-test",
+                "bridge_capability_ttl_ms": pc.PRODUCTION_BRIDGE_CAPABILITY_TTL_MS,
+                "bridge_capability_renew_before_ms": pc.PRODUCTION_BRIDGE_CAPABILITY_RENEW_BEFORE_MS,
+            }
+            now_ms = 10_000
+            pc._write_json_private(
+                layout["bridge_state_dir"] / "authority-state.json",
+                {
+                    "schema_version": 2,
+                    "key_generation": 1,
+                    "records": {
+                        state["bridge_capability_id"]: {
+                            "lease": {
+                                "grant": {
+                                    "principal_id": "tunnel-client-production-uds",
+                                    "execution_session_id": state["bridge_execution_session_id"],
+                                    "capability_id": state["bridge_capability_id"],
+                                    "workspace_id": pc.CONNECTOR_ID,
+                                    "capabilities": [
+                                        "Discovery",
+                                        "HostAttestation",
+                                        "FileRead",
+                                        "FileWrite",
+                                        "FileMove",
+                                        "Shell",
+                                        "ProcessJobs",
+                                    ],
+                                },
+                                "issued_at_ms": now_ms - 1_000,
+                                "expires_at_ms": now_ms - 1_000
+                                + pc.PRODUCTION_BRIDGE_CAPABILITY_TTL_MS,
+                                "session_generation": 1,
+                            },
+                            "revoked": False,
+                            "used_nonces": [],
+                            "used_request_ids": [],
+                        }
+                    },
+                    "session_generations": {
+                        state["bridge_execution_session_id"]: 1,
+                    },
+                },
+            )
+            observed = pc._bridge_capability_lease_status(
+                layout, state, now_ms=now_ms
+            )
+            self.assertTrue(observed["ready"])
+            self.assertTrue(observed["renewal_enabled"])
+            self.assertEqual(
+                observed["remaining_ms"],
+                pc.PRODUCTION_BRIDGE_CAPABILITY_TTL_MS - 1_000,
+            )
+
+    def test_bridge_capability_lease_status_rejects_expired_unbounded_or_identity_drift(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest, runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
+            )
+            state = {
+                "bridge_capability_id": "bridge-cap-production-test",
+                "bridge_execution_session_id": "bridge-session-production-test",
+                "bridge_capability_ttl_ms": pc.PRODUCTION_BRIDGE_CAPABILITY_TTL_MS,
+                "bridge_capability_renew_before_ms": pc.PRODUCTION_BRIDGE_CAPABILITY_RENEW_BEFORE_MS,
+            }
+
+            def write_record(*, issued_at_ms, expires_at_ms, session_id=None, revoked=False):
+                pc._write_json_private(
+                    layout["bridge_state_dir"] / "authority-state.json",
+                    {
+                        "schema_version": 2,
+                        "key_generation": 1,
+                        "records": {
+                            state["bridge_capability_id"]: {
+                                "lease": {
+                                    "grant": {
+                                        "principal_id": "tunnel-client-production-uds",
+                                        "execution_session_id": session_id
+                                        or state["bridge_execution_session_id"],
+                                        "capability_id": state["bridge_capability_id"],
+                                        "workspace_id": pc.CONNECTOR_ID,
+                                        "capabilities": [
+                                            "Discovery",
+                                            "HostAttestation",
+                                            "FileRead",
+                                            "FileWrite",
+                                            "FileMove",
+                                            "Shell",
+                                            "ProcessJobs",
+                                        ],
+                                    },
+                                    "issued_at_ms": issued_at_ms,
+                                    "expires_at_ms": expires_at_ms,
+                                    "session_generation": 1,
+                                },
+                                "revoked": revoked,
+                                "used_nonces": [],
+                                "used_request_ids": [],
+                            }
+                        },
+                        "session_generations": {
+                            state["bridge_execution_session_id"]: 1,
+                        },
+                    },
+                )
+
+            now_ms = 100_000_000
+            ttl_ms = pc.PRODUCTION_BRIDGE_CAPABILITY_TTL_MS
+            renew_before_ms = pc.PRODUCTION_BRIDGE_CAPABILITY_RENEW_BEFORE_MS
+            for label, kwargs in (
+                (
+                    "expired",
+                    {
+                        "issued_at_ms": now_ms - ttl_ms - 1,
+                        "expires_at_ms": now_ms - 1,
+                    },
+                ),
+                (
+                    "unbounded",
+                    {
+                        "issued_at_ms": now_ms - 1_000,
+                        "expires_at_ms": now_ms - 1_000 + ttl_ms + 1,
+                    },
+                ),
+                (
+                    "missed-renewal-window",
+                    {
+                        "issued_at_ms": now_ms - ttl_ms + renew_before_ms // 2,
+                        "expires_at_ms": now_ms + renew_before_ms // 2,
+                    },
+                ),
+                (
+                    "identity",
+                    {
+                        "issued_at_ms": now_ms - 1_000,
+                        "expires_at_ms": now_ms - 1_000 + ttl_ms,
+                        "session_id": "bridge-session-production-attacker",
+                    },
+                ),
+                (
+                    "revoked",
+                    {
+                        "issued_at_ms": now_ms - 1_000,
+                        "expires_at_ms": now_ms - 1_000 + ttl_ms,
+                        "revoked": True,
+                    },
+                ),
+            ):
+                with self.subTest(label=label):
+                    write_record(**kwargs)
+                    with self.assertRaises(RuntimeError):
+                        pc._bridge_capability_lease_status(
+                            layout, state, now_ms=now_ms
+                        )
     def test_install_release_bundle_is_private_immutable_and_hash_verified(self):
         manifest = self._manifest()
         with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:

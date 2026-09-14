@@ -23,7 +23,9 @@ fn manifest_value() -> serde_json::Value {
         "bridge": {
             "contract_version": CONTRACT,
             "release_revision": REVISION,
-            "endpoint_generation": 7
+            "endpoint_generation": 7,
+            "capability_ttl_ms": 86400000,
+            "capability_renew_before_ms": 3600000
         }
     })
 }
@@ -44,6 +46,8 @@ fn production_bridge_release_fence_accepts_only_exact_manifest_contract() {
     assert_eq!(fence.endpoint_generation, 7);
     assert_eq!(fence.workspace, WORKSPACE);
     assert_eq!(fence.tunnel_profile_name, PROFILE);
+    assert_eq!(fence.capability_ttl_ms, 86_400_000);
+    assert_eq!(fence.capability_renew_before_ms, 3_600_000);
 }
 
 #[test]
@@ -128,6 +132,8 @@ fn production_bridge_release_fence_rejects_bridge_subsection_drift() {
             serde_json::json!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
         ),
         ("endpoint_generation", serde_json::json!(6)),
+        ("capability_ttl_ms", serde_json::json!(86_399_999)),
+        ("capability_renew_before_ms", serde_json::json!(3_599_999)),
     ] {
         let mut candidate = manifest_value();
         candidate["bridge"][key] = value;

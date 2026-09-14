@@ -52,6 +52,8 @@ PRODUCTION_RUNTIME_ROOT = Path.home() / ".local-agent-bridge" / "production-conn
 PRODUCTION_BRIDGE_SOCKET = Path("/tmp/local-agent-bridge-production/bridge.sock")
 PRODUCTION_CATDESK_PORT = 33331
 PRODUCTION_HOST_MCP_PORT = 33321
+PRODUCTION_BRIDGE_CAPABILITY_TTL_MS = 86_400_000
+PRODUCTION_BRIDGE_CAPABILITY_RENEW_BEFORE_MS = 3_600_000
 AI_BRIDGE_EXECUTABLE = Path("/Applications/AI-Bridge.app/Contents/MacOS/ai-bridge")
 COMPUTE_HELPER_EXECUTABLE = Path("/Applications/Compute Helper.app/Contents/MacOS/compute-helper")
 COMPUTE_HELPER_SOCKET = (
@@ -306,6 +308,7 @@ def production_layout(
         "host_extension_binding": runtime_generation_dir / "host" / "runtime-extension-binding.json",
         "host_tool_receipt_state": runtime_generation_dir / "host" / "tool-receipts.json",
         "bridge_state_dir": runtime_generation_dir / "bridge",
+        "bridge_authority_state": runtime_generation_dir / "bridge" / "authority-state.json",
         "bridge_receipt_journal": runtime_generation_dir / "bridge" / "tool-receipt-journal.json",
         "runtime_hook_socket_dir": host_socket_dir,
         "runtime_hook_socket": host_socket_dir / "rh.sock",
@@ -362,6 +365,12 @@ def production_component_env(
         "LAB_BRIDGE_PRINCIPAL_ID": "tunnel-client-production-uds",
         "LAB_BRIDGE_CAPABILITIES": (
             "discovery,host_attestation,file_read,file_write,file_move,shell,process_jobs"
+        ),
+        "LAB_BRIDGE_CAPABILITY_TTL_MS": str(
+            manifest["bridge"]["capability_ttl_ms"]
+        ),
+        "LAB_BRIDGE_CAPABILITY_RENEW_BEFORE_MS": str(
+            manifest["bridge"]["capability_renew_before_ms"]
         ),
         "LAB_HOST_BACKEND_URL": f"http://127.0.0.1:{PRODUCTION_HOST_MCP_PORT}/mcp",
         "LAB_HOST_BACKEND_KEY_FILE": str(layout["host_backend_key"]),
@@ -4059,6 +4068,93 @@ def _activate_production_tunnel_unlocked(
     }
 
 
+def _bridge_capability_lease_status(
+    layout: dict[str, Path], state: dict[str, Any], *, now_ms: int | None = None
+) -> dict[str, Any]:
+    capability_id = state.get("bridge_capability_id")
+    session_id = state.get("bridge_execution_session_id")
+    ttl_ms = state.get("bridge_capability_ttl_ms")
+    renew_before_ms = state.get("bridge_capability_renew_before_ms")
+    if (
+        not isinstance(capability_id, str)
+        or not capability_id.startswith("bridge-cap-production-")
+        or not isinstance(session_id, str)
+        or not session_id.startswith("bridge-session-production-")
+        or ttl_ms != PRODUCTION_BRIDGE_CAPABILITY_TTL_MS
+        or renew_before_ms != PRODUCTION_BRIDGE_CAPABILITY_RENEW_BEFORE_MS
+    ):
+        raise RuntimeError("production Bridge capability renewal state is missing or invalid")
+    raw = _read_private_bytes_if_present(
+        layout["bridge_authority_state"], "production Bridge capability authority state"
+    )
+    if raw is None:
+        raise RuntimeError("production Bridge capability authority state is missing")
+    try:
+        authority = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("production Bridge capability authority state is invalid JSON") from error
+    if not isinstance(authority, dict) or authority.get("schema_version") != 2:
+        raise RuntimeError("production Bridge capability authority state schema is unsupported")
+    records = authority.get("records")
+    generations = authority.get("session_generations")
+    if not isinstance(records, dict) or not isinstance(generations, dict):
+        raise RuntimeError("production Bridge capability authority state is incomplete")
+    record = records.get(capability_id)
+    if not isinstance(record, dict) or record.get("revoked") is not False:
+        raise RuntimeError("production Bridge capability is missing or revoked")
+    lease = record.get("lease")
+    grant = lease.get("grant") if isinstance(lease, dict) else None
+    issued_at_ms = lease.get("issued_at_ms") if isinstance(lease, dict) else None
+    expires_at_ms = lease.get("expires_at_ms") if isinstance(lease, dict) else None
+    session_generation = lease.get("session_generation") if isinstance(lease, dict) else None
+    expected_capabilities = {
+        "Discovery",
+        "HostAttestation",
+        "FileRead",
+        "FileWrite",
+        "FileMove",
+        "Shell",
+        "ProcessJobs",
+    }
+    observed_capabilities = grant.get("capabilities") if isinstance(grant, dict) else None
+    if (
+        not isinstance(grant, dict)
+        or grant.get("capability_id") != capability_id
+        or grant.get("execution_session_id") != session_id
+        or grant.get("principal_id") != "tunnel-client-production-uds"
+        or grant.get("workspace_id") != CONNECTOR_ID
+        or not isinstance(observed_capabilities, list)
+        or not all(isinstance(value, str) for value in observed_capabilities)
+        or set(observed_capabilities) != expected_capabilities
+        or isinstance(issued_at_ms, bool)
+        or not isinstance(issued_at_ms, int)
+        or issued_at_ms < 1
+        or isinstance(expires_at_ms, bool)
+        or not isinstance(expires_at_ms, int)
+        or expires_at_ms <= issued_at_ms
+        or expires_at_ms - issued_at_ms != ttl_ms
+        or isinstance(session_generation, bool)
+        or not isinstance(session_generation, int)
+        or session_generation < 1
+        or generations.get(session_id) != session_generation
+    ):
+        raise RuntimeError("production Bridge capability lease identity or bounds mismatch")
+    observed_now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    if isinstance(observed_now_ms, bool) or not isinstance(observed_now_ms, int):
+        raise RuntimeError("production Bridge capability observation time is invalid")
+    remaining_ms = max(0, expires_at_ms - observed_now_ms)
+    if observed_now_ms > expires_at_ms:
+        raise RuntimeError("production Bridge capability lease is expired")
+    if remaining_ms <= renew_before_ms:
+        raise RuntimeError("production Bridge capability lease did not renew before its safety window")
+    return {
+        "ready": True,
+        "renewal_enabled": True,
+        "remaining_ms": remaining_ms,
+        "expires_at_ms": expires_at_ms,
+    }
+
+
 def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict[str, Any]:
     _validate_manifest_contract(manifest)
     try:
@@ -4129,12 +4225,20 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
     )
     tools: list[str] = []
     bridge_ready = False
+    bridge_lease: dict[str, Any] = {
+        "ready": False,
+        "renewal_enabled": False,
+        "remaining_ms": None,
+        "expires_at_ms": None,
+    }
+    bridge_lease_error = None
     if bridge_process and layout["bridge_socket"].exists():
         try:
             tools = smoke_tools(layout)
-            bridge_ready = True
-        except Exception:
-            pass
+            bridge_lease = _bridge_capability_lease_status(layout, state)
+            bridge_ready = bridge_lease["ready"] is True
+        except Exception as error:
+            bridge_lease_error = str(error)
     local_ready = bool(
         release_installed
         and state_matches
@@ -4162,6 +4266,10 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
         "host_ready": host_ready,
         "runtime_hook_ready": runtime_hook_ready,
         "bridge_ready": bridge_ready,
+        "bridge_capability_renewal_enabled": bridge_lease["renewal_enabled"],
+        "bridge_capability_lease_remaining_ms": bridge_lease["remaining_ms"],
+        "bridge_capability_lease_expires_at_ms": bridge_lease["expires_at_ms"],
+        "bridge_capability_lease_error": bridge_lease_error,
         "local_runtime_ready": local_ready,
         "catdesk_supervisor_pid": catdesk_pid,
         "host_pid": host_pid,
@@ -4464,7 +4572,6 @@ def _start_local_runtime_unlocked(
             **component_env["bridge"],
             "LAB_BRIDGE_EXECUTION_SESSION_ID": session_id,
             "LAB_BRIDGE_CAPABILITY_ID": capability_id,
-            "LAB_BRIDGE_CAPABILITY_TTL_MS": "86400000",
         }
         bridge_binary = layout["bridge_binary"].resolve(strict=True)
         bridge_command = [str(bridge_binary)]
@@ -4502,6 +4609,10 @@ def _start_local_runtime_unlocked(
             "bridge_process_identity": bridge_identity,
             "bridge_execution_session_id": session_id,
             "bridge_capability_id": capability_id,
+            "bridge_capability_ttl_ms": manifest["bridge"]["capability_ttl_ms"],
+            "bridge_capability_renew_before_ms": manifest["bridge"][
+                "capability_renew_before_ms"
+            ],
             "tools": tools,
             **preserved_activation_state,
         }
@@ -5468,6 +5579,23 @@ def _unlink_owned_runtime_pid_file(path: Path) -> None:
 
 def _validate_manifest_contract(manifest: dict[str, Any]) -> None:
     _validate_manifest_identity(manifest)
+    bridge = manifest.get("bridge")
+    ttl_ms = bridge.get("capability_ttl_ms") if isinstance(bridge, dict) else None
+    renew_before_ms = (
+        bridge.get("capability_renew_before_ms") if isinstance(bridge, dict) else None
+    )
+    if (
+        isinstance(ttl_ms, bool)
+        or not isinstance(ttl_ms, int)
+        or ttl_ms != PRODUCTION_BRIDGE_CAPABILITY_TTL_MS
+        or isinstance(renew_before_ms, bool)
+        or not isinstance(renew_before_ms, int)
+        or renew_before_ms != PRODUCTION_BRIDGE_CAPABILITY_RENEW_BEFORE_MS
+        or renew_before_ms >= ttl_ms
+    ):
+        raise RuntimeError(
+            "production Bridge capability renewal policy is invalid, unbounded, or noncanonical"
+        )
     _validate_runtime_dependencies(manifest)
 
 
@@ -6102,6 +6230,8 @@ def release_manifest(
             "contract_version": CONTRACT_VERSION,
             "release_revision": revision,
             "endpoint_generation": generation,
+            "capability_ttl_ms": PRODUCTION_BRIDGE_CAPABILITY_TTL_MS,
+            "capability_renew_before_ms": PRODUCTION_BRIDGE_CAPABILITY_RENEW_BEFORE_MS,
         },
         "host": {
             "tool": "discover_current_entry",

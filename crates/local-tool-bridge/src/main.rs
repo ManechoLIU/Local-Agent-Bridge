@@ -3,7 +3,8 @@ use bridge_security_core::{Capability, CapabilityAuthority, CapabilityGrant, Exe
 use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use local_tool_bridge::{
-    BridgeIngress, ProductionReleaseFence, ToolPolicy, validate_production_release_manifest,
+    BridgeIngress, PRODUCTION_CAPABILITY_TTL_MS, ProductionReleaseFence, ToolPolicy,
+    validate_production_release_manifest,
 };
 use std::{
     env,
@@ -17,7 +18,6 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 const PRODUCTION_BRIDGE_SOCKET: &str = "/tmp/local-agent-bridge-production/bridge.sock";
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = required_env("LAB_BRIDGE_SOCKET")?;
@@ -66,10 +66,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| format!("bridge-session-{}", Uuid::new_v4()));
     let capability_id = env::var("LAB_BRIDGE_CAPABILITY_ID")
         .unwrap_or_else(|_| format!("bridge-cap-{}", Uuid::new_v4()));
-    let ttl_ms = env::var("LAB_BRIDGE_CAPABILITY_TTL_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(3_600_000);
+    let ttl_ms = match env::var("LAB_BRIDGE_CAPABILITY_TTL_MS") {
+        Ok(value) => value
+            .parse::<u64>()
+            .map_err(|_| "LAB_BRIDGE_CAPABILITY_TTL_MS must be a positive integer")?,
+        Err(env::VarError::NotPresent) => 3_600_000,
+        Err(error) => {
+            return Err(format!("LAB_BRIDGE_CAPABILITY_TTL_MS is unreadable: {error}").into());
+        }
+    };
+    let renew_before_ms = match env::var("LAB_BRIDGE_CAPABILITY_RENEW_BEFORE_MS") {
+        Ok(value) => Some(
+            value
+                .parse::<u64>()
+                .map_err(|_| "LAB_BRIDGE_CAPABILITY_RENEW_BEFORE_MS must be a positive integer")?,
+        ),
+        Err(env::VarError::NotPresent) if production_mode => {
+            return Err("production Bridge requires LAB_BRIDGE_CAPABILITY_RENEW_BEFORE_MS".into());
+        }
+        Err(env::VarError::NotPresent) => None,
+        Err(error) => {
+            return Err(
+                format!("LAB_BRIDGE_CAPABILITY_RENEW_BEFORE_MS is unreadable: {error}").into(),
+            );
+        }
+    };
+    if ttl_ms == 0 || (production_mode && ttl_ms > PRODUCTION_CAPABILITY_TTL_MS) {
+        return Err(format!(
+            "production capability ttl must be positive and at most {PRODUCTION_CAPABILITY_TTL_MS}ms"
+        )
+        .into());
+    }
+    if let Some(renew_before_ms) = renew_before_ms {
+        if renew_before_ms == 0 || renew_before_ms >= ttl_ms {
+            return Err(
+                "LAB_BRIDGE_CAPABILITY_RENEW_BEFORE_MS must be positive and less than LAB_BRIDGE_CAPABILITY_TTL_MS"
+                    .into(),
+            );
+        }
+    }
+    if let Some(fence) = &production_fence {
+        if ttl_ms != fence.capability_ttl_ms
+            || renew_before_ms != Some(fence.capability_renew_before_ms)
+        {
+            return Err(
+                "production capability lease environment does not match immutable release manifest"
+                    .into(),
+            );
+        }
+    }
 
     let capabilities = capability_set_from_env()?;
     let policy = ToolPolicy::catdesk_default();
@@ -106,11 +151,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
-        authority.issued_capability_at(&capability_id, now_ms).map_err(|error| {
-            format!(
-                "existing capability {capability_id} is not reusable: {error}; rotate the capability/session identity explicitly"
-            )
-        })?
+        match authority.issued_capability_at(&capability_id, now_ms) {
+            Ok(issued) => issued,
+            Err(_) if renew_before_ms.is_some() && existing.expires_at_ms < now_ms => {
+                // The Bridge renews under its authority mutex before signing the
+                // first request, so no expired proof is ever accepted.
+                authority.issued_capability(&capability_id)?
+            }
+            Err(error) => {
+                return Err(format!(
+                    "existing capability {capability_id} is not reusable: {error}; rotate the capability/session identity explicitly"
+                )
+                .into());
+            }
+        }
     } else {
         authority.issue(grant, now_ms, ttl_ms, 1)?
     };
@@ -127,6 +181,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         policy,
         state_dir.clone(),
     )?;
+    if let Some(renew_before_ms) = renew_before_ms {
+        ingress = ingress.with_capability_renewal(ttl_ms, renew_before_ms)?;
+    }
     match (
         host_backend_url.as_deref(),
         host_backend_key_file.as_deref(),

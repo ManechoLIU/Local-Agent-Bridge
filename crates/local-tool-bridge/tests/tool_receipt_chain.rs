@@ -305,6 +305,8 @@ fn fence() -> ProductionReleaseFence {
         endpoint_generation: 7,
         workspace: "/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge".into(),
         tunnel_profile_name: "local-agent-bridge-production".into(),
+        capability_ttl_ms: 86_400_000,
+        capability_renew_before_ms: 3_600_000,
     }
 }
 
@@ -346,6 +348,49 @@ fn bridge(
     .unwrap()
     .with_tool_receipt_chain(host_socket, runtime_socket, fence())
     .unwrap()
+}
+
+fn bridge_with_renewal_after_challenge(
+    backend_url: &str,
+    state_dir: &Path,
+    host_socket: &Path,
+) -> (BridgeIngress, u64) {
+    let context = ExecutionContext {
+        principal_id: "bridge-principal".into(),
+        execution_session_id: "bridge-session".into(),
+        capability_id: "bridge-capability".into(),
+        workspace_id: "local-agent-bridge-production".into(),
+    };
+    let grant = CapabilityGrant {
+        principal_id: context.principal_id.clone(),
+        execution_session_id: context.execution_session_id.clone(),
+        capability_id: context.capability_id.clone(),
+        workspace_id: context.workspace_id.clone(),
+        capabilities: vec![Capability::Shell],
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut authority = CapabilityAuthority::new_for_test([43; 32]);
+    // The first challenge happens before the renewal threshold; retry crosses it.
+    let issued = authority.issue(grant, now - 1, 5_000, 1).unwrap();
+    authority.save_private(state_dir).unwrap();
+    let ingress = BridgeIngress::new_trusted_unix_socket(
+        authority,
+        issued,
+        context,
+        backend_url,
+        BACKEND_KEY,
+        ToolPolicy::catdesk_default(),
+        state_dir,
+    )
+    .unwrap()
+    .with_capability_renewal(5_000, 4_000)
+    .unwrap()
+    .with_tool_receipt_chain(host_socket, None, fence())
+    .unwrap();
+    (ingress, now - 1)
 }
 
 fn restarted_bridge(
@@ -957,6 +1002,77 @@ async fn protected_run_command_requires_then_consumes_host_capability_exactly_on
     assert_eq!(
         journal.state(bridge_call_id),
         Some(ToolReceiptState::Terminal)
+    );
+}
+
+#[tokio::test]
+async fn renewal_between_host_challenge_and_retry_preserves_exact_single_use_terminal_chain() {
+    let root = tempfile::tempdir().unwrap();
+    let host_path = root.path().join("host.sock");
+    let host_log = Arc::new(StdMutex::new(Vec::new()));
+    let _host = spawn_ndjson_server(host_path.clone(), 3, host_handler(host_log.clone()));
+    while !host_path.exists() {
+        tokio::task::yield_now().await;
+    }
+    let backend_capture = BackendCapture::default();
+    let backend_url = backend_server(backend_capture.clone(), false).await;
+    let (ingress, initial_issued_at_ms) =
+        bridge_with_renewal_after_challenge(&backend_url, root.path(), &host_path);
+    let app = ingress.router();
+
+    let challenge = response_json(
+        app.clone()
+            .oneshot(call(challenge_body("renew-challenge", "printf renewal")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let capability = challenge["error"]["data"]["host_invocation_capability"].clone();
+    let bridge_call_id = capability["bridge_call_id"].as_str().unwrap().to_string();
+    assert_eq!(backend_capture.0.lock().await.len(), 0);
+    let before_renewal = CapabilityAuthority::load_or_create_private(root.path())
+        .unwrap()
+        .lease("bridge-capability")
+        .unwrap();
+    assert_eq!(before_renewal.issued_at_ms, initial_issued_at_ms);
+
+    // The configured renewal threshold is one second after issuance. The receipt
+    // has already been durably ISSUED before this retry crosses that threshold.
+    tokio::time::sleep(Duration::from_millis(1_150)).await;
+    let retry = retry_body("renew-retry", "printf renewal", capability);
+    let accepted = app.clone().oneshot(call(retry.clone())).await.unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+    assert_eq!(backend_capture.0.lock().await.len(), 1);
+    assert!(
+        CapabilityAuthority::load_or_create_private(root.path())
+            .unwrap()
+            .lease("bridge-capability")
+            .unwrap()
+            .issued_at_ms
+            > before_renewal.issued_at_ms
+    );
+    assert_eq!(
+        ToolReceiptJournal::load(root.path().join("tool-receipt-journal.json"))
+            .unwrap()
+            .state(&bridge_call_id),
+        Some(ToolReceiptState::Terminal)
+    );
+
+    let duplicate = app.oneshot(call(retry)).await.unwrap();
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    assert_eq!(backend_capture.0.lock().await.len(), 1);
+    assert_eq!(
+        host_log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["op"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "tool_receipt_issue",
+            "tool_receipt_consume",
+            "tool_receipt_terminal"
+        ]
     );
 }
 

@@ -181,7 +181,7 @@ fn default_key_generation() -> u64 {
     1
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CapabilityAuthority {
     master_key: [u8; 32],
     key_generation: u64,
@@ -391,6 +391,58 @@ impl CapabilityAuthority {
         self.records
             .get(capability_id)
             .map(|record| record.lease.clone())
+    }
+
+    /// Renews a durable capability only when its complete grant still matches the
+    /// caller's immutable binding. Replay state is deliberately retained and the
+    /// in-memory record is restored if publishing the renewed lease fails.
+    pub fn renew_exact_grant_private(
+        &mut self,
+        state_dir: impl AsRef<Path>,
+        capability_id: &str,
+        expected_grant: &CapabilityGrant,
+        issued_at_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<IssuedCapability, String> {
+        if ttl_ms == 0 {
+            return Err("capability ttl must be positive".into());
+        }
+        let expires_at_ms = issued_at_ms
+            .checked_add(ttl_ms)
+            .ok_or_else(|| "capability expiry overflow".to_string())?;
+        let prior = self
+            .records
+            .get(capability_id)
+            .cloned()
+            .ok_or_else(|| "unknown capability".to_string())?;
+        if prior.revoked {
+            return Err("capability revoked".into());
+        }
+        if &prior.lease.grant != expected_grant {
+            return Err("capability grant does not match exact renewal grant".into());
+        }
+        let current_generation = self
+            .session_generations
+            .get(&prior.lease.grant.execution_session_id)
+            .copied()
+            .unwrap_or(prior.lease.session_generation);
+        if current_generation != prior.lease.session_generation {
+            return Err("capability belongs to a stale execution session generation".into());
+        }
+
+        let mut renewed = prior.clone();
+        renewed.lease.issued_at_ms = issued_at_ms;
+        renewed.lease.expires_at_ms = expires_at_ms;
+        let signing_secret = derive_capability_secret(&self.master_key, &renewed.lease)?;
+        self.records.insert(capability_id.to_string(), renewed);
+        if let Err(error) = self.save_private(state_dir) {
+            self.records.insert(capability_id.to_string(), prior);
+            return Err(error);
+        }
+        Ok(IssuedCapability {
+            capability_id: capability_id.to_string(),
+            signing_secret,
+        })
     }
 
     pub fn issued_capability(&self, capability_id: &str) -> Result<IssuedCapability, String> {
@@ -1129,6 +1181,15 @@ mod request_proof_tests {
         (authority, issued, context)
     }
 
+    fn private_test_dir() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "bridge-security-core-renewal-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
     #[test]
     fn bridge_execution_identity_is_in_headers_and_mac() {
         let (mut authority, issued, context) = fixture();
@@ -1175,5 +1236,148 @@ mod request_proof_tests {
                 .unwrap_err(),
             "request MAC mismatch"
         );
+    }
+
+    #[test]
+    fn exact_grant_renewal_replaces_the_signing_secret_without_clearing_replay_sets() {
+        let (mut authority, issued, context) = fixture();
+        let body = br#"{"jsonrpc":"2.0"}"#;
+        let old_proof = sign_request(
+            &issued,
+            &context,
+            "request-before-renewal",
+            "nonce-before-renewal",
+            "tools/call",
+            "run_command",
+            body,
+        )
+        .unwrap();
+        authority
+            .verify_request(
+                &old_proof,
+                body,
+                "tools/call",
+                "run_command",
+                Capability::Shell,
+                2,
+            )
+            .unwrap();
+
+        let state_dir = private_test_dir();
+        authority.save_private(&state_dir).unwrap();
+        let grant = authority.lease(&context.capability_id).unwrap().grant;
+        let renewed = authority
+            .renew_exact_grant_private(&state_dir, &context.capability_id, &grant, 900, 1_000)
+            .unwrap();
+
+        assert_eq!(
+            authority
+                .lease(&context.capability_id)
+                .unwrap()
+                .issued_at_ms,
+            900
+        );
+        assert_eq!(
+            authority
+                .verify_request(
+                    &old_proof,
+                    body,
+                    "tools/call",
+                    "run_command",
+                    Capability::Shell,
+                    900,
+                )
+                .unwrap_err(),
+            "request id replay detected"
+        );
+
+        let stale_proof = sign_request(
+            &issued,
+            &context,
+            "request-with-old-secret",
+            "nonce-with-old-secret",
+            "tools/call",
+            "run_command",
+            body,
+        )
+        .unwrap();
+        assert_eq!(
+            authority
+                .verify_request(
+                    &stale_proof,
+                    body,
+                    "tools/call",
+                    "run_command",
+                    Capability::Shell,
+                    900,
+                )
+                .unwrap_err(),
+            "request MAC mismatch"
+        );
+
+        let renewed_proof = sign_request(
+            &renewed,
+            &context,
+            "request-after-renewal",
+            "nonce-after-renewal",
+            "tools/call",
+            "run_command",
+            body,
+        )
+        .unwrap();
+        authority
+            .verify_request(
+                &renewed_proof,
+                body,
+                "tools/call",
+                "run_command",
+                Capability::Shell,
+                900,
+            )
+            .unwrap();
+        std::fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn exact_grant_renewal_rejects_drift_revocation_and_save_failure_without_mutating_memory() {
+        let (mut authority, _, context) = fixture();
+        let state_dir = private_test_dir();
+        authority.save_private(&state_dir).unwrap();
+        let grant = authority.lease(&context.capability_id).unwrap().grant;
+        let mut drifted = grant.clone();
+        drifted.workspace_id = "other-workspace".into();
+        assert_eq!(
+            authority
+                .renew_exact_grant_private(
+                    &state_dir,
+                    &context.capability_id,
+                    &drifted,
+                    900,
+                    1_000,
+                )
+                .unwrap_err(),
+            "capability grant does not match exact renewal grant"
+        );
+        assert!(authority.revoke(&context.capability_id));
+        assert_eq!(
+            authority
+                .renew_exact_grant_private(&state_dir, &context.capability_id, &grant, 900, 1_000,)
+                .unwrap_err(),
+            "capability revoked"
+        );
+
+        let (mut authority, _, context) = fixture();
+        authority.save_private(&state_dir).unwrap();
+        let grant = authority.lease(&context.capability_id).unwrap().grant;
+        let before = authority.lease(&context.capability_id).unwrap();
+        std::fs::remove_file(state_dir.join("authority-state.json")).unwrap();
+        std::fs::create_dir(state_dir.join("authority-state.json")).unwrap();
+        assert!(
+            authority
+                .renew_exact_grant_private(&state_dir, &context.capability_id, &grant, 900, 1_000,)
+                .is_err()
+        );
+        assert_eq!(authority.lease(&context.capability_id).unwrap(), before);
+        std::fs::remove_dir_all(state_dir).unwrap();
     }
 }

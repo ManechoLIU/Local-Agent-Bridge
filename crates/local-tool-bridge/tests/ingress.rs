@@ -23,6 +23,8 @@ fn production_fence() -> ProductionReleaseFence {
         endpoint_generation: 7,
         workspace: "/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge".into(),
         tunnel_profile_name: "local-agent-bridge-production".into(),
+        capability_ttl_ms: 86_400_000,
+        capability_renew_before_ms: 3_600_000,
     }
 }
 
@@ -183,6 +185,59 @@ async fn authenticated_loopback_ingress_forwards_signed_proof_without_secret() {
     assert!(headers.get("x-lab-request-nonce").is_some());
     assert_eq!(headers.get("x-lab-backend-key").unwrap(), BACKEND_KEY);
     assert!(headers.get("x-openai-subject").is_none());
+}
+
+#[tokio::test]
+async fn explicit_renewal_allows_an_expired_trusted_capability_without_changing_its_context() {
+    let capture = Capture::default();
+    let backend_url = backend_server(capture.clone()).await;
+    let state_dir = tempfile::tempdir().unwrap();
+    let context = ExecutionContext {
+        principal_id: "renew-principal".into(),
+        execution_session_id: "renew-session".into(),
+        capability_id: "renew-capability".into(),
+        workspace_id: "renew-workspace".into(),
+    };
+    let grant = CapabilityGrant {
+        principal_id: context.principal_id.clone(),
+        execution_session_id: context.execution_session_id.clone(),
+        capability_id: context.capability_id.clone(),
+        workspace_id: context.workspace_id.clone(),
+        capabilities: vec![Capability::FileRead],
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut authority = CapabilityAuthority::new_for_test([71; 32]);
+    let issued = authority.issue(grant, now - 10_000, 1, 1).unwrap();
+    authority.save_private(state_dir.path()).unwrap();
+    let app = BridgeIngress::new_trusted_unix_socket(
+        authority,
+        issued,
+        context.clone(),
+        &backend_url,
+        BACKEND_KEY,
+        local_tool_bridge::ToolPolicy::catdesk_default(),
+        state_dir.path(),
+    )
+    .unwrap()
+    .with_capability_renewal(1_000, 100)
+    .unwrap()
+    .router();
+    let body = r#"{"jsonrpc":"2.0","id":"renew","method":"tools/call","params":{"name":"read","arguments":{}}}"#;
+
+    let response = app.oneshot(mcp_request(body, None)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let restarted = CapabilityAuthority::load_or_create_private(state_dir.path()).unwrap();
+    let lease = restarted.lease(&context.capability_id).unwrap();
+    assert_eq!(
+        lease.grant.execution_session_id,
+        context.execution_session_id
+    );
+    assert_eq!(lease.grant.capability_id, context.capability_id);
+    assert_eq!(lease.grant.workspace_id, context.workspace_id);
+    assert!(lease.expires_at_ms > now);
 }
 
 #[tokio::test]

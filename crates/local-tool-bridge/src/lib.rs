@@ -42,6 +42,8 @@ const RECEIPT_JOURNAL_FILE: &str = "tool-receipt-journal.json";
 const MAX_PROTECTED_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_PROTECTED_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_PROTECTED_JSON_DEPTH: usize = 32;
+pub const PRODUCTION_CAPABILITY_TTL_MS: u64 = 86_400_000;
+pub const PRODUCTION_CAPABILITY_RENEW_BEFORE_MS: u64 = 3_600_000;
 const FORWARDED_HEADERS: &[&str] = &[
     "content-type",
     "accept",
@@ -58,6 +60,8 @@ pub struct ProductionReleaseFence {
     pub endpoint_generation: u64,
     pub workspace: String,
     pub tunnel_profile_name: String,
+    pub capability_ttl_ms: u64,
+    pub capability_renew_before_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -511,6 +515,12 @@ pub fn validate_production_release_manifest(
     require_manifest_str(bridge, "contract_version", observed_contract_version)?;
     require_manifest_str(bridge, "release_revision", observed_release_revision)?;
     require_manifest_u64(bridge, "endpoint_generation", observed_endpoint_generation)?;
+    require_manifest_u64(bridge, "capability_ttl_ms", PRODUCTION_CAPABILITY_TTL_MS)?;
+    require_manifest_u64(
+        bridge,
+        "capability_renew_before_ms",
+        PRODUCTION_CAPABILITY_RENEW_BEFORE_MS,
+    )?;
 
     Ok(ProductionReleaseFence {
         contract_version: observed_contract_version.to_string(),
@@ -518,6 +528,8 @@ pub fn validate_production_release_manifest(
         endpoint_generation: observed_endpoint_generation,
         workspace: observed_workspace.to_string(),
         tunnel_profile_name: observed_tunnel_profile_name.to_string(),
+        capability_ttl_ms: PRODUCTION_CAPABILITY_TTL_MS,
+        capability_renew_before_ms: PRODUCTION_CAPABILITY_RENEW_BEFORE_MS,
     })
 }
 
@@ -629,6 +641,27 @@ pub struct BridgeIngress {
     inner: Arc<BridgeIngressInner>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapabilityRenewal {
+    pub ttl_ms: u64,
+    pub renew_before_ms: u64,
+}
+
+impl CapabilityRenewal {
+    pub fn new(ttl_ms: u64, renew_before_ms: u64) -> Result<Self, String> {
+        if ttl_ms == 0 {
+            return Err("capability renewal ttl must be positive".into());
+        }
+        if renew_before_ms == 0 || renew_before_ms >= ttl_ms {
+            return Err("capability renewal threshold must be positive and less than ttl".into());
+        }
+        Ok(Self {
+            ttl_ms,
+            renew_before_ms,
+        })
+    }
+}
+
 #[derive(Clone)]
 struct BackendTarget {
     url: Url,
@@ -637,8 +670,8 @@ struct BackendTarget {
 
 struct BridgeIngressInner {
     authority: Mutex<CapabilityAuthority>,
-    issued: IssuedCapability,
     context: ExecutionContext,
+    renewal: Option<CapabilityRenewal>,
     local_auth: LocalIngressAuth,
     default_backend: BackendTarget,
     host_backend: Option<BackendTarget>,
@@ -695,8 +728,8 @@ impl BridgeIngress {
         Ok(Self {
             inner: Arc::new(BridgeIngressInner {
                 authority: Mutex::new(authority),
-                issued,
                 context,
+                renewal: None,
                 local_auth: LocalIngressAuth::SharedKey(ingress_key_sha256),
                 default_backend: BackendTarget {
                     url: backend_url,
@@ -730,8 +763,8 @@ impl BridgeIngress {
         Ok(Self {
             inner: Arc::new(BridgeIngressInner {
                 authority: Mutex::new(authority),
-                issued,
                 context,
+                renewal: None,
                 local_auth: LocalIngressAuth::TrustedUnixSocket,
                 default_backend: BackendTarget {
                     url: backend_url,
@@ -746,6 +779,21 @@ impl BridgeIngress {
                 tool_receipts: None,
             }),
         })
+    }
+
+    /// Enables bounded renewal for this ingress. It is opt-in so non-production
+    /// callers retain the prior fixed-lease behavior.
+    pub fn with_capability_renewal(
+        mut self,
+        ttl_ms: u64,
+        renew_before_ms: u64,
+    ) -> Result<Self, String> {
+        let renewal = CapabilityRenewal::new(ttl_ms, renew_before_ms)?;
+        let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
+            "capability renewal must be configured before BridgeIngress is cloned".to_string()
+        })?;
+        inner.renewal = Some(renewal);
+        Ok(self)
     }
 
     pub fn with_host_backend(
@@ -899,26 +947,60 @@ async fn handle_mcp(
                 })
         };
     let nonce = Uuid::new_v4().to_string();
-    let proof = match sign_request(
-        &state.inner.issued,
-        &state.inner.context,
-        &request_id,
-        &nonce,
-        method,
-        tool_name,
-        &body,
-    ) {
-        Ok(value) => value,
-        Err(error) => return text_response(StatusCode::INTERNAL_SERVER_ERROR, &error),
-    };
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX);
-    {
+    let proof = {
         let mut authority = state.inner.authority.lock().await;
+        if let Some(renewal) = state.inner.renewal {
+            let lease = match authority.lease(&state.inner.context.capability_id) {
+                Some(lease) => lease,
+                None => return text_response(StatusCode::FORBIDDEN, "unknown capability"),
+            };
+            let renew_at = lease.expires_at_ms.saturating_sub(renewal.renew_before_ms);
+            if now_ms >= renew_at {
+                if let Some(state_dir) = &state.inner.state_dir {
+                    if let Err(error) = authority.renew_exact_grant_private(
+                        state_dir,
+                        &state.inner.context.capability_id,
+                        &lease.grant,
+                        now_ms,
+                        renewal.ttl_ms,
+                    ) {
+                        return text_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &format!("capability renewal failed: {error}"),
+                        );
+                    }
+                } else {
+                    return text_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "capability renewal requires durable Bridge state",
+                    );
+                }
+            }
+        }
+        let issued =
+            match authority.issued_capability_at(&state.inner.context.capability_id, now_ms) {
+                Ok(issued) => issued,
+                Err(error) => return text_response(StatusCode::FORBIDDEN, &error),
+            };
+        let proof = match sign_request(
+            &issued,
+            &state.inner.context,
+            &request_id,
+            &nonce,
+            method,
+            tool_name,
+            &body,
+        ) {
+            Ok(value) => value,
+            Err(error) => return text_response(StatusCode::INTERNAL_SERVER_ERROR, &error),
+        };
+        let authority_before_verify = authority.clone();
         if let Err(error) =
             authority.verify_request(&proof, &body, method, tool_name, capability, now_ms)
         {
@@ -926,13 +1008,15 @@ async fn handle_mcp(
         }
         if let Some(state_dir) = &state.inner.state_dir {
             if let Err(error) = authority.save_private(state_dir) {
+                *authority = authority_before_verify;
                 return text_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &format!("capability replay state persistence failed: {error}"),
                 );
             }
         }
-    }
+        proof
+    };
 
     if let (Some(protected), Some(chain)) = (protected, state.inner.tool_receipts.as_ref()) {
         return match handle_protected_run_command(&state, &headers, protected, body, chain).await {
@@ -1402,8 +1486,21 @@ async fn handle_protected_run_command(
         })
         .map_err(|error| FlowError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let issued = state
+        .inner
+        .authority
+        .lock()
+        .await
+        .issued_capability_at(&state.inner.context.capability_id, now_ms)
+        .map_err(|error| FlowError::new(StatusCode::FORBIDDEN, error))?;
     let proof = sign_request_for_execution(
-        &state.inner.issued,
+        &issued,
         &state.inner.context,
         &host_tool_execution_id,
         &Uuid::new_v4().to_string(),
