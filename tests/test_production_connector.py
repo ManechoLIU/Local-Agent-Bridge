@@ -1649,6 +1649,9 @@ class ProductionConnectorContractTests(unittest.TestCase):
             server.bind(str(live_socket))
             live_socket.chmod(0o600)
             identity = pc._capture_process_identity(os.getpid())
+            self.assertTrue(pc._trusted_macos_tmp_alias())
+            with patch.object(pc.os, "readlink", return_value="/private/tmp"):
+                self.assertFalse(pc._trusted_macos_tmp_alias())
             pc._verify_process_owned_unix_socket(identity, live_socket, "test Bridge")
 
             real_parent = root / "real-parent"
@@ -1668,6 +1671,22 @@ class ProductionConnectorContractTests(unittest.TestCase):
                     )
             finally:
                 second.close()
+
+            target_socket = root / "target.sock"
+            socket_alias = root / "socket-alias.sock"
+            third = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                third.bind(str(target_socket))
+                target_socket.chmod(0o600)
+                socket_alias.symlink_to(target_socket.name)
+                with self.assertRaisesRegex(RuntimeError, "Unix socket is unsafe"):
+                    pc._verify_process_owned_unix_socket(
+                        identity,
+                        socket_alias,
+                        "symlinked socket",
+                    )
+            finally:
+                third.close()
         finally:
             server.close()
             shutil.rmtree(root, ignore_errors=True)

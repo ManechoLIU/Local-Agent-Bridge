@@ -5062,6 +5062,29 @@ def _unique_loopback_listener_identity(host: str, port: int, label: str) -> dict
     return _capture_process_identity(next(iter(pids)))
 
 
+def _trusted_macos_tmp_alias() -> bool:
+    if sys.platform != "darwin":
+        return False
+    macos_tmp = Path("/tmp")
+    macos_private_tmp = Path("/private/tmp")
+    try:
+        tmp_info = macos_tmp.lstat()
+        private_tmp_info = macos_private_tmp.lstat()
+        target = os.readlink(macos_tmp)
+        resolved = macos_tmp.resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        return False
+    return (
+        stat.S_ISLNK(tmp_info.st_mode)
+        and tmp_info.st_uid == 0
+        and target == "private/tmp"
+        and resolved == macos_private_tmp
+        and stat.S_ISDIR(private_tmp_info.st_mode)
+        and private_tmp_info.st_uid == 0
+        and stat.S_IMODE(private_tmp_info.st_mode) & stat.S_ISVTX
+    )
+
+
 def _verify_process_owned_unix_socket(
     identity: dict[str, Any], socket_path: Path, label: str
 ) -> None:
@@ -5076,11 +5099,9 @@ def _verify_process_owned_unix_socket(
     macos_tmp = Path("/tmp")
     macos_private_tmp = Path("/private/tmp")
     if (
-        sys.platform == "darwin"
-        and path.is_absolute()
+        path.is_absolute()
         and (path == macos_tmp or macos_tmp in path.parents)
-        and macos_tmp.is_symlink()
-        and macos_tmp.resolve(strict=True) == macos_private_tmp
+        and _trusted_macos_tmp_alias()
     ):
         canonical_path = macos_private_tmp / path.relative_to(macos_tmp)
     if (
