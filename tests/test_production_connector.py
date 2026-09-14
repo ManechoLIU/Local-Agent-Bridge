@@ -595,6 +595,10 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 layout["runtime_verifier_wrapper"],
                 layout["release_dir"] / "bin" / "runtime-verifier-production",
             )
+            self.assertEqual(
+                layout["node_binary"],
+                layout["release_dir"] / "bin" / "node-runtime",
+            )
             self.assertEqual(layout["bridge_socket"], socket)
             self.assertEqual(
                 layout["tunnel_profile"],
@@ -826,6 +830,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
                         )
     def test_install_release_bundle_is_private_immutable_and_hash_verified(self):
         manifest = self._manifest()
+        source_node = dict(manifest["runtime_dependencies"]["node"])
         with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
             root = Path(raw_root)
             sources = self._release_sources(root)
@@ -987,6 +992,21 @@ class ProductionConnectorContractTests(unittest.TestCase):
             self.assertEqual(
                 layout["tunnel_profile"].read_bytes(), tunnel_profile_before_retry
             )
+
+            legacy_manifest = json.loads(release_manifest_before_retry)
+            legacy_manifest["runtime_dependencies"]["node"] = {
+                "path": source_node["path"],
+                "sha256": source_node["sha256"],
+            }
+            pc._write_json_private(layout["release_manifest"], legacy_manifest)
+            with self.assertRaisesRegex(RuntimeError, "Node.*immutable release"):
+                pc.validate_installed_release(layout)
+            with patch.object(pc, "_spawn_logged") as spawn:
+                with self.assertRaisesRegex(RuntimeError, "Node.*immutable release"):
+                    pc.start_local_runtime(manifest, layout)
+                spawn.assert_not_called()
+            layout["release_manifest"].write_bytes(release_manifest_before_retry)
+            layout["release_manifest"].chmod(0o600)
 
             extra = layout["release_dir"] / "unlisted-evidence.txt"
             extra.write_text("not in release manifest", encoding="utf-8")
@@ -1233,6 +1253,8 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 "#!/bin/sh\nexit 0\n", encoding="utf-8"
             )
             layout["runtime_verifier_wrapper"].chmod(0o700)
+            layout["node_binary"].write_bytes(b"release-local-node")
+            layout["node_binary"].chmod(0o700)
             for relative in pc.RUNTIME_VERIFIER_BUNDLE_RELATIVE_PATHS:
                 path = layout["host_dir"] / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -1248,10 +1270,15 @@ class ProductionConnectorContractTests(unittest.TestCase):
             )
             extension_manifest.chmod(0o600)
             installed_release = json.loads(json.dumps(manifest))
+            installed_release["runtime_dependencies"]["node"] = {
+                "path": str(layout["node_binary"].resolve(strict=True)),
+                "sha256": pc._sha256_file(layout["node_binary"]),
+            }
             installed_release["artifacts_sha256"] = {
                 str(path.relative_to(layout["release_dir"])): pc._sha256_file(path)
                 for path in (
                     layout["native_host_wrapper"],
+                    layout["node_binary"],
                     *pc._runtime_verifier_bundle_paths(layout),
                 )
             }
@@ -1440,6 +1467,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
 
     def test_real_release_registers_and_revalidates_runtime_host_verifier(self):
         manifest = self._manifest()
+        source_node = dict(manifest["runtime_dependencies"]["node"])
         with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
             root = Path(raw_root)
             layout = pc.production_layout(
@@ -1482,8 +1510,29 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 layout["release_manifest"].read_text(encoding="utf-8")
             )["runtime_dependencies"]["node"]
             self.assertEqual(
+                node["path"], str(layout["node_binary"].resolve(strict=True))
+            )
+            self.assertEqual(stat.S_IMODE(layout["node_binary"].stat().st_mode), 0o700)
+            self.assertEqual(node["sha256"], pc._sha256_file(layout["node_binary"]))
+            self.assertEqual(node["sha256"], source_node["sha256"])
+            self.assertEqual(
                 config["verifiers"]["web"]["bundle_sha256"][node["path"]],
                 node["sha256"],
+            )
+            native_wrapper = layout["native_host_wrapper"].read_text(encoding="utf-8")
+            verifier_wrapper = layout["runtime_verifier_wrapper"].read_text(
+                encoding="utf-8"
+            )
+            release_node = layout["node_binary"].resolve(strict=True)
+            self.assertIn(f"exec {release_node}", native_wrapper)
+            self.assertIn(f"exec {release_node}", verifier_wrapper)
+            self.assertNotIn(
+                self._manifest()["runtime_dependencies"]["node"]["path"],
+                native_wrapper,
+            )
+            self.assertNotIn(
+                self._manifest()["runtime_dependencies"]["node"]["path"],
+                verifier_wrapper,
             )
 
             dependency = layout["host_dir"] / "chrome-host" / "client.mjs"
@@ -4778,6 +4827,68 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 pc.start_local_runtime(manifest, layout)
             self.assertFalse(layout["bridge_socket"].exists())
 
+    def test_runtime_status_rejects_host_started_with_nonrelease_node(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest,
+                runtime_root=root / "runtime",
+                bridge_socket=root / "bridge.sock",
+            )
+            release_node = layout["node_binary"]
+            release_node.parent.mkdir(parents=True, exist_ok=True)
+            release_node.write_text("release-node", encoding="utf-8")
+            release_node.chmod(0o700)
+            source_node = root / "homebrew-node"
+            installed = json.loads(json.dumps(manifest))
+            installed["runtime_dependencies"]["node"] = {
+                "path": str(release_node),
+                "sha256": "a" * 64,
+            }
+            state = {
+                "release_revision": manifest["release_revision"],
+                "endpoint_generation": manifest["endpoint_generation"],
+                "workspace": manifest["workspace"],
+                "tunnel_profile_name": pc.TUNNEL_PROFILE_NAME,
+            }
+            for name, pid, argv in (
+                ("catdesk_supervisor", 801, ["/private/catdesk"]),
+                ("host", 802, [str(source_node), str(layout["host_mcp_adapter"])]),
+                ("runtime_hook", 803, ["/private/python", str(layout["runtime_hook_entrypoint"])]),
+                ("bridge", 804, [str(layout["bridge_binary"])]),
+            ):
+                state[f"{name}_pid"] = pid
+                state[f"{name}_process_identity"] = self._identity(pid, argv)
+            pc._write_json_private(layout["runtime_state"], state)
+            with patch.object(
+                pc, "validate_installed_release", return_value=installed
+            ), patch.object(
+                pc, "_validate_runtime_host_verifier_registration"
+            ), patch.object(
+                pc, "_process_identity_matches", return_value=True
+            ), patch.object(
+                pc, "_tcp_ready", return_value=True
+            ), patch.object(
+                pc, "_runtime_hook_socket_is_live", return_value=True
+            ), patch.object(
+                pc, "smoke_tools", return_value=sorted(pc.REQUIRED_TOOLS)
+            ), patch.object(
+                pc,
+                "_bridge_capability_lease_status",
+                return_value={
+                    "ready": True,
+                    "renewal_enabled": True,
+                    "remaining_ms": 1000,
+                    "expires_at_ms": 2000,
+                },
+            ), patch.object(
+                pc, "production_tunnel_status", return_value={"tunnel_ready": True}
+            ):
+                status = pc.production_status(manifest, layout)
+            self.assertFalse(status["host_ready"])
+            self.assertFalse(status["local_runtime_ready"])
+
     def test_start_local_post_status_failure_cleans_new_processes_and_preserves_verified_tunnel(self):
         manifest = self._manifest()
         with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
@@ -4812,7 +4923,16 @@ class ProductionConnectorContractTests(unittest.TestCase):
             node = root / "node"
             node.write_text("node", encoding="utf-8")
             node.chmod(0o700)
+            release_node = layout["node_binary"]
+            release_node.parent.mkdir(parents=True, exist_ok=True)
+            release_node.write_text("release-node", encoding="utf-8")
+            release_node.chmod(0o700)
             kernel_python = root / "kernel-python"
+            installed_release = json.loads(json.dumps(manifest))
+            installed_release["runtime_dependencies"]["node"] = {
+                "path": str(release_node),
+                "sha256": pc._sha256_file(release_node),
+            }
             processes = [
                 MagicMock(pid=801), MagicMock(pid=802), MagicMock(pid=803), MagicMock(pid=804)
             ]
@@ -4832,7 +4952,9 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 return sorted(pc.REQUIRED_TOOLS)
 
             try:
-                with patch.object(pc, "validate_installed_release"), patch.object(
+                with patch.object(
+                    pc, "validate_installed_release", return_value=installed_release
+                ), patch.object(
                     pc,
                     "production_status",
                     side_effect=[
@@ -4859,9 +4981,14 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 ), patch.object(
                     pc, "_wait_for_bridge", side_effect=bridge_became_ready
                 ), patch.object(
-                    pc, "_validate_runtime_dependencies", return_value={
-                        "node": {"path": str(node)}, "python": {"path": str(kernel_python)}
-                    }
+                    pc,
+                    "_validate_runtime_dependencies",
+                    side_effect=lambda observed: {
+                        "node": {
+                            "path": str(release_node if observed is installed_release else node)
+                        },
+                        "python": {"path": str(kernel_python)},
+                    },
                 ), patch.object(pc, "_stop_verified_process_identity") as stop:
                     with self.assertRaisesRegex(RuntimeError, "post-start status"):
                         pc.start_local_runtime(manifest, layout)
@@ -4870,12 +4997,15 @@ class ProductionConnectorContractTests(unittest.TestCase):
             self.assertEqual(stop.call_count, 4)
             stop_prior.assert_called_once_with(prior, layout)
             self.assertEqual(spawn.call_args_list[0].args[0][0], str(kernel_python))
+            self.assertEqual(spawn.call_args_list[1].args[0][0], str(release_node))
             self.assertEqual(
                 capture.call_args_list[0].kwargs["expected_executable"], kernel_python
             )
             self.assertEqual(
                 capture.call_args_list[0].kwargs["expected_argv"][0], str(kernel_python)
             )
+            for call in spawn.call_args_list:
+                self.assertEqual(call.kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1")
             state = json.loads(layout["runtime_state"].read_text(encoding="utf-8"))
             self.assertEqual(state["tunnel_pid"], 717)
             self.assertEqual(state["tunnel_process_identity"], prior["tunnel_process_identity"])

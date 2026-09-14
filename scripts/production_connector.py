@@ -284,6 +284,7 @@ def production_layout(
         "release_manifest": release_dir / "release.json",
         "bridge_binary": release_dir / "bin" / "local-tool-bridge",
         "catdesk_binary": release_dir / "bin" / "catdesk",
+        "node_binary": release_dir / "bin" / "node-runtime",
         "catdesk_runner": release_dir / "bin" / "run-catdesk.py",
         "release_catdesk_config": release_catdesk_home / ".catdesk" / "config.toml",
         "release_catdesk_backend_key": release_catdesk_home / ".catdesk" / "backend.key",
@@ -481,7 +482,7 @@ def install_release_bundle(
     except (OSError, json.JSONDecodeError) as error:
         raise RuntimeError("source tunnel profile is not valid UTF-8 JSON") from error
     profile = production_tunnel_profile(source_profile, manifest, layout)
-    node = _validate_runtime_dependencies(manifest)["node"]
+    source_node = _validate_runtime_dependencies(manifest)["node"]
 
     install_lock = _production_install_lock(layout["runtime_root"])
     install_lock.__enter__()
@@ -517,6 +518,16 @@ def install_release_bundle(
         release_dir_created = True
         _copy_owned_file(resolved_sources["bridge_binary"], layout["bridge_binary"], 0o700)
         _copy_owned_file(resolved_sources["catdesk_binary"], layout["catdesk_binary"], 0o700)
+        _copy_owned_file(Path(source_node["path"]), layout["node_binary"], 0o700)
+        copied_node_digest = _sha256_file(layout["node_binary"])
+        if copied_node_digest != source_node["sha256"]:
+            raise RuntimeError(
+                "production Node.js executable changed during immutable release installation"
+            )
+        node = {
+            "path": str(layout["node_binary"].resolve(strict=True)),
+            "sha256": copied_node_digest,
+        }
         _copy_owned_file(
             resolved_sources["catdesk_config"], layout["release_catdesk_config"], 0o600
         )
@@ -577,6 +588,7 @@ def install_release_bundle(
         ):
             artifacts[str(path.relative_to(release_dir))] = _sha256_file(path)
         installed_manifest = json.loads(json.dumps(manifest))
+        installed_manifest["runtime_dependencies"]["node"] = node
         installed_manifest["artifacts_sha256"] = artifacts
         installed_manifest["runtime_host_tool_hook"] = _runtime_host_tool_hook_record(
             layout, installed_manifest
@@ -685,6 +697,7 @@ def validate_installed_release(layout: dict[str, Path]) -> dict[str, Any]:
     if not isinstance(artifacts, dict) or not artifacts:
         raise RuntimeError("production release manifest has no artifact hashes")
     _validate_runtime_dependencies(manifest)
+    _validate_release_local_node(layout, manifest)
     release_dir = layout["release_dir"]
     expected_files = {str(relative) for relative in artifacts}
     if "release.json" in expected_files:
@@ -1177,28 +1190,9 @@ def _runtime_verifier_record(
                 f"Runtime Host verifier artifact is not pinned to the immutable release: {relative}"
             )
         bundle_sha256[str(path.resolve(strict=True))] = actual
-    node_record = (installed.get("runtime_dependencies") or {}).get("node")
-    if not isinstance(node_record, dict):
-        raise RuntimeError("production Runtime Host verifier Node pin is missing")
-    node_path_raw = node_record.get("path")
-    node_digest = node_record.get("sha256")
-    if not isinstance(node_path_raw, str) or not isinstance(node_digest, str):
-        raise RuntimeError("production Runtime Host verifier Node pin is invalid")
-    node_path = Path(node_path_raw)
-    try:
-        node_info = node_path.lstat()
-    except FileNotFoundError as error:
-        raise RuntimeError("production Runtime Host verifier Node executable is missing") from error
-    if (
-        not node_path.is_absolute()
-        or node_path.is_symlink()
-        or not node_path.is_file()
-        or node_info.st_uid != os.geteuid()
-        or stat.S_IMODE(node_info.st_mode) & 0o022
-        or not os.access(node_path, os.X_OK)
-        or _sha256_file(node_path) != node_digest
-    ):
-        raise RuntimeError("production Runtime Host verifier Node executable pin mismatch")
+    node_record = _validate_release_local_node(layout, installed)
+    node_path = Path(node_record["path"])
+    node_digest = node_record["sha256"]
     bundle_sha256[str(node_path)] = node_digest
     extension_binding = _validate_runtime_extension_binding(layout, installed)
     binding_path = layout["host_extension_binding"]
@@ -1217,6 +1211,48 @@ def _runtime_verifier_record(
         "sha256": _sha256_file(wrapper),
         "bundle_sha256": bundle_sha256,
     }
+
+
+def _validate_release_local_node(
+    layout: dict[str, Path], installed: dict[str, Any]
+) -> dict[str, str]:
+    artifacts = installed.get("artifacts_sha256")
+    if not isinstance(artifacts, dict):
+        raise RuntimeError("production release manifest has no Node artifact hashes")
+    node_record = (installed.get("runtime_dependencies") or {}).get("node")
+    if not isinstance(node_record, dict):
+        raise RuntimeError("production release Node pin is missing")
+    node_path_raw = node_record.get("path")
+    node_digest = node_record.get("sha256")
+    if not isinstance(node_path_raw, str) or not isinstance(node_digest, str):
+        raise RuntimeError("production release Node pin is invalid")
+    node_path = Path(node_path_raw)
+    try:
+        node_info = node_path.lstat()
+        expected_node_path = layout["node_binary"].resolve(strict=True)
+    except FileNotFoundError as error:
+        raise RuntimeError("production release Node executable is missing") from error
+    node_relative = str(
+        expected_node_path.relative_to(layout["release_dir"].resolve(strict=True))
+    )
+    if (
+        node_path.resolve(strict=True) != expected_node_path
+        or artifacts.get(node_relative) != node_digest
+    ):
+        raise RuntimeError(
+            "production release Node executable is not pinned to the immutable release"
+        )
+    if (
+        not node_path.is_absolute()
+        or node_path.is_symlink()
+        or not node_path.is_file()
+        or node_info.st_uid != os.geteuid()
+        or stat.S_IMODE(node_info.st_mode) & 0o077
+        or not os.access(node_path, os.X_OK)
+        or _sha256_file(node_path) != node_digest
+    ):
+        raise RuntimeError("production release Node executable pin mismatch")
+    return {"path": str(expected_node_path), "sha256": node_digest}
 
 
 def _read_runtime_verifier_config(path: Path) -> tuple[dict[str, Any], bytes | None]:
@@ -4201,6 +4237,10 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
         and isinstance(host_pid, int)
         and isinstance(host_identity, dict)
         and host_identity.get("pid") == host_pid
+        and host_identity.get("exe_realpath")
+        == str(Path(node).resolve(strict=True))
+        and host_identity.get("argv")
+        == [str(Path(node).resolve(strict=True)), str(layout["host_mcp_adapter"])]
         and _process_identity_matches(host_identity)
     )
     runtime_hook_process = bool(
@@ -4462,7 +4502,7 @@ def _preserved_activation_state(
 def _start_local_runtime_unlocked(
     manifest: dict[str, Any], layout: dict[str, Path]
 ) -> dict[str, Any]:
-    validate_installed_release(layout)
+    installed = validate_installed_release(layout)
     current = production_status(manifest, layout)
     if current["local_runtime_ready"]:
         return current
@@ -4506,6 +4546,7 @@ def _start_local_runtime_unlocked(
     base_env = {
         "HOME": str(Path.home()),
         "PATH": os.environ.get("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"),
+        "PYTHONDONTWRITEBYTECODE": "1",
     }
     started: list[tuple[subprocess.Popen[Any], dict[str, Any] | None, bool]] = []
     try:
@@ -4525,7 +4566,7 @@ def _start_local_runtime_unlocked(
         started[-1] = (catdesk, catdesk_identity, True)
         _wait_for_tcp(catdesk, PRODUCTION_CATDESK_PORT, "production CatDesk")
 
-        dependencies = _validate_runtime_dependencies(manifest)
+        dependencies = _validate_runtime_dependencies(installed)
         node = Path(dependencies["node"]["path"])
         host_command = [str(node), str(layout["host_mcp_adapter"])]
         host = _spawn_logged(
