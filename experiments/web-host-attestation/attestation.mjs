@@ -973,6 +973,27 @@ export class RuntimeHostVerifier {
     );
   }
 
+  #reloadPersistedState() {
+    if (!this.statePath) return;
+    const persisted = loadPrivateState(this.statePath);
+    this.challenges = new Map(
+      Array.isArray(persisted?.challenges)
+        ? persisted.challenges.map(([id, record]) => [id, record])
+        : []
+    );
+    this.usedAttestationReceipts = new Set(persisted?.used_attestation_receipts ?? []);
+    this.verifiedTargets = new Map(
+      Array.isArray(persisted?.verified_targets) ? persisted.verified_targets : []
+    );
+  }
+
+  #withStateLock(callback) {
+    return withPrivateStateLock(this.statePath, () => {
+      this.#reloadPersistedState();
+      return callback();
+    });
+  }
+
   #persist() {
     savePrivateState(this.statePath, {
       schema_version: 1,
@@ -983,144 +1004,152 @@ export class RuntimeHostVerifier {
   }
 
   issueChallenge({ conversation_id, target_generation, ownership_generation }) {
-    const issuedAt = nowMs(this.clock);
-    const challenge = {
-      schema_version: 1,
-      challenge_id: `hc_${randomUUID()}`,
-      challenge_nonce: randomBytes(24).toString("hex"),
-      host_type: "chatgpt_web",
-      conversation_id: nonEmpty(conversation_id, "conversation_id"),
-      target_generation: positiveInteger(target_generation, "target_generation"),
-      ownership_generation: positiveInteger(ownership_generation, "ownership_generation"),
-      issued_at_ms: issuedAt,
-      expires_at_ms: issuedAt + this.challengeTtlMs
-    };
-    this.challenges.set(challenge.challenge_id, { challenge, consumed: false });
-    this.#persist();
-    return structuredClone(challenge);
+    return this.#withStateLock(() => {
+      const issuedAt = nowMs(this.clock);
+      const challenge = {
+        schema_version: 1,
+        challenge_id: `hc_${randomUUID()}`,
+        challenge_nonce: randomBytes(24).toString("hex"),
+        host_type: "chatgpt_web",
+        conversation_id: nonEmpty(conversation_id, "conversation_id"),
+        target_generation: positiveInteger(target_generation, "target_generation"),
+        ownership_generation: positiveInteger(ownership_generation, "ownership_generation"),
+        issued_at_ms: issuedAt,
+        expires_at_ms: issuedAt + this.challengeTtlMs
+      };
+      this.challenges.set(challenge.challenge_id, { challenge, consumed: false });
+      this.#persist();
+      return structuredClone(challenge);
+    });
   }
 
   verifyAndConsume(attestation, expected = {}) {
-    const now = nowMs(this.clock);
-    const challengeId = nonEmpty(attestation?.challenge_id, "attestation.challenge_id");
-    const challengeRecord = this.challenges.get(challengeId);
-    if (!challengeRecord) throw new Error("unknown host attestation challenge");
-    if (challengeRecord.consumed) throw new Error("host attestation challenge was already consumed");
-    const challenge = challengeRecord.challenge;
-    if (now > challenge.expires_at_ms) throw new Error("host attestation challenge expired");
+    return this.#withStateLock(() => {
+      const now = nowMs(this.clock);
+      const challengeId = nonEmpty(attestation?.challenge_id, "attestation.challenge_id");
+      const challengeRecord = this.challenges.get(challengeId);
+      if (!challengeRecord) throw new Error("unknown host attestation challenge");
+      if (challengeRecord.consumed) throw new Error("host attestation challenge was already consumed");
+      const challenge = challengeRecord.challenge;
+      if (now > challenge.expires_at_ms) throw new Error("host attestation challenge expired");
 
-    const unsigned = { ...attestation };
-    const mac = nonEmpty(unsigned.host_mac_sha256, "host_mac_sha256");
-    delete unsigned.host_mac_sha256;
-    const expectedMac = hmac(this.secret, unsigned);
-    if (!secureEqualHex(mac, expectedMac)) throw new Error("Host attestation authentication failed");
+      const unsigned = { ...attestation };
+      const mac = nonEmpty(unsigned.host_mac_sha256, "host_mac_sha256");
+      delete unsigned.host_mac_sha256;
+      const expectedMac = hmac(this.secret, unsigned);
+      if (!secureEqualHex(mac, expectedMac)) throw new Error("Host attestation authentication failed");
 
-    if (attestation.provenance !== ATTESTATION_PROVENANCE) throw new Error("untrusted host attestation provenance");
-    if (attestation.host_type !== challenge.host_type) throw new Error("host_type does not match challenge");
-    if (attestation.challenge_nonce !== challenge.challenge_nonce) throw new Error("host challenge nonce mismatch");
-    if (attestation.conversation_id !== challenge.conversation_id) throw new Error("conversation_id does not match challenge");
-    if (attestation.target_generation !== challenge.target_generation) throw new Error("target generation does not match challenge");
-    if (attestation.ownership_generation !== challenge.ownership_generation) throw new Error("ownership generation does not match challenge");
-    if (expected.conversation_id && attestation.conversation_id !== expected.conversation_id) throw new Error("wrong Web conversation");
-    if (expected.target_generation && attestation.target_generation !== expected.target_generation) throw new Error("stale target generation");
-    if (expected.ownership_generation && attestation.ownership_generation !== expected.ownership_generation) throw new Error("stale ownership generation");
+      if (attestation.provenance !== ATTESTATION_PROVENANCE) throw new Error("untrusted host attestation provenance");
+      if (attestation.host_type !== challenge.host_type) throw new Error("host_type does not match challenge");
+      if (attestation.challenge_nonce !== challenge.challenge_nonce) throw new Error("host challenge nonce mismatch");
+      if (attestation.conversation_id !== challenge.conversation_id) throw new Error("conversation_id does not match challenge");
+      if (attestation.target_generation !== challenge.target_generation) throw new Error("target generation does not match challenge");
+      if (attestation.ownership_generation !== challenge.ownership_generation) throw new Error("ownership generation does not match challenge");
+      if (expected.conversation_id && attestation.conversation_id !== expected.conversation_id) throw new Error("wrong Web conversation");
+      if (expected.target_generation && attestation.target_generation !== expected.target_generation) throw new Error("stale target generation");
+      if (expected.ownership_generation && attestation.ownership_generation !== expected.ownership_generation) throw new Error("stale ownership generation");
 
-    const observation = validateMachineObservation(attestation.machine_observation);
-    if (observation.conversation_id !== attestation.conversation_id) throw new Error("machine observation conversation mismatch");
-    if (observation.browser_target_id !== attestation.browser_target_id) throw new Error("machine observation browser target mismatch");
-    if (attestation.observed_at_ms !== observation.observed_at_ms) throw new Error("attestation observation timestamp mismatch");
-    if (attestation.observed_at_ms < challenge.issued_at_ms - this.attestationSkewMs || attestation.observed_at_ms > now + this.attestationSkewMs) {
-      throw new Error("host attestation machine observation is not fresh for challenge");
-    }
-    if (attestation.issued_at_ms < challenge.issued_at_ms || attestation.issued_at_ms > now + this.attestationSkewMs) {
-      throw new Error("host attestation issue time is not fresh");
-    }
-    if (attestation.expires_at_ms > challenge.expires_at_ms || now > attestation.expires_at_ms) {
-      throw new Error("host attestation expired or outlives Runtime challenge");
-    }
-    if (this.usedAttestationReceipts.has(attestation.host_receipt_id)) throw new Error("host attestation receipt replayed");
+      const observation = validateMachineObservation(attestation.machine_observation);
+      if (observation.conversation_id !== attestation.conversation_id) throw new Error("machine observation conversation mismatch");
+      if (observation.browser_target_id !== attestation.browser_target_id) throw new Error("machine observation browser target mismatch");
+      if (attestation.observed_at_ms !== observation.observed_at_ms) throw new Error("attestation observation timestamp mismatch");
+      if (attestation.observed_at_ms < challenge.issued_at_ms - this.attestationSkewMs || attestation.observed_at_ms > now + this.attestationSkewMs) {
+        throw new Error("host attestation machine observation is not fresh for challenge");
+      }
+      if (attestation.issued_at_ms < challenge.issued_at_ms || attestation.issued_at_ms > now + this.attestationSkewMs) {
+        throw new Error("host attestation issue time is not fresh");
+      }
+      if (attestation.expires_at_ms > challenge.expires_at_ms || now > attestation.expires_at_ms) {
+        throw new Error("host attestation expired or outlives Runtime challenge");
+      }
+      if (this.usedAttestationReceipts.has(attestation.host_receipt_id)) throw new Error("host attestation receipt replayed");
 
-    challengeRecord.consumed = true;
-    this.usedAttestationReceipts.add(attestation.host_receipt_id);
-    const verified = signVerifiedTarget(this.secret, {
-      schema_version: 1,
-      verified_target_id: `vt_${randomUUID()}`,
-      host_type: attestation.host_type,
-      conversation_id: attestation.conversation_id,
-      browser_target_id: observation.browser_target_id,
-      top_frame_id: observation.top_frame_id,
-      loader_id: observation.loader_id,
-      secure_origin: observation.secure_origin,
-      target_generation: attestation.target_generation,
-      ownership_generation: attestation.ownership_generation,
-      host_receipt_id: attestation.host_receipt_id,
-      verified_at_ms: now,
-      provenance: VERIFIED_TARGET_PROVENANCE
+      challengeRecord.consumed = true;
+      this.usedAttestationReceipts.add(attestation.host_receipt_id);
+      const verified = signVerifiedTarget(this.secret, {
+        schema_version: 1,
+        verified_target_id: `vt_${randomUUID()}`,
+        host_type: attestation.host_type,
+        conversation_id: attestation.conversation_id,
+        browser_target_id: observation.browser_target_id,
+        top_frame_id: observation.top_frame_id,
+        loader_id: observation.loader_id,
+        secure_origin: observation.secure_origin,
+        target_generation: attestation.target_generation,
+        ownership_generation: attestation.ownership_generation,
+        host_receipt_id: attestation.host_receipt_id,
+        verified_at_ms: now,
+        provenance: VERIFIED_TARGET_PROVENANCE
+      });
+      this.verifiedTargets.set(attestation.host_receipt_id, verified);
+      this.#persist();
+      return verified;
     });
-    this.verifiedTargets.set(attestation.host_receipt_id, verified);
-    this.#persist();
-    return verified;
   }
 
   verifyCurrentEntryAndRegister(evidence, expected = {}) {
-    const current = verifyCurrentEntryEvidence({
-      secret: this.secret,
-      evidence,
-      expectedTargetGeneration: expected.target_generation,
-      expectedOwnershipGeneration: expected.ownership_generation,
-      clock: this.clock
+    return this.#withStateLock(() => {
+      const current = verifyCurrentEntryEvidence({
+        secret: this.secret,
+        evidence,
+        expectedTargetGeneration: expected.target_generation,
+        expectedOwnershipGeneration: expected.ownership_generation,
+        clock: this.clock
+      });
+      if (expected.conversation_id && current.conversation_id !== expected.conversation_id) {
+        throw new Error("current-entry verified target conversation mismatch");
+      }
+      if (this.usedAttestationReceipts.has(current.host_receipt_id)) {
+        throw new Error("host attestation receipt replayed");
+      }
+      const now = nowMs(this.clock);
+      this.usedAttestationReceipts.add(current.host_receipt_id);
+      const verified = signVerifiedTarget(this.secret, {
+        schema_version: 1,
+        verified_target_id: `vt_${randomUUID()}`,
+        host_type: "chatgpt_web",
+        conversation_id: current.conversation_id,
+        browser_target_id: current.browser_target_id,
+        top_frame_id: current.top_frame_id,
+        loader_id: current.loader_id,
+        secure_origin: current.secure_origin,
+        target_generation: current.target_generation,
+        ownership_generation: current.ownership_generation,
+        host_receipt_id: current.host_receipt_id,
+        verified_at_ms: now,
+        provenance: VERIFIED_TARGET_PROVENANCE
+      });
+      this.verifiedTargets.set(current.host_receipt_id, verified);
+      this.#persist();
+      return verified;
     });
-    if (expected.conversation_id && current.conversation_id !== expected.conversation_id) {
-      throw new Error("current-entry verified target conversation mismatch");
-    }
-    if (this.usedAttestationReceipts.has(current.host_receipt_id)) {
-      throw new Error("host attestation receipt replayed");
-    }
-    const now = nowMs(this.clock);
-    this.usedAttestationReceipts.add(current.host_receipt_id);
-    const verified = signVerifiedTarget(this.secret, {
-      schema_version: 1,
-      verified_target_id: `vt_${randomUUID()}`,
-      host_type: "chatgpt_web",
-      conversation_id: current.conversation_id,
-      browser_target_id: current.browser_target_id,
-      top_frame_id: current.top_frame_id,
-      loader_id: current.loader_id,
-      secure_origin: current.secure_origin,
-      target_generation: current.target_generation,
-      ownership_generation: current.ownership_generation,
-      host_receipt_id: current.host_receipt_id,
-      verified_at_ms: now,
-      provenance: VERIFIED_TARGET_PROVENANCE
-    });
-    this.verifiedTargets.set(current.host_receipt_id, verified);
-    this.#persist();
-    return verified;
   }
 
   consumeVerifiedTarget(hostReceiptId, expected = {}) {
-    const receiptId = nonEmpty(hostReceiptId, "host_receipt_id");
-    const storedVerified = this.verifiedTargets.get(receiptId);
-    if (!storedVerified) throw new Error("verified Host target receipt is missing or already consumed");
-    const verified = authenticateVerifiedTarget(this.secret, storedVerified);
-    const now = nowMs(this.clock);
-    if (now - Number(verified.verified_at_ms) > this.verifiedTargetTtlMs) {
+    return this.#withStateLock(() => {
+      const receiptId = nonEmpty(hostReceiptId, "host_receipt_id");
+      const storedVerified = this.verifiedTargets.get(receiptId);
+      if (!storedVerified) throw new Error("verified Host target receipt is missing or already consumed");
+      const verified = authenticateVerifiedTarget(this.secret, storedVerified);
+      const now = nowMs(this.clock);
+      if (now - Number(verified.verified_at_ms) > this.verifiedTargetTtlMs) {
+        this.verifiedTargets.delete(receiptId);
+        this.#persist();
+        throw new Error("verified Host target receipt expired");
+      }
+      if (expected.conversation_id && verified.conversation_id !== expected.conversation_id) {
+        throw new Error("verified Host target conversation mismatch");
+      }
+      if (expected.target_generation && verified.target_generation !== expected.target_generation) {
+        throw new Error("verified Host target generation mismatch");
+      }
+      if (expected.ownership_generation && verified.ownership_generation !== expected.ownership_generation) {
+        throw new Error("verified Host target ownership generation mismatch");
+      }
       this.verifiedTargets.delete(receiptId);
       this.#persist();
-      throw new Error("verified Host target receipt expired");
-    }
-    if (expected.conversation_id && verified.conversation_id !== expected.conversation_id) {
-      throw new Error("verified Host target conversation mismatch");
-    }
-    if (expected.target_generation && verified.target_generation !== expected.target_generation) {
-      throw new Error("verified Host target generation mismatch");
-    }
-    if (expected.ownership_generation && verified.ownership_generation !== expected.ownership_generation) {
-      throw new Error("verified Host target ownership generation mismatch");
-    }
-    this.verifiedTargets.delete(receiptId);
-    this.#persist();
-    return structuredClone(verified);
+      return structuredClone(verified);
+    });
   }
 }
 

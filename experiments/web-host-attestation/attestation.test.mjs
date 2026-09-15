@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, createHmac } from "node:crypto";
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -11,6 +11,7 @@ import {
   ToolInvocationReceiptJournal,
   WebReentryAdapter,
   machineObservationFromFrameTree,
+  signCurrentEntryEvidence,
   signHostAttestation,
   signRuntimeInvocationOriginReceipt,
   validateMachineObservation,
@@ -639,6 +640,44 @@ test("receipt verifier rejects authenticated contradictory result state", async 
     }),
     /result-unknown state is inconsistent/
   );
+});
+
+test("two verifier instances cannot consume the same signed current-entry receipt from stale state", () => {
+  const root = mkdtempSync(join(tmpdir(), "lab-current-entry-race-"));
+  const verifierState = join(root, "verifier.json");
+  const time = clock();
+  try {
+    const currentEntry = signCurrentEntryEvidence({
+      secret: SECRET,
+      machineContext: {
+        entry_scope: "runtime_invocation",
+        machine_source: "host_invocation_context_v1",
+        conversation_id: CONVERSATION,
+        browser_target_id: "browser-current-race",
+        top_frame_id: "frame-current-race",
+        loader_id: "loader-current-race",
+        secure_origin: "https://chatgpt.com",
+        generation_anchor_sha256: "a".repeat(64),
+        observed_at_ms: time.now()
+      },
+      targetGeneration: 9,
+      ownershipGeneration: 9,
+      clock: time.now
+    });
+    const first = new RuntimeHostVerifier(SECRET, { clock: time.now, statePath: verifierState });
+    const second = new RuntimeHostVerifier(SECRET, { clock: time.now, statePath: verifierState });
+    first.verifyCurrentEntryAndRegister(currentEntry, {
+      conversation_id: CONVERSATION, target_generation: 9, ownership_generation: 9
+    });
+    assert.throws(
+      () => second.verifyCurrentEntryAndRegister(currentEntry, {
+        conversation_id: CONVERSATION, target_generation: 9, ownership_generation: 9
+      }),
+      /replay/i
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("verified Host target receipt persists across verifier process restart and is one-shot", () => {
