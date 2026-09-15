@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import importlib.util
 import json
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -15,6 +17,22 @@ HEALTHY = "HEALTHY"
 DEGRADED = "DEGRADED"
 BROKEN = "BROKEN"
 UNINSTRUMENTED = "UNINSTRUMENTED"
+
+EXPOSURE_CONFIRMED = "CONFIRMED"
+EXPOSURE_ABSENT_REPAIRABLE = "ABSENT_REPAIRABLE"
+EXPOSURE_UNAVAILABLE = "UNAVAILABLE"
+EXPOSURE_UNKNOWN = "UNKNOWN"
+
+MANAGED_WEB_EXPOSURE_SOURCES = {
+    "web_chatgpt_executor",
+    "managed_web_executor",
+    "local_web_executor_adapter",
+}
+WEB_EXECUTION_ID_RE = re.compile(
+    r"^wex_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+WEB_EXECUTION_EXPOSURE_MAX_AGE_SECONDS = 300
+WEB_EXECUTION_EXPOSURE_MAX_FUTURE_SKEW_SECONDS = 30
 
 M0_REQUIRED_LAYERS = (
     "backend",
@@ -58,6 +76,169 @@ def _layer(
     }
 
 
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    return []
+
+
+def parse_web_tool_exposure(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    source = str(value.get("source") or "").strip()
+    if source not in MANAGED_WEB_EXPOSURE_SOURCES:
+        return None
+    claimed_state = str(value.get("state") or EXPOSURE_UNKNOWN).upper()
+    if claimed_state not in {
+        EXPOSURE_CONFIRMED,
+        EXPOSURE_ABSENT_REPAIRABLE,
+        EXPOSURE_UNAVAILABLE,
+        EXPOSURE_UNKNOWN,
+    }:
+        claimed_state = EXPOSURE_UNKNOWN
+    required_apps = _string_list(value.get("required_apps", value.get("required_app")))
+    observed_apps = _string_list(value.get("observed_apps"))
+    required_keys = {item.strip().casefold() for item in required_apps if item.strip()}
+    observed_keys = {item.strip().casefold() for item in observed_apps if item.strip()}
+    exact_current_proof = bool(required_keys) and required_keys.issubset(observed_keys)
+    if claimed_state == EXPOSURE_CONFIRMED and not exact_current_proof:
+        state = EXPOSURE_ABSENT_REPAIRABLE if required_keys else EXPOSURE_UNKNOWN
+    else:
+        state = claimed_state
+    attempts = value.get("attempts")
+    attempts_n = (
+        attempts
+        if isinstance(attempts, int) and not isinstance(attempts, bool)
+        else 0
+    )
+    return {
+        "source": source,
+        "state": state,
+        "required_apps": required_apps,
+        "confirmed": state == EXPOSURE_CONFIRMED and exact_current_proof,
+        "attempts": attempts_n,
+        "observed_apps": observed_apps,
+        "action": value.get("action"),
+    }
+
+
+
+def _fresh_execution_timestamp(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    try:
+        observed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if observed.tzinfo is None:
+        return False
+    age = (datetime.now(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds()
+    return (
+        -WEB_EXECUTION_EXPOSURE_MAX_FUTURE_SKEW_SECONDS
+        <= age
+        <= WEB_EXECUTION_EXPOSURE_MAX_AGE_SECONDS
+    )
+
+def load_web_tool_exposure_from_executor_state(
+    state_dir: str | Path, execution_id: str
+) -> dict[str, Any] | None:
+    execution_id = str(execution_id or "").strip()
+    if WEB_EXECUTION_ID_RE.fullmatch(execution_id) is None:
+        return None
+    executions = Path(state_dir) / "executions"
+    if not executions.is_dir():
+        return None
+    path = executions / f"{execution_id}.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if str(data.get("execution_id") or "").strip() != execution_id:
+        return None
+    # Per-message exposure is current only while this explicitly correlated
+    # executor execution is live. Historical/crashed files are audit evidence.
+    if str(data.get("status") or "").strip().lower() != "running":
+        return None
+    if data.get("terminal_at") not in (None, ""):
+        return None
+    if not _fresh_execution_timestamp(data.get("updated_at")):
+        return None
+    exposure = data.get("tool_exposure")
+    if not isinstance(exposure, dict):
+        return None
+    return parse_web_tool_exposure(
+        {
+            **exposure,
+            "source": str(data.get("provenance") or ""),
+        }
+    )
+
+
+def unknown_web_tool_exposure() -> dict[str, Any]:
+    return {
+        "source": None,
+        "state": EXPOSURE_UNKNOWN,
+        "required_apps": [],
+        "confirmed": False,
+        "attempts": 0,
+        "observed_apps": [],
+        "action": None,
+    }
+
+
+def resolve_web_tool_exposure(status: dict[str, Any]) -> dict[str, Any]:
+    # Per-message Web app exposure is current only when it is correlated to the
+    # explicitly current managed Web execution. A naked status claim is audit
+    # input only and must never promote connector health.
+    state_dir = status.get("web_executor_state_dir")
+    current_execution_id = str(status.get("web_executor_current_execution_id") or "").strip()
+    if isinstance(state_dir, str) and state_dir.strip() and current_execution_id:
+        loaded = load_web_tool_exposure_from_executor_state(
+            state_dir, current_execution_id
+        )
+        if loaded is not None:
+            return loaded
+    return unknown_web_tool_exposure()
+
+
+def project_connector_layer(exposure: dict[str, Any]) -> dict[str, Any]:
+    source = exposure.get("source")
+    state = str(exposure.get("state") or EXPOSURE_UNKNOWN)
+    evidence = {"web_tool_exposure": exposure}
+    if not source or state == EXPOSURE_UNKNOWN:
+        return _layer(
+            UNINSTRUMENTED,
+            "ChatGPT connector/tool exposure is not machine-observed by a managed Web executor",
+            repair_state="connector_probe_required",
+            evidence=evidence,
+        )
+    if state == EXPOSURE_CONFIRMED:
+        return _layer(
+            HEALTHY,
+            "managed Web executor confirmed required app exposure for the observed turn",
+            repair_state="none",
+            evidence=evidence,
+        )
+    if state == EXPOSURE_ABSENT_REPAIRABLE:
+        return _layer(
+            DEGRADED,
+            "required Web tool app is absent on the current turn and can be reselected; backend/tunnel health is separate",
+            repair_state="reselect_web_app_exposure",
+            evidence=evidence,
+        )
+    return _layer(
+        DEGRADED,
+        "required Web tool app exposure is unavailable; backend/tunnel health is reported separately",
+        repair_state="reselect_web_app_exposure",
+        evidence=evidence,
+    )
+
+
 def classify_overall(
     layers: dict[str, dict[str, Any]], required_layers: Iterable[str]
 ) -> str:
@@ -86,7 +267,9 @@ def _m0_contract() -> tuple[set[str], int]:
     )
 
 
-def project_m0_layers(status: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def project_m0_layers(
+    status: dict[str, Any], *, exposure: dict[str, Any] | None = None
+) -> dict[str, dict[str, Any]]:
     bridge_ready = status.get("bridge_ready") is True
     backend_ready = status.get("backend_ready") is True
     tunnel_ready = status.get("tunnel_ready") is True
@@ -116,6 +299,8 @@ def project_m0_layers(status: dict[str, Any]) -> dict[str, dict[str, Any]]:
         and lease_remaining_ms >= min_remaining_ms
     )
     jobs_present = {"start_command", "poll_command", "cancel_command"}.issubset(tools)
+    if exposure is None:
+        exposure = resolve_web_tool_exposure(status)
 
     return {
         "backend": _layer(
@@ -162,11 +347,7 @@ def project_m0_layers(status: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 "state_source": tunnel_state_source,
             },
         ),
-        "connector": _layer(
-            UNINSTRUMENTED,
-            "ChatGPT connector binding/endpoint generation is not yet machine-observable by LAB",
-            repair_state="connector_probe_required",
-        ),
+        "connector": project_connector_layer(exposure),
         "mcp": _layer(
             HEALTHY if mcp_ready else BROKEN,
             "MCP discovery/smoke matches the M0 surface"
@@ -249,7 +430,8 @@ def collect_m0_status() -> dict[str, Any]:
 
 
 def build_report(status: dict[str, Any], *, scope: str) -> dict[str, Any]:
-    layers = project_m0_layers(status)
+    exposure = resolve_web_tool_exposure(status)
+    layers = project_m0_layers(status, exposure=exposure)
     required = M0_REQUIRED_LAYERS if scope == "m0" else FULL_LAYER_ORDER
     return {
         "schema_version": 1,
@@ -258,6 +440,7 @@ def build_report(status: dict[str, Any], *, scope: str) -> dict[str, Any]:
         "overall": classify_overall(layers, required),
         "repair_mode": "diagnostic_only",
         "silent_fallback_allowed": False,
+        "web_tool_exposure": exposure,
         "layers": {name: layers[name] for name in FULL_LAYER_ORDER},
     }
 
