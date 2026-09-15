@@ -1062,6 +1062,42 @@ export class RuntimeHostVerifier {
     return verified;
   }
 
+  verifyCurrentEntryAndRegister(evidence, expected = {}) {
+    const current = verifyCurrentEntryEvidence({
+      secret: this.secret,
+      evidence,
+      expectedTargetGeneration: expected.target_generation,
+      expectedOwnershipGeneration: expected.ownership_generation,
+      clock: this.clock
+    });
+    if (expected.conversation_id && current.conversation_id !== expected.conversation_id) {
+      throw new Error("current-entry verified target conversation mismatch");
+    }
+    if (this.usedAttestationReceipts.has(current.host_receipt_id)) {
+      throw new Error("host attestation receipt replayed");
+    }
+    const now = nowMs(this.clock);
+    this.usedAttestationReceipts.add(current.host_receipt_id);
+    const verified = signVerifiedTarget(this.secret, {
+      schema_version: 1,
+      verified_target_id: `vt_${randomUUID()}`,
+      host_type: "chatgpt_web",
+      conversation_id: current.conversation_id,
+      browser_target_id: current.browser_target_id,
+      top_frame_id: current.top_frame_id,
+      loader_id: current.loader_id,
+      secure_origin: current.secure_origin,
+      target_generation: current.target_generation,
+      ownership_generation: current.ownership_generation,
+      host_receipt_id: current.host_receipt_id,
+      verified_at_ms: now,
+      provenance: VERIFIED_TARGET_PROVENANCE
+    });
+    this.verifiedTargets.set(current.host_receipt_id, verified);
+    this.#persist();
+    return verified;
+  }
+
   consumeVerifiedTarget(hostReceiptId, expected = {}) {
     const receiptId = nonEmpty(hostReceiptId, "host_receipt_id");
     const storedVerified = this.verifiedTargets.get(receiptId);

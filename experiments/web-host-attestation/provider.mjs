@@ -8,12 +8,15 @@ export function createRuntimeHostProvider({ secret, driver, clock = Date.now, ve
   const reentry = new WebReentryAdapter(secret, driver, { clock, statePath: reentryStatePath });
   return Object.freeze({
     interface_version: 1,
-    capabilities: Object.freeze(["issueChallenge", "verifyAttestation", "submitReentry"]),
+    capabilities: Object.freeze(["issueChallenge", "verifyAttestation", "verifyCurrentEntry", "submitReentry"]),
     issueChallenge(input) {
       return verifier.issueChallenge(input);
     },
     verifyAttestation(attestation, expected) {
       return verifier.verifyAndConsume(attestation, expected);
+    },
+    verifyCurrentEntry(evidence, expected) {
+      return verifier.verifyCurrentEntryAndRegister(evidence, expected);
     },
     consumeVerifiedTarget(hostReceiptId, expected) {
       return verifier.consumeVerifiedTarget(hostReceiptId, expected);

@@ -564,7 +564,7 @@ test("stable provider exposes receipts without owning Runtime lifecycle", async 
   const time = clock();
   const rawDriver = new Driver(observation(time.now()));
   const provider = createRuntimeHostProvider({ secret: SECRET, driver: rawDriver, clock: time.now });
-  assert.deepEqual(provider.capabilities, ["issueChallenge", "verifyAttestation", "submitReentry"]);
+  assert.deepEqual(provider.capabilities, ["issueChallenge", "verifyAttestation", "verifyCurrentEntry", "submitReentry"]);
   assert.equal("wake" in provider, false);
   assert.equal("retry" in provider, false);
   const challenge = provider.issueChallenge({ conversation_id: CONVERSATION, target_generation: 4, ownership_generation: 8 });

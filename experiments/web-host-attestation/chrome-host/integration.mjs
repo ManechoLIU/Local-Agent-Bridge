@@ -64,6 +64,19 @@ export function createChromeRuntimeHostIntegration(options) {
       });
     },
 
+    async verifyCurrentEntry(input) {
+      const current = input && input.current_entry;
+      const verifiedTarget = provider.verifyCurrentEntry(current, {
+        conversation_id: input && input.conversation_id,
+        target_generation: input && input.target_generation,
+        ownership_generation: input && input.ownership_generation
+      });
+      return Object.freeze({
+        host_receipt_id: current.host_receipt_id,
+        verified_target: verifiedTarget
+      });
+    },
+
     async verifyToolPreReceipt(input) {
       return await verifyToolReceiptWithCurrentEntry(input, verifyToolPreReceipt);
     },
@@ -151,7 +164,7 @@ function requiredRuntimeGeneration(value, name) {
 
 export async function executeRuntimeVerifierCommand(input, options) {
   const operation = requiredRuntimeText(input && input.operation, "operation", 64);
-  if (!["discover_current_entry", "attest_and_verify", "submit_reentry", "verify_tool_pre", "verify_tool_terminal"].includes(operation)) {
+  if (!["discover_current_entry", "verify_current_entry", "attest_and_verify", "submit_reentry", "verify_tool_pre", "verify_tool_terminal"].includes(operation)) {
     throw new Error("unsupported Runtime Host operation: " + operation);
   }
   const integration = options && options.integration;
@@ -213,6 +226,34 @@ export async function executeRuntimeVerifierCommand(input, options) {
     }
     requiredRuntimeGeneration(current.observed_at_unix_ms, "current_entry.observed_at_unix_ms");
     return Object.freeze({ ok: true, operation: operation, current_entry: current });
+  }
+
+  if (operation === "verify_current_entry") {
+    if (typeof integration.verifyCurrentEntry !== "function") {
+      throw new Error("Runtime Host current-entry verification integration is required");
+    }
+    const request = {
+      conversation_id: requiredRuntimeText(input && input.conversation_id, "conversation_id", 128),
+      target_generation: requiredRuntimeGeneration(input && input.target_generation, "target_generation"),
+      ownership_generation: requiredRuntimeGeneration(input && input.ownership_generation, "ownership_generation"),
+      current_entry: input && input.current_entry
+    };
+    const result = await integration.verifyCurrentEntry(request);
+    const verified = result && result.verified_target;
+    const receipt = result && result.host_receipt_id;
+    if (!verified || verified.provenance !== "runtime_host_verifier_v1") {
+      throw new Error("Runtime Host current-entry verifier did not return a trusted verified target");
+    }
+    if (verified.conversation_id !== request.conversation_id ||
+        verified.target_generation !== request.target_generation ||
+        verified.ownership_generation !== request.ownership_generation) {
+      throw new Error("Runtime Host current-entry verified target does not match requested ownership fence");
+    }
+    return Object.freeze({
+      ok: true, operation,
+      host_receipt_id: requiredRuntimeText(receipt, "host_receipt_id", 256),
+      verified_target: verified
+    });
   }
 
   if (operation === "attest_and_verify") {
