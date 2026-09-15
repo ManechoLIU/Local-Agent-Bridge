@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { extensionIdFromManifestKey } from "./extension-id.mjs";
-import { ToolInvocationReceiptJournal, signCurrentEntryEvidence } from "../attestation.mjs";
+import { RuntimeHostVerifier, ToolInvocationReceiptJournal, WebReentryAdapter, signCurrentEntryEvidence, signHostAttestation } from "../attestation.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CLI_CWD = dirname(HERE);
@@ -340,4 +340,176 @@ test("Runtime verifier CLI v2 verifies literal pre and terminal receipts through
     pre_receipt_id: receipts.pre.pre_receipt_id,
     pre_receipt_sha256: receiptSha256(receipts.pre)
   });
+});
+
+
+test("Runtime verifier CLI reconciles a durable RESULT_UNKNOWN through the Unix Host socket without raw prompt or nonce", async function (t) {
+  const { bindingPath } = createBindingFixture(t);
+  const root = mkdtempSync(join(tmpdir(), "lab-runtime-verifier-reconcile-"));
+  const socketPath = join(root, "host.sock");
+  const keyPath = join(root, "attestation.key");
+  const reentryStatePath = join(root, "runtime-reentry-state.json");
+  const secret = "cli-reconcile-secret-0123456789abcdef0123456789abcdef";
+  const now = Date.now();
+  const conversation = "6a9e4158-cc8c-83ea-9763-05a7fd51f597";
+  const observation = {
+    host_type: "chatgpt_web",
+    browser_target_id: "browser-target-cli-reconcile",
+    top_frame_id: "frame-cli-reconcile",
+    loader_id: "loader-cli-reconcile",
+    secure_origin: "https://chatgpt.com",
+    conversation_id: conversation,
+    observed_at_ms: now,
+    source: "browser_cdp_page_frame_tree_v1"
+  };
+  writeFileSync(keyPath, secret, { mode: 0o600 });
+  chmodSync(keyPath, 0o600);
+
+  const verifier = new RuntimeHostVerifier(secret, { clock: () => now });
+  const challenge = verifier.issueChallenge({
+    conversation_id: conversation,
+    target_generation: 9,
+    ownership_generation: 9
+  });
+  const attestation = signHostAttestation({ secret, challenge, observation, clock: () => now });
+  const verified = verifier.verifyAndConsume(attestation, {
+    conversation_id: conversation,
+    target_generation: 9,
+    ownership_generation: 9
+  });
+  const seedAdapter = new WebReentryAdapter(secret, {
+    async observeTarget() { return observation; },
+    async submitContinuation() {
+      return {
+        dispatch_attempted: true,
+        submit_confirmed: false,
+        retryable: false,
+        status: "result_unknown",
+        host_submit_receipt: "chrome-submit-cli-unknown"
+      };
+    }
+  }, { clock: () => now, statePath: reentryStatePath });
+  const original = await seedAdapter.reenter({
+    verified_target: verified,
+    wake_id: "wake-cli-reconcile",
+    wake_nonce: "nonce-cli-reconcile",
+    continuation_payload: "cli reconcile body",
+    expected_target_generation: 9,
+    expected_ownership_generation: 9
+  });
+  assert.equal(original.result_class, "RESULT_UNKNOWN");
+
+  const extensionEpoch = {
+    binding_sha256: sha256(bindingPath),
+    instance_id_sha256: "d".repeat(64),
+    loaded_at_ms: now - 10
+  };
+  const browserRequests = [];
+  const server = await new Promise((resolve, reject) => {
+    const listener = net.createServer((socket) => {
+      let buffer = "";
+      socket.on("data", (chunk) => {
+        buffer += chunk.toString("utf8");
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) return;
+        const request = JSON.parse(buffer.slice(0, newline));
+        browserRequests.push(request);
+        let result;
+        if (request.op === "observe_target") {
+          result = { observation, extension_epoch: extensionEpoch };
+        } else if (request.op === "reconcile_continuation") {
+          result = {
+            status: "observed",
+            journal_phase: "result_unknown",
+            journal_binding_matched: true,
+            conversation_matches: true,
+            target_matches: true,
+            composer_exact_payload: true,
+            composer_empty: false,
+            exact_user_message_present: false,
+            stable_not_delivered: true,
+            baseline_user_message_count: 1,
+            extension_epoch: extensionEpoch
+          };
+        } else {
+          socket.end(JSON.stringify({ request_id: request.request_id, ok: false, error: "unexpected op" }) + "\n");
+          return;
+        }
+        socket.end(JSON.stringify({ request_id: request.request_id, ok: true, result }) + "\n");
+      });
+    });
+    listener.once("error", reject);
+    listener.listen(socketPath, () => resolve(listener));
+  });
+  t.after(() => {
+    server.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const child = spawn(process.execPath, [CLI], {
+    cwd: CLI_CWD,
+    env: {
+      ...process.env,
+      LAB_HOST_ATTESTATION_KEY_FILE: keyPath,
+      LAB_HOST_ADAPTER_SOCKET: socketPath,
+      LAB_HOST_EXTENSION_BINDING_FILE: bindingPath,
+      LAB_HOST_REENTRY_STATE_FILE: reentryStatePath
+    },
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  let stdout = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk.toString("utf8"); });
+  child.stdin.end(JSON.stringify({
+    operation: "reconcile_reentry_result",
+    expected_conversation_id: conversation,
+    expected_target_generation: 9,
+    expected_ownership_generation: 9,
+    original_reentry_receipt: original
+  }) + "\n");
+  const [code] = await once(child, "exit");
+  const payload = JSON.parse(stdout.trim());
+  assert.equal(code, 0, JSON.stringify(payload));
+  assert.equal(payload.ok, true);
+  assert.equal(payload.operation, "reconcile_reentry_result");
+  assert.equal(payload.reconciliation_receipt.reconciliation_class, "CONFIRMED_NOT_DELIVERED");
+  assert.equal(payload.reconciliation_receipt.original_receipt_id, original.receipt_id);
+  assert.deepEqual(browserRequests.map((request) => request.op), [
+    "observe_target",
+    "reconcile_continuation",
+    "observe_target",
+    "reconcile_continuation"
+  ]);
+  const serializedRequests = JSON.stringify(browserRequests);
+  assert.equal(serializedRequests.includes("cli reconcile body"), false);
+  assert.equal(serializedRequests.includes("nonce-cli-reconcile"), false);
+  assert.equal(browserRequests[1].payload_sha256, original.continuation_payload_sha256);
+  assert.equal(browserRequests[3].payload_sha256, original.continuation_payload_sha256);
+
+  const beforeTamperRequests = browserRequests.length;
+  const tampered = { ...original, target_generation: 10 };
+  const child2 = spawn(process.execPath, [CLI], {
+    cwd: CLI_CWD,
+    env: {
+      ...process.env,
+      LAB_HOST_ATTESTATION_KEY_FILE: keyPath,
+      LAB_HOST_ADAPTER_SOCKET: socketPath,
+      LAB_HOST_EXTENSION_BINDING_FILE: bindingPath,
+      LAB_HOST_REENTRY_STATE_FILE: reentryStatePath
+    },
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  let stdout2 = "";
+  child2.stdout.on("data", (chunk) => { stdout2 += chunk.toString("utf8"); });
+  child2.stdin.end(JSON.stringify({
+    operation: "reconcile_reentry_result",
+    expected_conversation_id: conversation,
+    expected_target_generation: 9,
+    expected_ownership_generation: 9,
+    original_reentry_receipt: tampered
+  }) + "\n");
+  const [code2] = await once(child2, "exit");
+  const payload2 = JSON.parse(stdout2.trim());
+  assert.equal(code2, 1);
+  assert.match(payload2.error, /authentication failed|stale target generation/i);
+  assert.equal(browserRequests.length, beforeTamperRequests);
 });

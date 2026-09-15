@@ -15,6 +15,11 @@ function requiredGeneration(value, name) {
   return number;
 }
 
+function optionalBaselineUserMessageCount(value) {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return null;
+  return value;
+}
+
 function normalizeRecord(input) {
   const value = input && typeof input === "object" ? input : {};
   return Object.freeze({
@@ -27,6 +32,7 @@ function normalizeRecord(input) {
     payload_sha256: requiredText(value.payload_sha256, "payload_sha256", 64),
     phase: requiredText(value.phase, "phase", 128),
     dispatch_attempted: value.dispatch_attempted === true,
+    baseline_user_message_count: optionalBaselineUserMessageCount(value.baseline_user_message_count),
     updated_at_ms: Number.isSafeInteger(Number(value.updated_at_ms))
       ? Number(value.updated_at_ms)
       : Date.now()

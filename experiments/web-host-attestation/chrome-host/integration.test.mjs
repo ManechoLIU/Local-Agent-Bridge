@@ -101,6 +101,8 @@ test("Runtime-facing Chrome integration issues challenge obtains Host attestatio
     "consumeVerifiedTarget",
     "submitReentry",
     "submitAndVerifyReentry",
+    "reconcileReentry",
+    "reconcileAndVerifyReentry",
     "verifyToolPreReceipt",
     "verifyToolTerminalReceipt"
   ]);
@@ -422,6 +424,65 @@ test("Runtime verifier verifies signed current-entry receipt without re-attestin
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("Runtime verifier reconciliation consumes only the original signed RESULT_UNKNOWN receipt and canonical fence", async function () {
+  const calls = [];
+  const original = {
+    schema_version: 1,
+    receipt_id: "wr_original",
+    wake_id: "wake-reconcile-runtime",
+    wake_nonce_sha256: "a".repeat(64),
+    conversation_id: CONVERSATION,
+    browser_target_id: "browser-reconcile-runtime",
+    target_generation: 21,
+    ownership_generation: 34,
+    continuation_payload_sha256: "b".repeat(64),
+    dispatch_attempted: true,
+    submit_confirmed: false,
+    retryable: false,
+    auto_retry_allowed: false,
+    result_class: "RESULT_UNKNOWN",
+    status: "result_unknown",
+    host_submit_receipt: "chrome_submit_runtime",
+    submit_diagnostics: null,
+    observed_at_ms: 1800000000200,
+    provenance: "browser_host_reentry_receipt_v1",
+    host_mac_sha256: "c".repeat(64)
+  };
+  const result = await executeRuntimeVerifierCommand({
+    operation: "reconcile_reentry_result",
+    original_reentry_receipt: original,
+    expected_conversation_id: CONVERSATION,
+    expected_target_generation: 21,
+    expected_ownership_generation: 34
+  }, {
+    integration: {
+      async reconcileAndVerifyReentry(input) {
+        calls.push(input);
+        return {
+          schema_version: 1,
+          receipt_id: "wrr_runtime",
+          original_receipt_id: original.receipt_id,
+          wake_id: original.wake_id,
+          conversation_id: CONVERSATION,
+          target_generation: 21,
+          ownership_generation: 34,
+          reconciliation_class: "CONFIRMED_NOT_DELIVERED",
+          status: "confirmed_not_delivered",
+          provenance: "browser_host_reentry_reconciliation_v1"
+        };
+      }
+    }
+  });
+  assert.deepEqual(calls, [{
+    original_reentry_receipt: original,
+    expected_conversation_id: CONVERSATION,
+    expected_target_generation: 21,
+    expected_ownership_generation: 34
+  }]);
+  assert.equal(result.operation, "reconcile_reentry_result");
+  assert.equal(result.reconciliation_receipt.reconciliation_class, "CONFIRMED_NOT_DELIVERED");
 });
 
 test("Runtime verifier discover_current_entry never accepts caller conversation and returns Host machine entry", async function () {

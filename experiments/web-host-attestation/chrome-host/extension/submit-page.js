@@ -415,5 +415,87 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
     };
   }
 
+  if (operation === "reconcile") {
+    const expectedPayloadSha256 = String(input.expected_payload_sha256 == null
+      ? ""
+      : input.expected_payload_sha256).trim().toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(expectedPayloadSha256)) {
+      return {
+        status: "invalid_payload_hash",
+        conversation_matches: null,
+        composer_exact_payload: null,
+        composer_empty: null,
+        exact_user_message_present: null
+      };
+    }
+    let currentConversation;
+    try {
+      currentConversation = conversationFromCurrentLocation();
+    } catch {
+      return {
+        status: "wrong_conversation",
+        conversation_matches: null,
+        composer_exact_payload: null,
+        composer_empty: null,
+        exact_user_message_present: null
+      };
+    }
+    if (currentConversation !== expectedConversation) {
+      return {
+        status: "wrong_conversation",
+        conversation_matches: false,
+        composer_exact_payload: null,
+        composer_empty: null,
+        exact_user_message_present: null
+      };
+    }
+
+    const baselineUserMessageCount = Number(input.baseline_user_message_count);
+    if (!Number.isSafeInteger(baselineUserMessageCount) || baselineUserMessageCount < 0) {
+      return {
+        status: "invalid_baseline_user_message_count",
+        conversation_matches: true,
+        composer_exact_payload: null,
+        composer_empty: null,
+        exact_user_message_present: null
+      };
+    }
+
+    async function exactPayloadMessageExists() {
+      const nodes = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
+        .slice(baselineUserMessageCount);
+      for (let index = 0; index < nodes.length; index += 1) {
+        const node = nodes[index];
+        const raw = typeof node.innerText === "string"
+          ? node.innerText
+          : String(node.textContent || "");
+        if (await sha256Hex(normalizedText(raw)) === expectedPayloadSha256) return true;
+      }
+      return false;
+    }
+
+    const exactUserMessage = await exactPayloadMessageExists();
+    const composer = document.querySelector('#prompt-textarea[contenteditable="true"]');
+    if (!composer) {
+      return {
+        status: "composer_unavailable",
+        conversation_matches: true,
+        composer_exact_payload: null,
+        composer_empty: null,
+        exact_user_message_present: exactUserMessage
+      };
+    }
+    const composerText = normalizedComposerText(composer);
+    const composerExact = composerText !== "" &&
+      await sha256Hex(composerText) === expectedPayloadSha256;
+    return {
+      status: "observed",
+      conversation_matches: true,
+      composer_exact_payload: composerExact,
+      composer_empty: composerText === "",
+      exact_user_message_present: exactUserMessage
+    };
+  }
+
   return { status: "unsupported_operation" };
 }

@@ -3,7 +3,10 @@ import {
   selectExactTarget,
   selectUniqueConversationTarget
 } from "./observation.js";
-import { submitContinuationThroughChrome } from "./browser-submit.js";
+import {
+  reconcileContinuationThroughChrome,
+  submitContinuationThroughChrome
+} from "./browser-submit.js";
 import { withDebuggerSession } from "./debugger-session.js";
 import {
   createChromeSubmitJournal,
@@ -235,6 +238,17 @@ async function handleCommand(message) {
         observeTarget,
         dispatchTrustedClick,
         rollbackPreparedByHash: rollbackPreparedPayloadByHash,
+        journal: submitJournal,
+        message
+      });
+    });
+  }
+  if (op === "reconcile_continuation") {
+    return await submitTransactions.run(async function () {
+      return await reconcileContinuationThroughChrome({
+        chromeApi: chrome,
+        getTargets: allTargets,
+        observeTarget,
         journal: submitJournal,
         message
       });

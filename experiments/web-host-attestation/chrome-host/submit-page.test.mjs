@@ -54,7 +54,9 @@ function withPage(t, options = {}) {
   };
   globalThis.document = {
     querySelector(selector) {
-      if (selector === '#prompt-textarea[contenteditable="true"]') return composer;
+      if (selector === '#prompt-textarea[contenteditable="true"]') {
+        return options.composer === false ? null : composer;
+      }
       if (selector === 'button[data-testid="send-button"]') return sendButton;
       if (selector === 'button[data-testid="stop-button"]') return stopButton;
       return null;
@@ -200,6 +202,100 @@ test("prepare_rollback authorizes only exact SHA-256-owned payload", async t => 
   const mismatch = await op("prepare_rollback", { expected_payload_sha256: "0".repeat(64) });
   assert.equal(mismatch.safe_to_clear, false);
   assert.equal(mismatch.status, "composer_hash_mismatch");
+});
+
+test("reconcile proves exact composer and user-message state from payload hash only", async t => {
+  const page = withPage(t, { initialText: "resume", userMessages: ["old"] });
+  const digest = Buffer.from(await webcrypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode("resume")
+  )).toString("hex");
+  const result = await op("reconcile", {
+    expected_payload_sha256: digest,
+    baseline_user_message_count: 1
+  });
+  assert.equal(result.status, "observed");
+  assert.equal(result.conversation_matches, true);
+  assert.equal(result.composer_exact_payload, true);
+  assert.equal(result.exact_user_message_present, false);
+  assert.equal(page.composer.innerText, "resume");
+});
+
+test("reconcile ignores identical user messages that predate the submit baseline", async t => {
+  withPage(t, { initialText: "resume", userMessages: ["resume"] });
+  const digest = Buffer.from(await webcrypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode("resume")
+  )).toString("hex");
+  const result = await op("reconcile", {
+    expected_payload_sha256: digest,
+    baseline_user_message_count: 1
+  });
+  assert.equal(result.status, "observed");
+  assert.equal(result.conversation_matches, true);
+  assert.equal(result.composer_exact_payload, true);
+  assert.equal(result.exact_user_message_present, false);
+});
+
+test("reconcile missing or invalid baseline stays unresolved without manufacturing delivery evidence", async t => {
+  withPage(t, { initialText: "resume", userMessages: ["old"] });
+  const digest = Buffer.from(await webcrypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode("resume")
+  )).toString("hex");
+  const missing = await op("reconcile", { expected_payload_sha256: digest });
+  assert.equal(missing.status, "invalid_baseline_user_message_count");
+  assert.equal(missing.exact_user_message_present, null);
+  assert.equal(missing.composer_exact_payload, null);
+  assert.notEqual(missing.status, "confirmed_not_delivered");
+
+  const invalid = await op("reconcile", {
+    expected_payload_sha256: digest,
+    baseline_user_message_count: -1
+  });
+  assert.equal(invalid.status, "invalid_baseline_user_message_count");
+  assert.equal(invalid.exact_user_message_present, null);
+});
+
+test("reconcile unknown conversation evidence stays null instead of false", async t => {
+  withPage(t, { initialText: "resume" });
+  const invalidHash = await op("reconcile", { expected_payload_sha256: "nope" });
+  assert.equal(invalidHash.status, "invalid_payload_hash");
+  assert.equal(invalidHash.conversation_matches, null);
+  assert.equal(invalidHash.composer_exact_payload, null);
+  assert.equal(invalidHash.exact_user_message_present, null);
+
+  globalThis.location = { href: "https://example.com/" };
+  const digest = Buffer.from(await webcrypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode("resume")
+  )).toString("hex");
+  const unreadable = await op("reconcile", {
+    expected_payload_sha256: digest,
+    baseline_user_message_count: 0
+  });
+  assert.equal(unreadable.status, "wrong_conversation");
+  assert.equal(unreadable.conversation_matches, null);
+  assert.equal(unreadable.composer_exact_payload, null);
+  assert.equal(unreadable.exact_user_message_present, null);
+});
+
+test("reconcile missing composer does not manufacture exact-payload false", async t => {
+  withPage(t, { initialText: "resume", composer: false, userMessages: ["old"] });
+  const digest = Buffer.from(await webcrypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode("resume")
+  )).toString("hex");
+  const result = await op("reconcile", {
+    expected_payload_sha256: digest,
+    baseline_user_message_count: 1
+  });
+  assert.equal(result.status, "composer_unavailable");
+  assert.equal(result.conversation_matches, true);
+  assert.equal(result.composer_exact_payload, null);
+  assert.equal(result.composer_empty, null);
+  assert.notEqual(result.composer_exact_payload, false);
+  assert.equal(result.exact_user_message_present, false);
 });
 
 test("verify_empty does not mutate composer", async t => {

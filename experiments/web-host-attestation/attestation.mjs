@@ -9,6 +9,8 @@ export const ATTESTATION_PROVENANCE = "browser_host_machine_attested_v1";
 export const MACHINE_OBSERVATION_SOURCE = "browser_cdp_page_frame_tree_v1";
 export const VERIFIED_TARGET_PROVENANCE = "runtime_host_verifier_v1";
 export const REENTRY_RECEIPT_PROVENANCE = "browser_host_reentry_receipt_v1";
+export const REENTRY_RECONCILIATION_PROVENANCE = "browser_host_reentry_reconciliation_v1";
+export const REENTRY_RECONCILE_SETTLE_MS = 250;
 export const INVOCATION_ORIGIN_PROVENANCE = "runtime_invocation_origin_v1";
 export const MACHINE_INVOCATION_ORIGIN_SOURCE = "browser_cdp_invocation_origin_v1";
 export const CURRENT_ENTRY_PROVENANCE = "runtime_host_current_entry_v1";
@@ -1190,12 +1192,57 @@ function sameTarget(observation, verified) {
   );
 }
 
+function optionalEvidenceBoolean(value) {
+  return typeof value === "boolean" ? value : null;
+}
+
+function optionalBaselineUserMessageCount(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function reconciliationEvidenceFlags(evidence) {
+  return {
+    status: evidence?.status == null ? null : String(evidence.status),
+    journalPhase: evidence?.journal_phase == null ? null : String(evidence.journal_phase),
+    journalMatched: optionalEvidenceBoolean(evidence?.journal_binding_matched),
+    conversationMatches: optionalEvidenceBoolean(evidence?.conversation_matches),
+    targetMatches: optionalEvidenceBoolean(evidence?.target_matches),
+    composerExact: optionalEvidenceBoolean(evidence?.composer_exact_payload),
+    composerEmpty: optionalEvidenceBoolean(evidence?.composer_empty),
+    exactUserMessage: optionalEvidenceBoolean(evidence?.exact_user_message_present),
+    stableNotDelivered: optionalEvidenceBoolean(evidence?.stable_not_delivered),
+    baseline: optionalBaselineUserMessageCount(evidence?.baseline_user_message_count)
+  };
+}
+
+function isStableNotDeliveredCandidate(flags) {
+  return flags.journalPhase === "result_unknown" &&
+    flags.journalMatched === true &&
+    flags.conversationMatches === true &&
+    flags.targetMatches === true &&
+    flags.exactUserMessage === false &&
+    flags.composerExact === true &&
+    flags.composerEmpty === false &&
+    flags.baseline != null;
+}
+
+async function boundedSleep(sleep, ms) {
+  if (typeof sleep === "function") {
+    await sleep(ms);
+    return;
+  }
+  const delay = Number.isFinite(ms) && ms > 0 ? Math.min(Math.floor(ms), 1000) : 0;
+  if (delay <= 0) return;
+  await new Promise((resolve) => setTimeout(resolve, delay));
+}
+
 export class WebReentryAdapter {
-  constructor(secret, driver, { clock = Date.now, statePath = null } = {}) {
+  constructor(secret, driver, { clock = Date.now, statePath = null, sleep = null } = {}) {
     if (!secret || Buffer.byteLength(secret) < 32) throw new Error("re-entry secret must be at least 32 bytes");
     this.secret = secret;
     this.driver = driver;
     this.clock = clock;
+    this.sleep = sleep;
     this.statePath = statePath;
     const persisted = loadPrivateState(statePath);
     this.legacyUsedWakeIds = new Set(
@@ -1508,6 +1555,265 @@ export class WebReentryAdapter {
     }
   }
 
+  #storeReconciliation(wakeId, receipt) {
+    const current = this.wakeRecords.get(wakeId) ?? {};
+    this.wakeRecords.set(wakeId, {
+      ...current,
+      reconciliation_receipt: receipt,
+      reconciled_at_ms: nowMs(this.clock)
+    });
+    this.#persist();
+    return receipt;
+  }
+
+  #signedReconciliationReceipt({
+    original,
+    verified,
+    wake_nonce_sha256,
+    continuation_payload_sha256,
+    reconciliation_class,
+    status,
+    journal_phase,
+    exact_user_message_present,
+    composer_exact_payload,
+    composer_empty,
+    stable_not_delivered
+  }) {
+    const receipt = {
+      schema_version: 1,
+      receipt_id: `wrr_${randomUUID()}`,
+      original_receipt_id: nonEmpty(original.receipt_id, "original_receipt_id"),
+      wake_id: original.wake_id,
+      wake_nonce_sha256,
+      continuation_payload_sha256,
+      conversation_id: verified.conversation_id,
+      browser_target_id: verified.browser_target_id,
+      target_generation: verified.target_generation,
+      ownership_generation: verified.ownership_generation,
+      original_result_class: original.result_class,
+      dispatch_attempted: original.dispatch_attempted === true,
+      submit_confirmed: false,
+      retryable: false,
+      auto_retry_allowed: false,
+      reconciliation_class: nonEmpty(reconciliation_class, "reconciliation_class"),
+      status: nonEmpty(status, "status"),
+      journal_phase: journal_phase == null ? null : String(journal_phase),
+      exact_user_message_present: typeof exact_user_message_present === "boolean"
+        ? exact_user_message_present
+        : null,
+      composer_exact_payload: typeof composer_exact_payload === "boolean" ? composer_exact_payload : null,
+      composer_empty: typeof composer_empty === "boolean" ? composer_empty : null,
+      stable_not_delivered: typeof stable_not_delivered === "boolean" ? stable_not_delivered : null,
+      observed_at_ms: nowMs(this.clock),
+      provenance: REENTRY_RECONCILIATION_PROVENANCE
+    };
+    return { ...receipt, host_mac_sha256: hmac(this.secret, receipt) };
+  }
+
+  async reconcile(input = {}) {
+    const suppliedOriginal = input && input.original_reentry_receipt;
+    const original = suppliedOriginal == null
+      ? null
+      : authenticateReentryReceipt(this.secret, suppliedOriginal);
+    if (original && original.result_class !== "RESULT_UNKNOWN") {
+      throw new Error("reentry reconciliation requires RESULT_UNKNOWN");
+    }
+
+    const wakeId = original
+      ? nonEmpty(original.wake_id, "original_reentry_receipt.wake_id")
+      : nonEmpty(input.wake_id, "wake_id");
+    const existing = this.wakeRecords.get(wakeId);
+    if (!existing) throw new Error("reentry journal record is required");
+    if (existing.phase !== "terminal" || !existing.receipt) {
+      throw new Error("reentry reconciliation requires a terminal journal record");
+    }
+    if (existing.receipt.result_class !== "RESULT_UNKNOWN") {
+      throw new Error("reentry reconciliation requires RESULT_UNKNOWN");
+    }
+    if (original && canonicalJson(original) !== canonicalJson(existing.receipt)) {
+      throw new Error("original re-entry receipt does not match durable Host record");
+    }
+
+    const verified = authenticateVerifiedTarget(this.secret, existing.verified_target);
+    const conversationId = original
+      ? original.conversation_id
+      : nonEmpty(input.conversation_id, "conversation_id");
+    if (original && input.expected_conversation_id != null &&
+        nonEmpty(input.expected_conversation_id, "expected_conversation_id") !== conversationId) {
+      throw new Error("original re-entry receipt conversation does not match expected Controller target");
+    }
+    const browserTargetId = original
+      ? original.browser_target_id
+      : nonEmpty(input.browser_target_id, "browser_target_id");
+    if (conversationId !== verified.conversation_id || browserTargetId !== verified.browser_target_id) {
+      throw new Error("wake_id replayed with mismatched binding");
+    }
+    if (verified.target_generation !== positiveInteger(input.expected_target_generation, "expected_target_generation")) {
+      throw new Error("stale target generation before re-entry reconciliation");
+    }
+    if (verified.ownership_generation !== positiveInteger(input.expected_ownership_generation, "expected_ownership_generation")) {
+      throw new Error("stale ownership generation before re-entry reconciliation");
+    }
+
+    let wakeNonceSha256;
+    let continuationPayloadSha256;
+    if (original) {
+      wakeNonceSha256 = nonEmpty(original.wake_nonce_sha256, "original_reentry_receipt.wake_nonce_sha256");
+      continuationPayloadSha256 = nonEmpty(
+        original.continuation_payload_sha256,
+        "original_reentry_receipt.continuation_payload_sha256"
+      );
+      if (
+        existing.wake_nonce_sha256 !== wakeNonceSha256 ||
+        existing.continuation_payload_sha256 !== continuationPayloadSha256
+      ) {
+        throw new Error("original re-entry receipt does not match durable Host binding");
+      }
+    } else {
+      const payload = nonEmpty(input.continuation_payload, "continuation_payload");
+      const nonce = nonEmpty(input.wake_nonce, "wake_nonce");
+      const binding = this.#wakeBinding({ wakeId, nonce, payload, verified });
+      this.#assertWakeBinding(existing, binding);
+      wakeNonceSha256 = binding.wake_nonce_sha256;
+      continuationPayloadSha256 = binding.continuation_payload_sha256;
+    }
+
+    if (existing.reconciliation_receipt) {
+      return verifyReentryReconciliationReceipt(this.secret, existing.reconciliation_receipt, {
+        wake_id: wakeId,
+        wake_nonce_sha256: wakeNonceSha256,
+        continuation_payload_sha256: continuationPayloadSha256,
+        conversation_id: verified.conversation_id,
+        browser_target_id: verified.browser_target_id,
+        target_generation: verified.target_generation,
+        ownership_generation: verified.ownership_generation,
+        original_receipt_id: existing.receipt.receipt_id
+      });
+    }
+
+    if (this.activeWakeIds.has(wakeId)) throw new Error("wake reconciliation already in progress");
+    this.activeWakeIds.add(wakeId);
+    try {
+      const unsigned = {
+        original: existing.receipt,
+        verified,
+        wake_nonce_sha256: wakeNonceSha256,
+        continuation_payload_sha256: continuationPayloadSha256
+      };
+      const unresolved = (status, flags = {}) => this.#signedReconciliationReceipt({
+        ...unsigned,
+        reconciliation_class: "UNRESOLVED",
+        status,
+        journal_phase: flags.journalPhase ?? null,
+        exact_user_message_present: flags.exactUserMessage ?? null,
+        composer_exact_payload: flags.composerExact ?? null,
+        composer_empty: flags.composerEmpty ?? null,
+        stable_not_delivered: flags.stableNotDelivered ?? null
+      });
+      const notClearable = (status, flags) => this.#storeReconciliation(wakeId, this.#signedReconciliationReceipt({
+        ...unsigned,
+        reconciliation_class: "NOT_CLEARABLE",
+        status,
+        journal_phase: flags.journalPhase,
+        exact_user_message_present: flags.exactUserMessage,
+        composer_exact_payload: flags.composerExact,
+        composer_empty: flags.composerEmpty,
+        stable_not_delivered: false
+      }));
+
+      if (typeof this.driver?.reconcileContinuation !== "function") {
+        return unresolved("reconciliation_unsupported");
+      }
+
+      const collect = async () => {
+        let observation;
+        try {
+          observation = validateMachineObservation(await this.driver.observeTarget(verified.browser_target_id));
+        } catch {
+          return { unresolved: true, status: "observation_unresolved" };
+        }
+        if (!sameTarget(observation, verified)) {
+          return { unresolved: true, status: "target_mismatch_unresolved" };
+        }
+        let evidence;
+        try {
+          evidence = await this.driver.reconcileContinuation({
+            browser_target_id: verified.browser_target_id,
+            conversation_id: verified.conversation_id,
+            payload_sha256: continuationPayloadSha256,
+            wake_id: wakeId,
+            target_generation: verified.target_generation,
+            ownership_generation: verified.ownership_generation
+          });
+        } catch (error) {
+          const message = String(error?.message || error || "");
+          if (/unsupported/i.test(message)) {
+            return { unresolved: true, status: "reconciliation_unsupported" };
+          }
+          return { unresolved: true, status: "observation_unresolved" };
+        }
+        return { flags: reconciliationEvidenceFlags(evidence), evidence };
+      };
+
+      const classifyCollected = (collected) => {
+        if (collected.unresolved) return { kind: "unresolved", status: collected.status };
+        const flags = collected.flags;
+        if (flags.status === "unsupported") {
+          return { kind: "unresolved", status: "reconciliation_unsupported", flags };
+        }
+        if (flags.journalMatched !== true) {
+          if (flags.journalMatched === false) {
+            throw new Error("wake_id replayed with mismatched binding");
+          }
+          return { kind: "unresolved", status: "browser_journal_unavailable", flags };
+        }
+        if (flags.status === "invalid_baseline_user_message_count" || flags.baseline == null) {
+          return { kind: "unresolved", status: "baseline_unresolved", flags };
+        }
+        if (flags.journalPhase === "submit_confirmed" || flags.exactUserMessage === true) {
+          return {
+            kind: "not_clearable",
+            status: flags.journalPhase === "submit_confirmed"
+              ? "journal_submit_confirmed"
+              : "user_message_present",
+            flags
+          };
+        }
+        if (isStableNotDeliveredCandidate(flags)) {
+          return { kind: "candidate", flags };
+        }
+        return {
+          kind: "unresolved",
+          status: flags.composerExact === false ? "composer_payload_unresolved" : "observation_unresolved",
+          flags
+        };
+      };
+
+      const first = classifyCollected(await collect());
+      if (first.kind === "not_clearable") return notClearable(first.status, first.flags);
+      if (first.kind !== "candidate") return unresolved(first.status, first.flags || {});
+
+      await boundedSleep(this.sleep, REENTRY_RECONCILE_SETTLE_MS);
+
+      const second = classifyCollected(await collect());
+      if (second.kind === "not_clearable") return notClearable(second.status, second.flags);
+      if (second.kind !== "candidate") return unresolved(second.status, second.flags || {});
+
+      return this.#storeReconciliation(wakeId, this.#signedReconciliationReceipt({
+        ...unsigned,
+        reconciliation_class: "CONFIRMED_NOT_DELIVERED",
+        status: "confirmed_not_delivered",
+        journal_phase: "result_unknown",
+        exact_user_message_present: false,
+        composer_exact_payload: true,
+        composer_empty: false,
+        stable_not_delivered: true
+      }));
+    } finally {
+      this.activeWakeIds.delete(wakeId);
+    }
+  }
+
   #signedReceipt({ wakeId, nonce, wake_nonce_sha256, verified, payload, continuation_payload_sha256, dispatch_attempted, submit_confirmed, retryable, auto_retry_allowed, result_class, status, host_submit_receipt, submit_diagnostics }) {
     const receipt = {
       schema_version: 1,
@@ -1534,15 +1840,7 @@ export class WebReentryAdapter {
   }
 }
 
-export function verifyReentryReceipt(secret, receipt, {
-  wake_id,
-  wake_nonce,
-  continuation_payload,
-  conversation_id,
-  browser_target_id,
-  target_generation,
-  ownership_generation
-}) {
+function authenticateReentryReceipt(secret, receipt) {
   if (Number(receipt?.schema_version) !== 1 || receipt?.schema_version !== 1) {
     throw new Error("re-entry receipt schema_version is unsupported");
   }
@@ -1551,22 +1849,14 @@ export function verifyReentryReceipt(secret, receipt, {
   delete unsigned.host_mac_sha256;
   if (!secureEqualHex(mac, hmac(secret, unsigned))) throw new Error("re-entry receipt authentication failed");
   if (receipt.provenance !== REENTRY_RECEIPT_PROVENANCE) throw new Error("untrusted re-entry receipt provenance");
-  if (receipt.wake_id !== nonEmpty(wake_id, "expected wake_id")) throw new Error("wrong wake receipt");
-  if (receipt.conversation_id !== nonEmpty(conversation_id, "expected conversation_id")) throw new Error("wrong Web conversation receipt");
-  if (receipt.browser_target_id !== nonEmpty(browser_target_id, "expected browser_target_id")) throw new Error("wrong browser target receipt");
-  const expectedTargetGeneration = positiveInteger(target_generation, "expected target_generation");
-  const expectedOwnershipGeneration = positiveInteger(ownership_generation, "expected ownership_generation");
-  if (receipt.target_generation !== expectedTargetGeneration) throw new Error("stale target generation receipt");
-  if (receipt.ownership_generation !== expectedOwnershipGeneration) throw new Error("stale ownership generation receipt");
+  nonEmpty(receipt.receipt_id, "receipt.receipt_id");
+  nonEmpty(receipt.wake_id, "receipt.wake_id");
+  nonEmpty(receipt.conversation_id, "receipt.conversation_id");
+  nonEmpty(receipt.browser_target_id, "receipt.browser_target_id");
+  nonEmpty(receipt.wake_nonce_sha256, "receipt.wake_nonce_sha256");
+  nonEmpty(receipt.continuation_payload_sha256, "receipt.continuation_payload_sha256");
   positiveInteger(receipt.target_generation, "receipt.target_generation");
   positiveInteger(receipt.ownership_generation, "receipt.ownership_generation");
-  if (receipt.wake_nonce_sha256 !== sha256Text(nonEmpty(wake_nonce, "expected wake_nonce"))) {
-    throw new Error("wake nonce hash mismatch");
-  }
-  if (receipt.continuation_payload_sha256 !== sha256Text(nonEmpty(continuation_payload, "expected continuation_payload"))) {
-    throw new Error("continuation payload hash mismatch");
-  }
-  nonEmpty(receipt.receipt_id, "receipt.receipt_id");
   positiveInteger(receipt.observed_at_ms, "receipt.observed_at_ms");
 
   const dispatchAttempted = receipt.dispatch_attempted;
@@ -1614,6 +1904,134 @@ export function verifyReentryReceipt(secret, receipt, {
     }
   } else {
     throw new Error("re-entry receipt result_class is invalid");
+  }
+  return receipt;
+}
+
+export function verifyReentryReceipt(secret, receipt, {
+  wake_id,
+  wake_nonce,
+  wake_nonce_sha256,
+  continuation_payload,
+  continuation_payload_sha256,
+  conversation_id,
+  browser_target_id,
+  target_generation,
+  ownership_generation
+}) {
+  authenticateReentryReceipt(secret, receipt);
+  if (receipt.wake_id !== nonEmpty(wake_id, "expected wake_id")) throw new Error("wrong wake receipt");
+  if (receipt.conversation_id !== nonEmpty(conversation_id, "expected conversation_id")) throw new Error("wrong Web conversation receipt");
+  if (receipt.browser_target_id !== nonEmpty(browser_target_id, "expected browser_target_id")) throw new Error("wrong browser target receipt");
+  const expectedTargetGeneration = positiveInteger(target_generation, "expected target_generation");
+  const expectedOwnershipGeneration = positiveInteger(ownership_generation, "expected ownership_generation");
+  if (receipt.target_generation !== expectedTargetGeneration) throw new Error("stale target generation receipt");
+  if (receipt.ownership_generation !== expectedOwnershipGeneration) throw new Error("stale ownership generation receipt");
+  const expectedWakeNonceSha256 = wake_nonce == null
+    ? nonEmpty(wake_nonce_sha256, "expected wake_nonce_sha256")
+    : sha256Text(nonEmpty(wake_nonce, "expected wake_nonce"));
+  const expectedPayloadSha256 = continuation_payload == null
+    ? nonEmpty(continuation_payload_sha256, "expected continuation_payload_sha256")
+    : sha256Text(nonEmpty(continuation_payload, "expected continuation_payload"));
+  if (receipt.wake_nonce_sha256 !== expectedWakeNonceSha256) {
+    throw new Error("wake nonce hash mismatch");
+  }
+  if (receipt.continuation_payload_sha256 !== expectedPayloadSha256) {
+    throw new Error("continuation payload hash mismatch");
+  }
+  return receipt;
+}
+
+export function verifyReentryReconciliationReceipt(secret, receipt, {
+  wake_id,
+  wake_nonce,
+  wake_nonce_sha256,
+  continuation_payload,
+  continuation_payload_sha256,
+  conversation_id,
+  browser_target_id,
+  target_generation,
+  ownership_generation,
+  original_receipt_id
+}) {
+  if (Number(receipt?.schema_version) !== 1 || receipt?.schema_version !== 1) {
+    throw new Error("re-entry reconciliation receipt schema_version is unsupported");
+  }
+  const unsigned = { ...receipt };
+  const mac = nonEmpty(unsigned.host_mac_sha256, "receipt.host_mac_sha256");
+  delete unsigned.host_mac_sha256;
+  if (!secureEqualHex(mac, hmac(secret, unsigned))) {
+    throw new Error("re-entry reconciliation receipt authentication failed");
+  }
+  if (receipt.provenance !== REENTRY_RECONCILIATION_PROVENANCE) {
+    throw new Error("untrusted re-entry reconciliation receipt provenance");
+  }
+  if (receipt.wake_id !== nonEmpty(wake_id, "expected wake_id")) throw new Error("wrong wake receipt");
+  if (receipt.conversation_id !== nonEmpty(conversation_id, "expected conversation_id")) {
+    throw new Error("wrong Web conversation receipt");
+  }
+  if (receipt.browser_target_id !== nonEmpty(browser_target_id, "expected browser_target_id")) {
+    throw new Error("wrong browser target receipt");
+  }
+  const expectedTargetGeneration = positiveInteger(target_generation, "expected target_generation");
+  const expectedOwnershipGeneration = positiveInteger(ownership_generation, "expected ownership_generation");
+  if (receipt.target_generation !== expectedTargetGeneration) throw new Error("stale target generation receipt");
+  if (receipt.ownership_generation !== expectedOwnershipGeneration) throw new Error("stale ownership generation receipt");
+  const expectedWakeNonceSha256 = wake_nonce == null
+    ? nonEmpty(wake_nonce_sha256, "expected wake_nonce_sha256")
+    : sha256Text(nonEmpty(wake_nonce, "expected wake_nonce"));
+  const expectedPayloadSha256 = continuation_payload == null
+    ? nonEmpty(continuation_payload_sha256, "expected continuation_payload_sha256")
+    : sha256Text(nonEmpty(continuation_payload, "expected continuation_payload"));
+  if (receipt.wake_nonce_sha256 !== expectedWakeNonceSha256) {
+    throw new Error("wake nonce hash mismatch");
+  }
+  if (receipt.continuation_payload_sha256 !== expectedPayloadSha256) {
+    throw new Error("continuation payload hash mismatch");
+  }
+  nonEmpty(receipt.receipt_id, "receipt.receipt_id");
+  nonEmpty(receipt.original_receipt_id, "receipt.original_receipt_id");
+  if (original_receipt_id != null &&
+      receipt.original_receipt_id !== nonEmpty(original_receipt_id, "expected original_receipt_id")) {
+    throw new Error("wrong original wake receipt");
+  }
+  positiveInteger(receipt.observed_at_ms, "receipt.observed_at_ms");
+  if (receipt.original_result_class !== "RESULT_UNKNOWN") {
+    throw new Error("re-entry reconciliation requires RESULT_UNKNOWN");
+  }
+  if (receipt.submit_confirmed !== false || receipt.retryable !== false || receipt.auto_retry_allowed !== false) {
+    throw new Error("re-entry reconciliation receipt retry state is invalid");
+  }
+  if (receipt.dispatch_attempted !== true) {
+    throw new Error("re-entry reconciliation receipt dispatch state is invalid");
+  }
+  const exactUserMessage = receipt.exact_user_message_present;
+  const composerExact = receipt.composer_exact_payload;
+  if (![exactUserMessage, composerExact, receipt.composer_empty, receipt.stable_not_delivered]
+    .every((value) => value === null || typeof value === "boolean")) {
+    throw new Error("re-entry reconciliation receipt evidence flags are invalid");
+  }
+  const reconciliationClass = receipt.reconciliation_class;
+  if (reconciliationClass === "CONFIRMED_NOT_DELIVERED") {
+    if (
+      exactUserMessage !== false ||
+      composerExact !== true ||
+      receipt.composer_empty !== false ||
+      receipt.stable_not_delivered !== true ||
+      receipt.journal_phase !== "result_unknown"
+    ) {
+      throw new Error("re-entry reconciliation confirmed-not-delivered state is inconsistent");
+    }
+  } else if (reconciliationClass === "NOT_CLEARABLE") {
+    if (exactUserMessage !== true && receipt.journal_phase !== "submit_confirmed") {
+      throw new Error("re-entry reconciliation not-clearable state is inconsistent");
+    }
+  } else if (reconciliationClass === "UNRESOLVED") {
+    if (exactUserMessage === true || receipt.journal_phase === "submit_confirmed") {
+      throw new Error("re-entry reconciliation unresolved state is inconsistent");
+    }
+  } else {
+    throw new Error("re-entry reconciliation_class is invalid");
   }
   return receipt;
 }

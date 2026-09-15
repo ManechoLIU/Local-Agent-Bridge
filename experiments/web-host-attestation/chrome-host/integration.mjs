@@ -1,5 +1,11 @@
 import { createRuntimeHostProvider } from "../provider.mjs";
-import { verifyCurrentEntryEvidence, verifyReentryReceipt, verifyToolPreReceipt, verifyToolTerminalReceipt } from "../attestation.mjs";
+import {
+  verifyCurrentEntryEvidence,
+  verifyReentryReceipt,
+  verifyReentryReconciliationReceipt,
+  verifyToolPreReceipt,
+  verifyToolTerminalReceipt
+} from "../attestation.mjs";
 import { createChromeHostDriver } from "./client.mjs";
 import { RUNTIME_HOST_REQUEST_TIMEOUT_MS } from "./extension/timeout-budget.js";
 
@@ -37,6 +43,8 @@ export function createChromeRuntimeHostIntegration(options) {
       "consumeVerifiedTarget",
       "submitReentry",
       "submitAndVerifyReentry",
+      "reconcileReentry",
+      "reconcileAndVerifyReentry",
       "verifyToolPreReceipt",
       "verifyToolTerminalReceipt"
     ]),
@@ -127,6 +135,62 @@ export function createChromeRuntimeHostIntegration(options) {
         target_generation: input && input.expected_target_generation,
         ownership_generation: input && input.expected_ownership_generation
       });
+    },
+
+    async reconcileReentry(input) {
+      return await provider.reconcileReentry(input);
+    },
+
+    async reconcileAndVerifyReentry(input) {
+      const original = input && input.original_reentry_receipt;
+      if (!original || typeof original !== "object" || Array.isArray(original)) {
+        throw new Error("original_reentry_receipt is required");
+      }
+      const expectedConversationId = requiredRuntimeText(
+        input && input.expected_conversation_id, "expected_conversation_id", 128
+      );
+      const expectedTargetGeneration = requiredRuntimeGeneration(
+        input && input.expected_target_generation, "expected_target_generation"
+      );
+      const expectedOwnershipGeneration = requiredRuntimeGeneration(
+        input && input.expected_ownership_generation, "expected_ownership_generation"
+      );
+      const verifiedOriginal = verifyReentryReceipt(secret, original, {
+        wake_id: requiredRuntimeText(original.wake_id, "original_reentry_receipt.wake_id", 256),
+        wake_nonce_sha256: requiredRuntimeText(
+          original.wake_nonce_sha256, "original_reentry_receipt.wake_nonce_sha256", 64
+        ),
+        continuation_payload_sha256: requiredRuntimeText(
+          original.continuation_payload_sha256,
+          "original_reentry_receipt.continuation_payload_sha256",
+          64
+        ),
+        conversation_id: expectedConversationId,
+        browser_target_id: requiredRuntimeText(
+          original.browser_target_id, "original_reentry_receipt.browser_target_id", 256
+        ),
+        target_generation: expectedTargetGeneration,
+        ownership_generation: expectedOwnershipGeneration
+      });
+      if (verifiedOriginal.result_class !== "RESULT_UNKNOWN") {
+        throw new Error("re-entry reconciliation requires RESULT_UNKNOWN");
+      }
+      const receipt = await provider.reconcileReentry({
+        original_reentry_receipt: verifiedOriginal,
+        expected_conversation_id: expectedConversationId,
+        expected_target_generation: expectedTargetGeneration,
+        expected_ownership_generation: expectedOwnershipGeneration
+      });
+      return verifyReentryReconciliationReceipt(secret, receipt, {
+        wake_id: verifiedOriginal.wake_id,
+        wake_nonce_sha256: verifiedOriginal.wake_nonce_sha256,
+        continuation_payload_sha256: verifiedOriginal.continuation_payload_sha256,
+        conversation_id: expectedConversationId,
+        browser_target_id: verifiedOriginal.browser_target_id,
+        target_generation: expectedTargetGeneration,
+        ownership_generation: expectedOwnershipGeneration,
+        original_receipt_id: verifiedOriginal.receipt_id
+      });
     }
   });
 
@@ -164,7 +228,7 @@ function requiredRuntimeGeneration(value, name) {
 
 export async function executeRuntimeVerifierCommand(input, options) {
   const operation = requiredRuntimeText(input && input.operation, "operation", 64);
-  if (!["discover_current_entry", "verify_current_entry", "attest_and_verify", "submit_reentry", "verify_tool_pre", "verify_tool_terminal"].includes(operation)) {
+  if (!["discover_current_entry", "verify_current_entry", "attest_and_verify", "submit_reentry", "reconcile_reentry_result", "verify_tool_pre", "verify_tool_terminal"].includes(operation)) {
     throw new Error("unsupported Runtime Host operation: " + operation);
   }
   const integration = options && options.integration;
@@ -313,6 +377,34 @@ export async function executeRuntimeVerifierCommand(input, options) {
       ok: true,
       operation: operation,
       reentry_receipt: receipt
+    });
+  }
+
+  if (operation === "reconcile_reentry_result") {
+    if (typeof integration.reconcileAndVerifyReentry !== "function") {
+      throw new Error("Runtime Host re-entry reconciliation integration is required");
+    }
+    const original = input && input.original_reentry_receipt;
+    if (!original || typeof original !== "object" || Array.isArray(original)) {
+      throw new Error("original_reentry_receipt is required");
+    }
+    const request = {
+      original_reentry_receipt: original,
+      expected_conversation_id: requiredRuntimeText(
+        input && input.expected_conversation_id, "expected_conversation_id", 128
+      ),
+      expected_target_generation: requiredRuntimeGeneration(
+        input && input.expected_target_generation, "expected_target_generation"
+      ),
+      expected_ownership_generation: requiredRuntimeGeneration(
+        input && input.expected_ownership_generation, "expected_ownership_generation"
+      )
+    };
+    const receipt = await integration.reconcileAndVerifyReentry(request);
+    return Object.freeze({
+      ok: true,
+      operation: operation,
+      reconciliation_receipt: receipt
     });
   }
 }

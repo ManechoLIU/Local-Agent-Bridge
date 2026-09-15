@@ -78,6 +78,108 @@ test("native Host rejects wrong target returned by browser machine boundary", as
   );
 });
 
+test("native Host reconciliation forwards only payload hash and exact wake fence", async function () {
+  let browserCommand;
+  const handle = createNativeHostHandler({
+    secret: SECRET,
+    sendBrowserCommand: async function (command) {
+      browserCommand = command;
+      return {
+        request_id: command.request_id,
+        ok: true,
+        result: {
+          status: "observed",
+          journal_phase: "result_unknown",
+          journal_binding_matched: true,
+          conversation_matches: true,
+          target_matches: true,
+          composer_exact_payload: true,
+          composer_empty: false,
+          exact_user_message_present: false
+        }
+      };
+    }
+  });
+  const payloadSha256 = "a".repeat(64);
+  const result = await handle({
+    op: "reconcile_continuation",
+    browser_target_id: "browser-target-7",
+    conversation_id: CONVERSATION,
+    payload_sha256: payloadSha256,
+    wake_id: "wake-reconcile",
+    target_generation: 4,
+    ownership_generation: 8
+  });
+  assert.equal(browserCommand.op, "reconcile_continuation");
+  assert.equal(browserCommand.payload_sha256, payloadSha256);
+  assert.equal("payload" in browserCommand, false);
+  assert.equal("wake_nonce" in browserCommand, false);
+  assert.equal(result.journal_binding_matched, true);
+});
+
+test("old extension without reconcile support returns typed unsupported evidence", async function () {
+  const handle = createNativeHostHandler({
+    secret: SECRET,
+    sendBrowserCommand: async function (command) {
+      return {
+        request_id: command.request_id,
+        ok: false,
+        error: "unsupported browser command: reconcile_continuation"
+      };
+    }
+  });
+  const result = await handle({
+    op: "reconcile_continuation",
+    browser_target_id: "browser-target-7",
+    conversation_id: CONVERSATION,
+    payload_sha256: "a".repeat(64),
+    wake_id: "wake-reconcile",
+    target_generation: 4,
+    ownership_generation: 8
+  });
+  assert.equal(result.status, "unsupported");
+  assert.equal(result.journal_binding_matched, null);
+  assert.equal(result.conversation_matches, null);
+  assert.equal(result.target_matches, null);
+  assert.equal(result.composer_exact_payload, null);
+  assert.equal(result.exact_user_message_present, null);
+  assert.equal(result.stable_not_delivered, null);
+  assert.notEqual(result.status, "confirmed_not_delivered");
+});
+
+test("native Host does not coerce missing reconciliation evidence to false", async function () {
+  const handle = createNativeHostHandler({
+    secret: SECRET,
+    sendBrowserCommand: async function (command) {
+      return {
+        request_id: command.request_id,
+        ok: true,
+        result: {
+          status: "observed",
+          journal_phase: "result_unknown",
+          journal_binding_matched: true
+        }
+      };
+    }
+  });
+  const result = await handle({
+    op: "reconcile_continuation",
+    browser_target_id: "browser-target-7",
+    conversation_id: CONVERSATION,
+    payload_sha256: "a".repeat(64),
+    wake_id: "wake-reconcile",
+    target_generation: 4,
+    ownership_generation: 8
+  });
+  assert.equal(result.conversation_matches, null);
+  assert.equal(result.target_matches, null);
+  assert.equal(result.composer_exact_payload, null);
+  assert.equal(result.composer_empty, null);
+  assert.equal(result.exact_user_message_present, null);
+  assert.equal(result.stable_not_delivered, null);
+  assert.notEqual(result.stable_not_delivered, false);
+});
+
 test("oversized continuation is rejected before browser dispatch", async function () {
   let calls = 0;
   const handle = createNativeHostHandler({

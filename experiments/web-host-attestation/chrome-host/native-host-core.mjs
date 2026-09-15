@@ -32,6 +32,47 @@ function optionalText(value, name, max) {
   return requiredText(value, name, max);
 }
 
+function optionalBoolean(value) {
+  return typeof value === "boolean" ? value : null;
+}
+
+function optionalNonNegativeInteger(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function unsupportedReconciliationEvidence() {
+  return Object.freeze({
+    status: "unsupported",
+    journal_phase: null,
+    journal_binding_matched: null,
+    conversation_matches: null,
+    target_matches: null,
+    composer_exact_payload: null,
+    composer_empty: null,
+    exact_user_message_present: null,
+    stable_not_delivered: null,
+    baseline_user_message_count: null
+  });
+}
+
+function normalizeReconciliationEvidence(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new Error("browser reconciliation evidence is required");
+  }
+  return Object.freeze({
+    status: requiredText(input.status, "reconciliation status", 128),
+    journal_phase: optionalText(input.journal_phase, "reconciliation journal_phase", 128),
+    journal_binding_matched: optionalBoolean(input.journal_binding_matched),
+    conversation_matches: optionalBoolean(input.conversation_matches),
+    target_matches: optionalBoolean(input.target_matches),
+    composer_exact_payload: optionalBoolean(input.composer_exact_payload),
+    composer_empty: optionalBoolean(input.composer_empty),
+    exact_user_message_present: optionalBoolean(input.exact_user_message_present),
+    stable_not_delivered: optionalBoolean(input.stable_not_delivered),
+    baseline_user_message_count: optionalNonNegativeInteger(input.baseline_user_message_count)
+  });
+}
+
 function normalizeSubmitDiagnostics(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) return null;
   const debuggerAttach = input.debugger_attach && typeof input.debugger_attach === "object"
@@ -435,6 +476,33 @@ export function createNativeHostHandler(options) {
         });
       }
       return { ...normalized, ...epochFields };
+    }
+
+    if (op === "reconcile_continuation") {
+      const target = requiredText(request.browser_target_id, "browser_target_id", 256);
+      const conversation = requiredText(request.conversation_id, "conversation_id", 128);
+      const payloadSha256 = requiredText(request.payload_sha256, "payload_sha256", 64).toLowerCase();
+      if (!/^[0-9a-f]{64}$/.test(payloadSha256)) throw new Error("payload_sha256 is invalid");
+      const wakeId = requiredText(request.wake_id, "wake_id", 256);
+      const targetGeneration = positiveInteger(request.target_generation, "target_generation");
+      const ownershipGeneration = positiveInteger(request.ownership_generation, "ownership_generation");
+      try {
+        const result = await browser("reconcile_continuation", {
+          browser_target_id: target,
+          conversation_id: conversation,
+          payload_sha256: payloadSha256,
+          wake_id: wakeId,
+          target_generation: targetGeneration,
+          ownership_generation: ownershipGeneration
+        });
+        return { ...normalizeReconciliationEvidence(result), ...epochFields };
+      } catch (error) {
+        const message = String(error && error.message || error || "");
+        if (/unsupported/i.test(message)) {
+          return { ...unsupportedReconciliationEvidence(), ...epochFields };
+        }
+        throw error;
+      }
     }
 
     throw new Error("unsupported runtime operation: " + op);

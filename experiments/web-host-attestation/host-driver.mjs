@@ -11,6 +11,13 @@ function requiredMethod(boundary, name) {
   return boundary[name].bind(boundary);
 }
 
+function requiredPositiveInteger(value, name) {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
 function optionalText(value, name) {
   if (value == null) return null;
   return requiredText(value, name);
@@ -98,11 +105,40 @@ function normalizeObservation(raw, requestedTargetId) {
  * Adapts a real browser/Host machine boundary to the stable LAB Host driver.
  * DOM, title and x-openai headers are intentionally absent from this contract.
  */
+function optionalBoolean(value) {
+  return typeof value === "boolean" ? value : null;
+}
+
+function optionalNonNegativeInteger(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function normalizeReconciliationEvidence(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new Error("machine boundary reconciliation evidence is required");
+  }
+  return {
+    status: requiredText(input.status, "reconciliation status"),
+    journal_phase: optionalText(input.journal_phase, "reconciliation journal_phase"),
+    journal_binding_matched: optionalBoolean(input.journal_binding_matched),
+    conversation_matches: optionalBoolean(input.conversation_matches),
+    target_matches: optionalBoolean(input.target_matches),
+    composer_exact_payload: optionalBoolean(input.composer_exact_payload),
+    composer_empty: optionalBoolean(input.composer_empty),
+    exact_user_message_present: optionalBoolean(input.exact_user_message_present),
+    stable_not_delivered: optionalBoolean(input.stable_not_delivered),
+    baseline_user_message_count: optionalNonNegativeInteger(input.baseline_user_message_count)
+  };
+}
+
 export function createHostDriver(machineBoundary) {
   const observe = requiredMethod(machineBoundary, "observeTarget");
   const submit = requiredMethod(machineBoundary, "submitContinuation");
+  const reconcile = typeof machineBoundary?.reconcileContinuation === "function"
+    ? machineBoundary.reconcileContinuation.bind(machineBoundary)
+    : null;
 
-  return Object.freeze({
+  const driver = {
     interface_version: 1,
     async observeTarget(browserTargetId) {
       const target = requiredText(browserTargetId, "browser_target_id");
@@ -132,5 +168,19 @@ export function createHostDriver(machineBoundary) {
         submit_diagnostics: normalizeSubmitDiagnostics(receipt.submit_diagnostics)
       };
     }
-  });
+  };
+  if (reconcile) {
+    driver.reconcileContinuation = async function (input) {
+      const request = {
+        browser_target_id: requiredText(input?.browser_target_id, "browser_target_id"),
+        conversation_id: requiredText(input?.conversation_id, "conversation_id"),
+        payload_sha256: requiredText(input?.payload_sha256, "payload_sha256"),
+        wake_id: requiredText(input?.wake_id, "wake_id"),
+        target_generation: requiredPositiveInteger(input?.target_generation, "target_generation"),
+        ownership_generation: requiredPositiveInteger(input?.ownership_generation, "ownership_generation")
+      };
+      return normalizeReconciliationEvidence(await reconcile(request));
+    };
+  }
+  return Object.freeze(driver);
 }

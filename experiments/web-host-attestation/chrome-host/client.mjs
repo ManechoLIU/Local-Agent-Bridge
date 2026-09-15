@@ -147,6 +147,20 @@ export function createChromeHostDriver(options) {
       }, { timeoutMs: timeoutMs });
       requireExpectedExtensionEpoch(result);
       return result;
+    },
+
+    async reconcileContinuation(input) {
+      const result = await requestNativeHost(socketPath, {
+        op: "reconcile_continuation",
+        browser_target_id: requiredText(input && input.browser_target_id, "browser_target_id", 256),
+        conversation_id: requiredText(input && input.conversation_id, "conversation_id", 128),
+        payload_sha256: requiredText(input && input.payload_sha256, "payload_sha256", 64),
+        wake_id: requiredText(input && input.wake_id, "wake_id", 256),
+        target_generation: Number(input && input.target_generation),
+        ownership_generation: Number(input && input.ownership_generation)
+      }, { timeoutMs: timeoutMs });
+      requireExpectedExtensionEpoch(result);
+      return result;
     }
   });
 }
