@@ -1,6 +1,6 @@
 import { conversationIdFromChatgptUrl, selectExactTarget } from "./observation.js";
 import { pageSubmitOperationFunction } from "./submit-page.js";
-import { SUBMIT_CONFIRM_TIMEOUT_MS } from "./timeout-budget.js";
+import { RECONCILE_STABLE_OBSERVATION_SETTLE_MS, SUBMIT_CONFIRM_TIMEOUT_MS } from "./timeout-budget.js";
 
 function requiredText(value, name, max) {
   const limit = max == null ? 8192 : max;
@@ -16,6 +16,26 @@ function requiredGeneration(value, name) {
     throw new Error(name + " must be a positive integer");
   }
   return number;
+}
+
+function optionalBaselineUserMessageCount(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
+function optionalEvidenceBoolean(value) {
+  return typeof value === "boolean" ? value : null;
+}
+
+async function settle(sleep, ms) {
+  if (typeof sleep === "function") {
+    await sleep(ms);
+    return;
+  }
+  const delay = Number.isFinite(ms) && ms > 0 ? Math.min(Math.floor(ms), 1000) : 0;
+  if (delay <= 0) return;
+  await new Promise(function (resolve) { setTimeout(resolve, delay); });
 }
 
 async function sha256Hex(value) {
@@ -78,6 +98,21 @@ function finalizeDiagnostics(trace, updates) {
   trace.submit_confirmed = Boolean(trace.submit_confirmed);
   trace.retryable = Boolean(trace.retryable);
   return trace;
+}
+
+function wakeJournalRecord(fields) {
+  return {
+    wake_id: fields.wakeId,
+    browser_target_id: fields.browserTargetId,
+    conversation_id: fields.conversationId,
+    target_generation: fields.targetGeneration,
+    ownership_generation: fields.ownershipGeneration,
+    payload_sha256: fields.payloadSha256,
+    phase: fields.phase,
+    dispatch_attempted: fields.dispatchAttempted === true,
+    baseline_user_message_count: optionalBaselineUserMessageCount(fields.baselineUserMessageCount),
+    updated_at_ms: Date.now()
+  };
 }
 
 function browserReceipt({
@@ -187,6 +222,20 @@ export async function submitContinuationThroughChrome(options) {
   const ownershipGeneration = requiredGeneration(message.ownership_generation, "ownership_generation");
   const payloadSha256 = await sha256Hex(payload);
   const trace = newDiagnostics({ wakeId, targetId: browserTargetId });
+  let baselineUserMessageCount = null;
+  function putWake(phase, dispatchAttempted) {
+    return journal.put(wakeJournalRecord({
+      wakeId,
+      browserTargetId,
+      conversationId,
+      targetGeneration,
+      ownershipGeneration,
+      payloadSha256,
+      phase,
+      dispatchAttempted,
+      baselineUserMessageCount
+    }));
+  }
 
   const priorWake = await journal.get(wakeId);
   if (priorWake) {
@@ -239,17 +288,7 @@ export async function submitContinuationThroughChrome(options) {
     });
   }
 
-  await journal.put({
-    wake_id: wakeId,
-    browser_target_id: browserTargetId,
-    conversation_id: conversationId,
-    target_generation: targetGeneration,
-    ownership_generation: ownershipGeneration,
-    payload_sha256: payloadSha256,
-    phase: "preparing",
-    dispatch_attempted: false,
-    updated_at_ms: Date.now()
-  });
+  await putWake("preparing", false);
 
   trace.composer_preparation.attempted = true;
   let prepared;
@@ -269,17 +308,7 @@ export async function submitContinuationThroughChrome(options) {
       payloadSha256
     });
     if (rollback.succeeded) await journal.remove(wakeId);
-    else await journal.put({
-      wake_id: wakeId,
-      browser_target_id: browserTargetId,
-      conversation_id: conversationId,
-      target_generation: targetGeneration,
-      ownership_generation: ownershipGeneration,
-      payload_sha256: payloadSha256,
-      phase: "rollback_unconfirmed",
-      dispatch_attempted: false,
-      updated_at_ms: Date.now()
-    });
+    else await putWake("rollback_unconfirmed", false);
     return browserReceipt({
       status: rollback.succeeded ? "prepare_result_unavailable" : "rollback_unconfirmed",
       retryable: rollback.succeeded,
@@ -303,17 +332,7 @@ export async function submitContinuationThroughChrome(options) {
     if (rollback.succeeded) {
       await journal.remove(wakeId);
     } else {
-      await journal.put({
-        wake_id: wakeId,
-        browser_target_id: browserTargetId,
-        conversation_id: conversationId,
-        target_generation: targetGeneration,
-        ownership_generation: ownershipGeneration,
-        payload_sha256: payloadSha256,
-        phase: "rollback_unconfirmed",
-        dispatch_attempted: false,
-        updated_at_ms: Date.now()
-      });
+      await putWake("rollback_unconfirmed", false);
     }
     return browserReceipt({
       status: rollback.succeeded ? "prepare_result_invalid" : "rollback_unconfirmed",
@@ -326,6 +345,7 @@ export async function submitContinuationThroughChrome(options) {
   }
 
   trace.composer_preparation.ok = prepared.prepared === true;
+  baselineUserMessageCount = optionalBaselineUserMessageCount(prepared.baseline_user_message_count);
   const rawPrepareStatus = String(prepared.status == null ? "" : prepared.status).trim();
   const prepareStatusValid = rawPrepareStatus.length > 0 && rawPrepareStatus.length <= 128;
   const cleanPrepareFailure = prepareStatusValid && new Set([
@@ -363,17 +383,7 @@ export async function submitContinuationThroughChrome(options) {
     if (rollback.succeeded) {
       await journal.remove(wakeId);
     } else {
-      await journal.put({
-        wake_id: wakeId,
-        browser_target_id: browserTargetId,
-        conversation_id: conversationId,
-        target_generation: targetGeneration,
-        ownership_generation: ownershipGeneration,
-        payload_sha256: payloadSha256,
-        phase: "rollback_unconfirmed",
-        dispatch_attempted: false,
-        updated_at_ms: Date.now()
-      });
+      await putWake("rollback_unconfirmed", false);
     }
     return browserReceipt({
       status: rollback.succeeded
@@ -387,17 +397,7 @@ export async function submitContinuationThroughChrome(options) {
     });
   }
 
-  await journal.put({
-    wake_id: wakeId,
-    browser_target_id: browserTargetId,
-    conversation_id: conversationId,
-    target_generation: targetGeneration,
-    ownership_generation: ownershipGeneration,
-    payload_sha256: payloadSha256,
-    phase: "prepared",
-    dispatch_attempted: false,
-    updated_at_ms: Date.now()
-  });
+  await putWake("prepared", false);
 
   try {
     const beforeDispatch = await observeTarget(browserTargetId);
@@ -418,17 +418,7 @@ export async function submitContinuationThroughChrome(options) {
     if (rollback.succeeded) {
       await journal.remove(wakeId);
     } else {
-      await journal.put({
-        wake_id: wakeId,
-        browser_target_id: browserTargetId,
-        conversation_id: conversationId,
-        target_generation: targetGeneration,
-        ownership_generation: ownershipGeneration,
-        payload_sha256: payloadSha256,
-        phase: "rollback_unconfirmed",
-        dispatch_attempted: false,
-        updated_at_ms: Date.now()
-      });
+      await putWake("rollback_unconfirmed", false);
     }
     return browserReceipt({
       status: rollback.succeeded
@@ -467,17 +457,7 @@ export async function submitContinuationThroughChrome(options) {
         );
         trace.trusted_dispatch.attempted = false;
         trace.dispatch_attempted = false;
-        await journal.put({
-          wake_id: wakeId,
-          browser_target_id: browserTargetId,
-          conversation_id: conversationId,
-          target_generation: targetGeneration,
-          ownership_generation: ownershipGeneration,
-          payload_sha256: payloadSha256,
-          phase: "dispatch_armed",
-          dispatch_attempted: false,
-          updated_at_ms: Date.now()
-        });
+        await putWake("dispatch_armed", false);
       }
     });
     if (dispatch && dispatch.diagnostics) {
@@ -527,17 +507,7 @@ export async function submitContinuationThroughChrome(options) {
     }
     if (dispatchAttempted) {
       trace.dispatch_attempted = true;
-      await journal.put({
-        wake_id: wakeId,
-        browser_target_id: browserTargetId,
-        conversation_id: conversationId,
-        target_generation: targetGeneration,
-        ownership_generation: ownershipGeneration,
-        payload_sha256: payloadSha256,
-        phase: "result_unknown",
-        dispatch_attempted: true,
-        updated_at_ms: Date.now()
-      });
+      await putWake("result_unknown", true);
       return browserReceipt({
         status: "result_unknown",
         retryable: false,
@@ -556,17 +526,7 @@ export async function submitContinuationThroughChrome(options) {
       payloadSha256
     });
     if (rollback.succeeded) await journal.remove(wakeId);
-    else await journal.put({
-      wake_id: wakeId,
-      browser_target_id: browserTargetId,
-      conversation_id: conversationId,
-      target_generation: targetGeneration,
-      ownership_generation: ownershipGeneration,
-      payload_sha256: payloadSha256,
-      phase: "rollback_unconfirmed",
-      dispatch_attempted: false,
-      updated_at_ms: Date.now()
-    });
+    else await putWake("rollback_unconfirmed", false);
     return browserReceipt({
       status: rollback.succeeded
         ? String(error && error.status || "trusted_dispatch_failed_before_dispatch")
@@ -591,17 +551,7 @@ export async function submitContinuationThroughChrome(options) {
     });
   } catch (error) {
     trace.failure_stage = "confirmation";
-    await journal.put({
-      wake_id: wakeId,
-      browser_target_id: browserTargetId,
-      conversation_id: conversationId,
-      target_generation: targetGeneration,
-      ownership_generation: ownershipGeneration,
-      payload_sha256: payloadSha256,
-      phase: "result_unknown",
-      dispatch_attempted: true,
-      updated_at_ms: Date.now()
-    });
+    await putWake("result_unknown", true);
     return browserReceipt({
       status: "result_unknown",
       retryable: false,
@@ -628,17 +578,7 @@ export async function submitContinuationThroughChrome(options) {
 
   if (confirmed) {
     trace.submit_confirmed = true;
-    await journal.put({
-      wake_id: wakeId,
-      browser_target_id: browserTargetId,
-      conversation_id: conversationId,
-      target_generation: targetGeneration,
-      ownership_generation: ownershipGeneration,
-      payload_sha256: payloadSha256,
-      phase: "submit_confirmed",
-      dispatch_attempted: true,
-      updated_at_ms: Date.now()
-    });
+    await putWake("submit_confirmed", true);
     return browserReceipt({
       status: "submit_confirmed",
       retryable: false,
@@ -650,17 +590,7 @@ export async function submitContinuationThroughChrome(options) {
   }
 
   trace.failure_stage = "confirmation";
-  await journal.put({
-    wake_id: wakeId,
-    browser_target_id: browserTargetId,
-    conversation_id: conversationId,
-    target_generation: targetGeneration,
-    ownership_generation: ownershipGeneration,
-    payload_sha256: payloadSha256,
-    phase: "result_unknown",
-    dispatch_attempted: true,
-    updated_at_ms: Date.now()
-  });
+  await putWake("result_unknown", true);
   return browserReceipt({
     status: "result_unknown",
     retryable: false,
@@ -669,4 +599,183 @@ export async function submitContinuationThroughChrome(options) {
     receiptFactory,
     diagnostics: trace
   });
+}
+
+function reconciliationEvidence(updates) {
+  return {
+    status: "observed",
+    journal_phase: null,
+    journal_binding_matched: null,
+    conversation_matches: null,
+    target_matches: null,
+    composer_exact_payload: null,
+    composer_empty: null,
+    exact_user_message_present: null,
+    stable_not_delivered: null,
+    baseline_user_message_count: null,
+    ...updates
+  };
+}
+
+function pageObservationCandidate(page) {
+  return page &&
+    page.conversation_matches === true &&
+    page.target_matches === true &&
+    page.exact_user_message_present === false &&
+    page.composer_exact_payload === true &&
+    page.composer_empty === false;
+}
+
+function conclusiveNotStable(page) {
+  return Boolean(page) && (
+    page.exact_user_message_present === true ||
+    page.composer_empty === true ||
+    page.composer_exact_payload === false ||
+    page.conversation_matches === false ||
+    page.target_matches === false
+  );
+}
+
+export async function reconcileContinuationThroughChrome(options) {
+  const chromeApi = options && options.chromeApi;
+  const getTargets = options && options.getTargets;
+  const observeTarget = options && options.observeTarget;
+  const journal = options && options.journal;
+  const message = options && options.message || {};
+  const sleep = options && options.sleep;
+
+  if (!chromeApi || typeof chromeApi.scripting?.executeScript !== "function") {
+    throw new Error("chrome.scripting.executeScript is required");
+  }
+  if (typeof getTargets !== "function" || typeof observeTarget !== "function") {
+    throw new Error("browser machine observation methods are required");
+  }
+  if (!journal || typeof journal.get !== "function") {
+    throw new Error("submit crash journal is required");
+  }
+
+  const browserTargetId = requiredText(message.browser_target_id, "browser_target_id", 256);
+  const conversationId = requiredText(message.conversation_id, "conversation_id", 128);
+  const payloadSha256 = requiredText(message.payload_sha256, "payload_sha256", 64).toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(payloadSha256)) throw new Error("payload_sha256 is invalid");
+  const wakeId = requiredText(message.wake_id, "wake_id", 256);
+  const targetGeneration = requiredGeneration(message.target_generation, "target_generation");
+  const ownershipGeneration = requiredGeneration(message.ownership_generation, "ownership_generation");
+
+  const priorWake = await journal.get(wakeId);
+  if (!priorWake) {
+    return reconciliationEvidence({
+      status: "journal_record_missing",
+      journal_binding_matched: null
+    });
+  }
+  const journalMatched =
+    priorWake.browser_target_id === browserTargetId &&
+    priorWake.conversation_id === conversationId &&
+    priorWake.target_generation === targetGeneration &&
+    priorWake.ownership_generation === ownershipGeneration &&
+    priorWake.payload_sha256 === payloadSha256;
+  if (!journalMatched) {
+    return reconciliationEvidence({
+      status: "journal_binding_mismatch",
+      journal_phase: priorWake.phase,
+      journal_binding_matched: false
+    });
+  }
+  if (priorWake.phase !== "result_unknown") {
+    return reconciliationEvidence({
+      status: "journal_not_result_unknown",
+      journal_phase: priorWake.phase,
+      journal_binding_matched: true
+    });
+  }
+  const baselineUserMessageCount = optionalBaselineUserMessageCount(priorWake.baseline_user_message_count);
+  if (baselineUserMessageCount == null) {
+    return reconciliationEvidence({
+      status: "invalid_baseline_user_message_count",
+      journal_phase: priorWake.phase,
+      journal_binding_matched: true,
+      baseline_user_message_count: null
+    });
+  }
+
+  async function observePage() {
+    const target = selectExactTarget(await getTargets(), browserTargetId);
+    if (conversationIdFromChatgptUrl(target.url) !== conversationId) {
+      throw new Error("wrong conversation during reconciliation");
+    }
+    const observation = await observeTarget(browserTargetId);
+    if (!observation ||
+        observation.browser_target_id !== browserTargetId ||
+        observation.conversation_id !== conversationId) {
+      throw new Error("machine target changed during reconciliation");
+    }
+    if (!Number.isInteger(target.tabId)) {
+      throw new Error("target tab unavailable during reconciliation");
+    }
+    const page = await scriptOperation(chromeApi, target.tabId, "reconcile", {
+      expected_payload_sha256: payloadSha256,
+      expected_conversation_id: conversationId,
+      baseline_user_message_count: baselineUserMessageCount
+    });
+    if (!page || typeof page !== "object") {
+      throw new Error("reconciliation page result is unavailable");
+    }
+    return {
+      status: String(page.status || "observed"),
+      conversation_matches: optionalEvidenceBoolean(page.conversation_matches),
+      target_matches: true,
+      composer_exact_payload: optionalEvidenceBoolean(page.composer_exact_payload),
+      composer_empty: optionalEvidenceBoolean(page.composer_empty),
+      exact_user_message_present: optionalEvidenceBoolean(page.exact_user_message_present)
+    };
+  }
+
+  function evidenceFromPage(page, extra) {
+    return reconciliationEvidence({
+      status: page && page.status || "observed",
+      journal_phase: priorWake.phase,
+      journal_binding_matched: true,
+      conversation_matches: page && page.conversation_matches,
+      target_matches: page && page.target_matches,
+      composer_exact_payload: page && page.composer_exact_payload,
+      composer_empty: page && page.composer_empty,
+      exact_user_message_present: page && page.exact_user_message_present,
+      baseline_user_message_count: baselineUserMessageCount,
+      stable_not_delivered: conclusiveNotStable(page) ? false : null,
+      ...extra
+    });
+  }
+
+  try {
+    const first = await observePage();
+    if (first.exact_user_message_present === true) {
+      return evidenceFromPage(first);
+    }
+    if (!pageObservationCandidate(first)) {
+      return evidenceFromPage(first);
+    }
+
+    await settle(sleep, RECONCILE_STABLE_OBSERVATION_SETTLE_MS);
+
+    const second = await observePage();
+    if (second.exact_user_message_present === true) {
+      return evidenceFromPage(second);
+    }
+    if (pageObservationCandidate(first) && pageObservationCandidate(second)) {
+      return evidenceFromPage(second, {
+        stable_not_delivered: true
+      });
+    }
+    return evidenceFromPage(second);
+  } catch {
+    return reconciliationEvidence({
+      status: "observation_unresolved",
+      journal_phase: priorWake.phase,
+      journal_binding_matched: true,
+      conversation_matches: null,
+      target_matches: null,
+      baseline_user_message_count: baselineUserMessageCount
+    });
+  }
 }

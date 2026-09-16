@@ -5,7 +5,8 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNativeHostHandler } from "./native-host-core.mjs";
-import { createChromeRuntimeHostIntegration } from "./integration.mjs";
+import { createChromeRuntimeHostIntegration, executeRuntimeVerifierCommand } from "./integration.mjs";
+import { signCurrentEntryEvidence } from "../attestation.mjs";
 
 const SECRET = "integration-test-secret-0123456789abcdef0123456789abcdef";
 const CONVERSATION = "6a9e4158-cc8c-83ea-9763-05a7fd51f597";
@@ -95,10 +96,15 @@ test("Runtime-facing Chrome integration issues challenge obtains Host attestatio
     "issueChallenge",
     "requestAttestation",
     "verifyAttestation",
+    "discoverCurrentEntry",
     "attestAndVerify",
     "consumeVerifiedTarget",
     "submitReentry",
-    "submitAndVerifyReentry"
+    "submitAndVerifyReentry",
+    "reconcileReentry",
+    "reconcileAndVerifyReentry",
+    "verifyToolPreReceipt",
+    "verifyToolTerminalReceipt"
   ]);
 
   const issued = integration.issueChallenge({
@@ -363,4 +369,164 @@ test("Runtime verifier CLI process performs fresh challenge Host request and exa
   assert.equal(payload.verified_target.target_generation, 21);
   assert.equal(payload.verified_target.ownership_generation, 34);
   assert.equal(payload.verified_target.provenance, "runtime_host_verifier_v1");
+});
+
+test("Runtime verifier verifies signed current-entry receipt without re-attesting browser generation and rejects replay", async function () {
+  const root = mkdtempSync(join(tmpdir(), "lab-current-entry-consume-"));
+  const statePath = join(root, "verifier-state.json");
+  try {
+    const clock = () => 1800000000200;
+    const currentEntry = signCurrentEntryEvidence({
+      secret: SECRET,
+      machineContext: {
+        entry_scope: "runtime_invocation",
+        machine_source: "host_invocation_context_v1",
+        conversation_id: CONVERSATION,
+        browser_target_id: "browser-current-consume",
+        top_frame_id: "frame-current-consume",
+        loader_id: "loader-current-consume",
+        secure_origin: "https://chatgpt.com",
+        generation_anchor_sha256: "a".repeat(64),
+        observed_at_ms: 1800000000100
+      },
+      targetGeneration: 21,
+      ownershipGeneration: 34,
+      clock
+    });
+    const integration = createChromeRuntimeHostIntegration({
+      secret: SECRET,
+      clock,
+      verifierStatePath: statePath,
+      driver: {
+        async attest() { throw new Error("browser re-attestation must not run"); },
+        async discoverCurrentEntry() { throw new Error("browser rediscovery must not run"); }
+      }
+    });
+    const request = {
+      operation: "verify_current_entry",
+      conversation_id: CONVERSATION,
+      target_generation: 21,
+      ownership_generation: 34,
+      current_entry: currentEntry
+    };
+    const result = await executeRuntimeVerifierCommand(request, { integration });
+    assert.equal(result.ok, true);
+    assert.equal(result.operation, "verify_current_entry");
+    assert.equal(result.host_receipt_id, currentEntry.host_receipt_id);
+    assert.equal(result.verified_target.provenance, "runtime_host_verifier_v1");
+    assert.equal(result.verified_target.conversation_id, CONVERSATION);
+    assert.equal(result.verified_target.target_generation, 21);
+    assert.equal(result.verified_target.ownership_generation, 34);
+    await assert.rejects(
+      executeRuntimeVerifierCommand(request, { integration }),
+      /receipt replayed/i
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Runtime verifier reconciliation consumes only the original signed RESULT_UNKNOWN receipt and canonical fence", async function () {
+  const calls = [];
+  const original = {
+    schema_version: 1,
+    receipt_id: "wr_original",
+    wake_id: "wake-reconcile-runtime",
+    wake_nonce_sha256: "a".repeat(64),
+    conversation_id: CONVERSATION,
+    browser_target_id: "browser-reconcile-runtime",
+    target_generation: 21,
+    ownership_generation: 34,
+    continuation_payload_sha256: "b".repeat(64),
+    dispatch_attempted: true,
+    submit_confirmed: false,
+    retryable: false,
+    auto_retry_allowed: false,
+    result_class: "RESULT_UNKNOWN",
+    status: "result_unknown",
+    host_submit_receipt: "chrome_submit_runtime",
+    submit_diagnostics: null,
+    observed_at_ms: 1800000000200,
+    provenance: "browser_host_reentry_receipt_v1",
+    host_mac_sha256: "c".repeat(64)
+  };
+  const result = await executeRuntimeVerifierCommand({
+    operation: "reconcile_reentry_result",
+    original_reentry_receipt: original,
+    expected_conversation_id: CONVERSATION,
+    expected_target_generation: 21,
+    expected_ownership_generation: 34
+  }, {
+    integration: {
+      async reconcileAndVerifyReentry(input) {
+        calls.push(input);
+        return {
+          schema_version: 1,
+          receipt_id: "wrr_runtime",
+          original_receipt_id: original.receipt_id,
+          wake_id: original.wake_id,
+          conversation_id: CONVERSATION,
+          target_generation: 21,
+          ownership_generation: 34,
+          reconciliation_class: "CONFIRMED_NOT_DELIVERED",
+          status: "confirmed_not_delivered",
+          provenance: "browser_host_reentry_reconciliation_v1"
+        };
+      }
+    }
+  });
+  assert.deepEqual(calls, [{
+    original_reentry_receipt: original,
+    expected_conversation_id: CONVERSATION,
+    expected_target_generation: 21,
+    expected_ownership_generation: 34
+  }]);
+  assert.equal(result.operation, "reconcile_reentry_result");
+  assert.equal(result.reconciliation_receipt.reconciliation_class, "CONFIRMED_NOT_DELIVERED");
+});
+
+test("Runtime verifier discover_current_entry never accepts caller conversation and returns Host machine entry", async function () {
+  const module = await import("./integration.mjs");
+  const calls = [];
+  const result = await module.executeRuntimeVerifierCommand({
+    operation: "discover_current_entry",
+    controller_id: "controller-existing",
+    target_generation: 21,
+    ownership_generation: 34
+  }, {
+    integration: {
+      async discoverCurrentEntry(input) {
+        calls.push(input);
+        return {
+          provenance: "runtime_host_current_entry_v1",
+          entry_scope: "runtime_invocation",
+          machine_source: "host_invocation_context_v1",
+          conversation_id: CONVERSATION,
+          browser_target_id: "browser-current-runtime",
+          top_frame_id: "frame-current-runtime",
+          loader_id: "loader-current-runtime",
+          secure_origin: "https://chatgpt.com",
+          target_generation: 21,
+          ownership_generation: 34,
+          host_receipt_id: "hce_runtime",
+          observed_at_unix_ms: 1800000000200
+        };
+      }
+    }
+  });
+  assert.deepEqual(calls, [{ target_generation: 21, ownership_generation: 34 }]);
+  assert.equal(result.ok, true);
+  assert.equal(result.operation, "discover_current_entry");
+  assert.equal(result.current_entry.conversation_id, CONVERSATION);
+  assert.equal(result.current_entry.provenance, "runtime_host_current_entry_v1");
+
+  await assert.rejects(
+    module.executeRuntimeVerifierCommand({
+      operation: "discover_current_entry",
+      conversation_id: CONVERSATION,
+      target_generation: 21,
+      ownership_generation: 34
+    }, { integration: { async discoverCurrentEntry() { return {}; } } }),
+    /caller.*conversation|conversation.*not.*accepted/i
+  );
 });

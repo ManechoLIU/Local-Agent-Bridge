@@ -1,17 +1,25 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHmac } from "node:crypto";
-import { mkdtempSync, statSync } from "node:fs";
+import { createHash, createHmac } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   MACHINE_OBSERVATION_SOURCE,
   RuntimeHostVerifier,
+  RuntimeInvocationOriginVerifier,
+  ToolInvocationReceiptJournal,
   WebReentryAdapter,
   machineObservationFromFrameTree,
+  signCurrentEntryEvidence,
   signHostAttestation,
+  signRuntimeInvocationOriginReceipt,
   validateMachineObservation,
-  verifyReentryReceipt
+  validateMachineInvocationOrigin,
+  verifyToolPreReceipt,
+  verifyToolTerminalReceipt,
+  verifyReentryReceipt,
+  verifyReentryReconciliationReceipt
 } from "./attestation.mjs";
 import { createHostDriver } from "./host-driver.mjs";
 import { createRuntimeHostProvider } from "./provider.mjs";
@@ -138,7 +146,22 @@ class Driver {
     this.current = current;
     this.focused = [];
     this.submitted = [];
+    this.reconciled = [];
     this.failure = null;
+    this.reconcileFailure = null;
+    this.reconcileResult = {
+      status: "observed",
+      journal_phase: "result_unknown",
+      journal_binding_matched: true,
+      conversation_matches: true,
+      target_matches: true,
+      composer_exact_payload: true,
+      composer_empty: false,
+      exact_user_message_present: false,
+      stable_not_delivered: true,
+      baseline_user_message_count: 1
+    };
+    this.reconcileResults = null;
     this.mutateAfterFocus = null;
     this.mutateAfterSubmit = null;
   }
@@ -154,6 +177,14 @@ class Driver {
     if (this.failure) throw this.failure;
     if (this.mutateAfterSubmit) this.current = this.mutateAfterSubmit;
     return { dispatch_attempted: true, submit_confirmed: true, host_submit_receipt: "browser-submit-1" };
+  }
+  async reconcileContinuation(input) {
+    this.reconciled.push(input);
+    if (this.reconcileFailure) throw this.reconcileFailure;
+    if (Array.isArray(this.reconcileResults) && this.reconcileResults.length > 0) {
+      return this.reconcileResults.shift();
+    }
+    return this.reconcileResult;
   }
 }
 
@@ -480,6 +511,51 @@ test("stable host driver consumes machine-boundary frame observations and valida
   assert.throws(() => createHostDriver({ observeTarget() {} }), /submitContinuation/);
 });
 
+test("stable host driver rejects invalid reconciliation generations before machine boundary", async () => {
+  let calls = 0;
+  const driver = createHostDriver({
+    observeTarget: async targetId => observation(1_800_000_000_100, { browser_target_id: targetId }),
+    submitContinuation: async () => ({ dispatch_attempted: true, submit_confirmed: true }),
+    reconcileContinuation: async () => {
+      calls += 1;
+      return { status: "observed" };
+    }
+  });
+  const base = {
+    browser_target_id: "browser-target-7",
+    conversation_id: CONVERSATION,
+    payload_sha256: "a".repeat(64),
+    wake_id: "wake-reconcile-generation",
+    target_generation: 4,
+    ownership_generation: 8
+  };
+  for (const mutation of [
+    { target_generation: null },
+    { target_generation: false },
+    { target_generation: "4" },
+    { target_generation: Number.NaN },
+    { ownership_generation: null },
+    { ownership_generation: false },
+    { ownership_generation: "8" },
+    { ownership_generation: Number.NaN }
+  ]) {
+    await assert.rejects(() => driver.reconcileContinuation({ ...base, ...mutation }), /positive integer/);
+  }
+  assert.equal(calls, 0);
+});
+
+test("provider does not advertise reconciliation when driver cannot reconcile", () => {
+  const provider = createRuntimeHostProvider({
+    secret: SECRET,
+    driver: {
+      async observeTarget(targetId) { return observation(1_800_000_000_100, { browser_target_id: targetId }); },
+      async submitContinuation() { return { dispatch_attempted: true, submit_confirmed: true }; }
+    }
+  });
+  assert.equal(provider.capabilities.includes("reconcileReentry"), false);
+  assert.equal("reconcileReentry" in provider, false);
+});
+
 test("stable host driver strips sensitive submit diagnostics before signed receipt", async () => {
   const driver = createHostDriver({
     observeTarget: async targetId => observation(1_800_000_000_100, {
@@ -558,7 +634,13 @@ test("stable provider exposes receipts without owning Runtime lifecycle", async 
   const time = clock();
   const rawDriver = new Driver(observation(time.now()));
   const provider = createRuntimeHostProvider({ secret: SECRET, driver: rawDriver, clock: time.now });
-  assert.deepEqual(provider.capabilities, ["issueChallenge", "verifyAttestation", "submitReentry"]);
+  assert.deepEqual(provider.capabilities, [
+    "issueChallenge",
+    "verifyAttestation",
+    "verifyCurrentEntry",
+    "submitReentry",
+    "reconcileReentry"
+  ]);
   assert.equal("wake" in provider, false);
   assert.equal("retry" in provider, false);
   const challenge = provider.issueChallenge({ conversation_id: CONVERSATION, target_generation: 4, ownership_generation: 8 });
@@ -590,6 +672,15 @@ test("receipt verifier binds browser target nonce payload schema and typed gener
     ownership_generation: 8
   };
   verifyReentryReceipt(SECRET, receipt, expected);
+  verifyReentryReceipt(SECRET, receipt, {
+    wake_id: expected.wake_id,
+    wake_nonce_sha256: receipt.wake_nonce_sha256,
+    continuation_payload_sha256: receipt.continuation_payload_sha256,
+    conversation_id: expected.conversation_id,
+    browser_target_id: expected.browser_target_id,
+    target_generation: expected.target_generation,
+    ownership_generation: expected.ownership_generation
+  });
   assert.throws(() => verifyReentryReceipt(SECRET, receipt, { ...expected, browser_target_id: "other-target" }), /wrong browser target receipt/);
   assert.throws(() => verifyReentryReceipt(SECRET, receipt, { ...expected, wake_nonce: "other-nonce" }), /wake nonce hash mismatch/);
   assert.throws(() => verifyReentryReceipt(SECRET, receipt, { ...expected, continuation_payload: "other-payload" }), /continuation payload hash mismatch/);
@@ -633,6 +724,44 @@ test("receipt verifier rejects authenticated contradictory result state", async 
     }),
     /result-unknown state is inconsistent/
   );
+});
+
+test("two verifier instances cannot consume the same signed current-entry receipt from stale state", () => {
+  const root = mkdtempSync(join(tmpdir(), "lab-current-entry-race-"));
+  const verifierState = join(root, "verifier.json");
+  const time = clock();
+  try {
+    const currentEntry = signCurrentEntryEvidence({
+      secret: SECRET,
+      machineContext: {
+        entry_scope: "runtime_invocation",
+        machine_source: "host_invocation_context_v1",
+        conversation_id: CONVERSATION,
+        browser_target_id: "browser-current-race",
+        top_frame_id: "frame-current-race",
+        loader_id: "loader-current-race",
+        secure_origin: "https://chatgpt.com",
+        generation_anchor_sha256: "a".repeat(64),
+        observed_at_ms: time.now()
+      },
+      targetGeneration: 9,
+      ownershipGeneration: 9,
+      clock: time.now
+    });
+    const first = new RuntimeHostVerifier(SECRET, { clock: time.now, statePath: verifierState });
+    const second = new RuntimeHostVerifier(SECRET, { clock: time.now, statePath: verifierState });
+    first.verifyCurrentEntryAndRegister(currentEntry, {
+      conversation_id: CONVERSATION, target_generation: 9, ownership_generation: 9
+    });
+    assert.throws(
+      () => second.verifyCurrentEntryAndRegister(currentEntry, {
+        conversation_id: CONVERSATION, target_generation: 9, ownership_generation: 9
+      }),
+      /replay/i
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("verified Host target receipt persists across verifier process restart and is one-shot", () => {
@@ -830,4 +959,1045 @@ test("signed re-entry receipt carries structured submit diagnostics without prom
   assert.equal(verifiedReceipt.submit_diagnostics.debugger_attach.ok, true);
   assert.equal(verifiedReceipt.submit_diagnostics.confirmation.exact_new_user_message, true);
   assert.equal(JSON.stringify(verifiedReceipt.submit_diagnostics).includes("sensitive continuation body"), false);
+});
+
+async function resultUnknownReceipt(adapter, driver, verified, wakeId, payload = "resume") {
+  driver.submitContinuation = async function (input) {
+    this.submitted.push(input);
+    return {
+      dispatch_attempted: true,
+      submit_confirmed: false,
+      retryable: false,
+      status: "result_unknown",
+      host_submit_receipt: "chrome_submit_unknown"
+    };
+  };
+  const receipt = await adapter.reenter({
+    verified_target: verified,
+    wake_id: wakeId,
+    wake_nonce: "nonce-reconcile",
+    continuation_payload: payload,
+    expected_target_generation: 4,
+    expected_ownership_generation: 8
+  });
+  assert.equal(receipt.result_class, "RESULT_UNKNOWN");
+  return receipt;
+}
+
+function reconcileRequest(verified, overrides = {}) {
+  return {
+    wake_id: "wake-reconcile",
+    wake_nonce: "nonce-reconcile",
+    continuation_payload: "resume",
+    conversation_id: CONVERSATION,
+    browser_target_id: verified.browser_target_id,
+    expected_target_generation: 4,
+    expected_ownership_generation: 8,
+    ...overrides
+  };
+}
+
+test("eligible RESULT_UNKNOWN reconciles to signed confirmed_not_delivered without a second submit", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  const adapter = new WebReentryAdapter(SECRET, driver, { clock: time.now, sleep: async () => {} });
+  const original = await resultUnknownReceipt(adapter, driver, verified, "wake-reconcile");
+  const receipt = await adapter.reconcile(reconcileRequest(verified));
+  assert.equal(receipt.reconciliation_class, "CONFIRMED_NOT_DELIVERED");
+  assert.equal(receipt.status, "confirmed_not_delivered");
+  assert.equal(receipt.original_receipt_id, original.receipt_id);
+  assert.equal(receipt.original_result_class, "RESULT_UNKNOWN");
+  assert.equal(receipt.auto_retry_allowed, false);
+  assert.equal(receipt.retryable, false);
+  assert.equal(receipt.submit_confirmed, false);
+  assert.equal(receipt.exact_user_message_present, false);
+  assert.equal(receipt.composer_exact_payload, true);
+  assert.equal(driver.submitted.length, 1);
+  assert.equal(driver.reconciled.length, 2);
+  verifyReentryReconciliationReceipt(SECRET, receipt, {
+    wake_id: "wake-reconcile",
+    wake_nonce: "nonce-reconcile",
+    continuation_payload: "resume",
+    conversation_id: CONVERSATION,
+    browser_target_id: "browser-target-7",
+    target_generation: 4,
+    ownership_generation: 8,
+    original_receipt_id: original.receipt_id
+  });
+  await assert.rejects(
+    adapter.reenter({
+      verified_target: verified,
+      wake_id: "wake-reconcile",
+      wake_nonce: "nonce-reconcile",
+      continuation_payload: "resume",
+      expected_target_generation: 4,
+      expected_ownership_generation: 8
+    }),
+    /wake_id replayed/
+  );
+  assert.equal(driver.submitted.length, 1);
+});
+
+test("production reconciliation consumes the signed RESULT_UNKNOWN receipt without raw nonce or payload", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  const adapter = new WebReentryAdapter(SECRET, driver, { clock: time.now, sleep: async () => {} });
+  const original = await resultUnknownReceipt(adapter, driver, verified, "wake-production-reconcile", "production wake payload");
+
+  const receipt = await adapter.reconcile({
+    original_reentry_receipt: original,
+    expected_target_generation: 4,
+    expected_ownership_generation: 8
+  });
+
+  assert.equal(receipt.reconciliation_class, "CONFIRMED_NOT_DELIVERED");
+  assert.equal(receipt.original_receipt_id, original.receipt_id);
+  assert.equal(receipt.wake_id, original.wake_id);
+  assert.equal(receipt.continuation_payload_sha256, original.continuation_payload_sha256);
+  assert.equal(driver.reconciled.length, 2);
+  assert.equal("payload" in driver.reconciled[0], false);
+  assert.equal("wake_nonce" in driver.reconciled[0], false);
+  assert.equal(driver.reconciled[0].payload_sha256, original.continuation_payload_sha256);
+  assert.equal(driver.reconciled[0].wake_id, original.wake_id);
+});
+
+test("user message present during reconciliation is not clearable", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  driver.reconcileResult = {
+    ...driver.reconcileResult,
+    exact_user_message_present: true,
+    composer_exact_payload: false,
+    composer_empty: true
+  };
+  const adapter = new WebReentryAdapter(SECRET, driver, { clock: time.now });
+  await resultUnknownReceipt(adapter, driver, verified, "wake-reconcile");
+  const receipt = await adapter.reconcile(reconcileRequest(verified));
+  assert.equal(receipt.reconciliation_class, "NOT_CLEARABLE");
+  assert.equal(receipt.status, "user_message_present");
+  assert.equal(receipt.auto_retry_allowed, false);
+});
+
+test("composer payload missing or changed during reconciliation stays unresolved", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  driver.reconcileResult = {
+    ...driver.reconcileResult,
+    composer_exact_payload: false,
+    composer_empty: true,
+    exact_user_message_present: false
+  };
+  const adapter = new WebReentryAdapter(SECRET, driver, { clock: time.now });
+  await resultUnknownReceipt(adapter, driver, verified, "wake-reconcile");
+  const receipt = await adapter.reconcile(reconcileRequest(verified));
+  assert.equal(receipt.reconciliation_class, "UNRESOLVED");
+  assert.equal(receipt.status, "composer_payload_unresolved");
+  assert.equal(receipt.auto_retry_allowed, false);
+  assert.equal(driver.reconciled.length, 1);
+  const again = await adapter.reconcile(reconcileRequest(verified));
+  assert.equal(again.reconciliation_class, "UNRESOLVED");
+  assert.equal(driver.reconciled.length, 2);
+});
+
+test("identity generation and payload mismatch reject reconciliation", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  const adapter = new WebReentryAdapter(SECRET, driver, { clock: time.now });
+  await resultUnknownReceipt(adapter, driver, verified, "wake-reconcile");
+  await assert.rejects(
+    adapter.reconcile(reconcileRequest(verified, { conversation_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" })),
+    /mismatched binding/
+  );
+  await assert.rejects(
+    adapter.reconcile(reconcileRequest(verified, { browser_target_id: "other-target" })),
+    /mismatched binding/
+  );
+  await assert.rejects(
+    adapter.reconcile(reconcileRequest(verified, { continuation_payload: "other-payload" })),
+    /mismatched binding/
+  );
+  await assert.rejects(
+    adapter.reconcile(reconcileRequest(verified, { wake_nonce: "other-nonce" })),
+    /mismatched binding/
+  );
+  await assert.rejects(
+    adapter.reconcile(reconcileRequest(verified, { expected_target_generation: 5 })),
+    /stale target generation/
+  );
+  await assert.rejects(
+    adapter.reconcile(reconcileRequest(verified, { expected_ownership_generation: 9 })),
+    /stale ownership generation/
+  );
+  assert.equal(driver.reconciled.length, 0);
+});
+
+test("non-RESULT_UNKNOWN journal records are not eligible for reconciliation", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  const adapter = new WebReentryAdapter(SECRET, driver, { clock: time.now });
+  await adapter.reenter({
+    verified_target: verified,
+    wake_id: "wake-confirmed",
+    wake_nonce: "nonce-reconcile",
+    continuation_payload: "resume",
+    expected_target_generation: 4,
+    expected_ownership_generation: 8
+  });
+  await assert.rejects(
+    adapter.reconcile(reconcileRequest(verified, { wake_id: "wake-confirmed" })),
+    /requires RESULT_UNKNOWN/
+  );
+  await assert.rejects(
+    adapter.reconcile(reconcileRequest(verified, { wake_id: "wake-missing" })),
+    /journal record is required/
+  );
+  assert.equal(driver.reconciled.length, 0);
+});
+
+test("reconciliation replay is idempotent and restart preserves the signed outcome", async () => {
+  const root = mkdtempSync(join(tmpdir(), "lab-host-reconcile-"));
+  const reentryState = join(root, "reentry.json");
+  try {
+    const { verified, time } = verifiedFixture();
+    const driver = new Driver(observation(time.now()));
+    const adapter = new WebReentryAdapter(SECRET, driver, { clock: time.now, statePath: reentryState, sleep: async () => {} });
+    const original = await resultUnknownReceipt(adapter, driver, verified, "wake-reconcile");
+    const first = await adapter.reconcile(reconcileRequest(verified));
+    assert.equal(first.reconciliation_class, "CONFIRMED_NOT_DELIVERED");
+    const second = await adapter.reconcile(reconcileRequest(verified));
+    assert.equal(second.receipt_id, first.receipt_id);
+    assert.equal(second.host_mac_sha256, first.host_mac_sha256);
+    assert.equal(driver.reconciled.length, 2);
+
+    const restartedDriver = new Driver(observation(time.now()));
+    const restarted = new WebReentryAdapter(SECRET, restartedDriver, { clock: time.now, statePath: reentryState });
+    const replayed = await restarted.reconcile(reconcileRequest(verified));
+    assert.equal(replayed.receipt_id, first.receipt_id);
+    assert.equal(replayed.original_receipt_id, original.receipt_id);
+    assert.equal(replayed.reconciliation_class, "CONFIRMED_NOT_DELIVERED");
+    assert.equal(restartedDriver.submitted.length, 0);
+    assert.equal(restartedDriver.reconciled.length, 0);
+    assert.equal(statSync(reentryState).mode & 0o777, 0o600);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("browser journal submit_confirmed evidence is not clearable", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  driver.reconcileResult = {
+    ...driver.reconcileResult,
+    journal_phase: "submit_confirmed",
+    exact_user_message_present: false,
+    composer_exact_payload: true
+  };
+  const adapter = new WebReentryAdapter(SECRET, driver, { clock: time.now });
+  await resultUnknownReceipt(adapter, driver, verified, "wake-reconcile");
+  const receipt = await adapter.reconcile(reconcileRequest(verified));
+  assert.equal(receipt.reconciliation_class, "NOT_CLEARABLE");
+  assert.equal(receipt.status, "journal_submit_confirmed");
+});
+
+test("provider reconcileReentry does not own retry or mutate submit_reentry RESULT_UNKNOWN", async () => {
+  const time = clock();
+  const driver = new Driver(observation(time.now()));
+  const provider = createRuntimeHostProvider({ secret: SECRET, driver, clock: time.now, sleep: async () => {} });
+  const challenge = provider.issueChallenge({ conversation_id: CONVERSATION, target_generation: 4, ownership_generation: 8 });
+  time.add(100);
+  const attestation = signHostAttestation({ secret: SECRET, challenge, observation: observation(time.now()), clock: time.now });
+  const verified = provider.verifyAttestation(attestation, { conversation_id: CONVERSATION, target_generation: 4, ownership_generation: 8 });
+  driver.submitContinuation = async function (input) {
+    this.submitted.push(input);
+    return { dispatch_attempted: true, submit_confirmed: false, retryable: false, status: "result_unknown" };
+  };
+  const unknown = await provider.submitReentry({
+    verified_target: verified,
+    wake_id: "provider-wake-unknown",
+    wake_nonce: "n",
+    continuation_payload: "resume",
+    expected_target_generation: 4,
+    expected_ownership_generation: 8
+  });
+  assert.equal(unknown.result_class, "RESULT_UNKNOWN");
+  const receipt = await provider.reconcileReentry(reconcileRequest(verified, { wake_id: "provider-wake-unknown", wake_nonce: "n" }));
+  assert.equal(receipt.reconciliation_class, "CONFIRMED_NOT_DELIVERED");
+  assert.equal(unknown.result_class, "RESULT_UNKNOWN");
+  assert.equal(driver.submitted.length, 1);
+});
+
+function reconcileAdapter(driver, time, extra = {}) {
+  return new WebReentryAdapter(SECRET, driver, { clock: time.now, sleep: async () => {}, ...extra });
+}
+
+test("missing or invalid reconciliation baseline stays unresolved", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  driver.reconcileResult = {
+    ...driver.reconcileResult,
+    baseline_user_message_count: null,
+    stable_not_delivered: true
+  };
+  const adapter = reconcileAdapter(driver, time);
+  await resultUnknownReceipt(adapter, driver, verified, "wake-reconcile");
+  const missing = await adapter.reconcile(reconcileRequest(verified));
+  assert.equal(missing.reconciliation_class, "UNRESOLVED");
+  assert.match(missing.status, /baseline/);
+  assert.notEqual(missing.reconciliation_class, "CONFIRMED_NOT_DELIVERED");
+  assert.equal(adapter.wakeRecords.get("wake-reconcile").reconciliation_receipt, undefined);
+
+  driver.reconcileResult = {
+    ...driver.reconcileResult,
+    baseline_user_message_count: -1
+  };
+  const invalid = await adapter.reconcile(reconcileRequest(verified));
+  assert.equal(invalid.reconciliation_class, "UNRESOLVED");
+  assert.notEqual(invalid.reconciliation_class, "CONFIRMED_NOT_DELIVERED");
+});
+
+test("first observation looks not-delivered then exact new user message is not clearable", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  driver.reconcileResults = [
+    {
+      ...driver.reconcileResult,
+      exact_user_message_present: false,
+      composer_exact_payload: true,
+      composer_empty: false,
+      stable_not_delivered: false,
+      baseline_user_message_count: 1
+    },
+    {
+      ...driver.reconcileResult,
+      exact_user_message_present: true,
+      composer_exact_payload: false,
+      composer_empty: true,
+      stable_not_delivered: false,
+      baseline_user_message_count: 1
+    }
+  ];
+  const adapter = reconcileAdapter(driver, time);
+  await resultUnknownReceipt(adapter, driver, verified, "wake-reconcile");
+  const receipt = await adapter.reconcile(reconcileRequest(verified));
+  assert.equal(receipt.reconciliation_class, "NOT_CLEARABLE");
+  assert.equal(receipt.exact_user_message_present, true);
+  assert.equal(receipt.auto_retry_allowed, false);
+});
+
+test("two stable exact composer observations with no new message confirm not delivered", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  driver.reconcileResult = {
+    ...driver.reconcileResult,
+    baseline_user_message_count: 1,
+    stable_not_delivered: true,
+    composer_empty: false
+  };
+  const adapter = reconcileAdapter(driver, time);
+  const original = await resultUnknownReceipt(adapter, driver, verified, "wake-reconcile");
+  const receipt = await adapter.reconcile(reconcileRequest(verified));
+  assert.equal(receipt.reconciliation_class, "CONFIRMED_NOT_DELIVERED");
+  assert.equal(receipt.journal_phase, "result_unknown");
+  assert.equal(receipt.composer_empty, false);
+  assert.equal(receipt.exact_user_message_present, false);
+  assert.equal(receipt.composer_exact_payload, true);
+  verifyReentryReconciliationReceipt(SECRET, receipt, {
+    wake_id: "wake-reconcile",
+    wake_nonce: "nonce-reconcile",
+    continuation_payload: "resume",
+    conversation_id: CONVERSATION,
+    browser_target_id: "browser-target-7",
+    target_generation: 4,
+    ownership_generation: 8,
+    original_receipt_id: original.receipt_id
+  });
+});
+
+test("second target or conversation drift stays unresolved", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  driver.reconcileResult = {
+    ...driver.reconcileResult,
+    baseline_user_message_count: 1,
+    stable_not_delivered: false
+  };
+  const originalReconcile = driver.reconcileContinuation.bind(driver);
+  driver.reconcileContinuation = async function (input) {
+    const evidence = await originalReconcile(input);
+    this.current = observation(time.now(), {
+      conversation_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    });
+    return evidence;
+  };
+  const adapter = reconcileAdapter(driver, time);
+  await resultUnknownReceipt(adapter, driver, verified, "wake-reconcile");
+  const receipt = await adapter.reconcile(reconcileRequest(verified));
+  assert.equal(receipt.reconciliation_class, "UNRESOLVED");
+  assert.notEqual(receipt.reconciliation_class, "CONFIRMED_NOT_DELIVERED");
+  assert.equal(adapter.wakeRecords.get("wake-reconcile").reconciliation_receipt, undefined);
+});
+
+test("composer empty on either observation is not confirmed not delivered", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  driver.reconcileResult = {
+    ...driver.reconcileResult,
+    composer_exact_payload: false,
+    composer_empty: true,
+    exact_user_message_present: false,
+    baseline_user_message_count: 1,
+    stable_not_delivered: false
+  };
+  const adapter = reconcileAdapter(driver, time);
+  await resultUnknownReceipt(adapter, driver, verified, "wake-reconcile");
+  const firstEmpty = await adapter.reconcile(reconcileRequest(verified));
+  assert.equal(firstEmpty.reconciliation_class, "UNRESOLVED");
+  assert.notEqual(firstEmpty.reconciliation_class, "CONFIRMED_NOT_DELIVERED");
+
+  driver.reconcileResults = [
+    {
+      ...driver.reconcileResult,
+      composer_exact_payload: true,
+      composer_empty: false,
+      exact_user_message_present: false,
+      baseline_user_message_count: 1,
+      stable_not_delivered: false
+    },
+    {
+      ...driver.reconcileResult,
+      composer_exact_payload: false,
+      composer_empty: true,
+      exact_user_message_present: false,
+      baseline_user_message_count: 1,
+      stable_not_delivered: false
+    }
+  ];
+  const secondEmpty = await adapter.reconcile(reconcileRequest(verified));
+  assert.ok(["UNRESOLVED", "NOT_CLEARABLE"].includes(secondEmpty.reconciliation_class));
+  assert.notEqual(secondEmpty.reconciliation_class, "CONFIRMED_NOT_DELIVERED");
+});
+
+test("null or missing page evidence stays null never false", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  driver.reconcileResult = {
+    status: "observed",
+    journal_phase: "result_unknown",
+    journal_binding_matched: true,
+    baseline_user_message_count: 1
+  };
+  const adapter = reconcileAdapter(driver, time);
+  await resultUnknownReceipt(adapter, driver, verified, "wake-reconcile");
+  const receipt = await adapter.reconcile(reconcileRequest(verified));
+  assert.equal(receipt.reconciliation_class, "UNRESOLVED");
+  assert.equal(receipt.conversation_matches == null ? null : receipt.conversation_matches, null);
+  assert.equal(receipt.exact_user_message_present, null);
+  assert.equal(receipt.composer_exact_payload, null);
+  assert.equal(receipt.composer_empty, null);
+  assert.equal(receipt.stable_not_delivered, null);
+  assert.notEqual(receipt.exact_user_message_present, false);
+  assert.notEqual(receipt.composer_exact_payload, false);
+  assert.notEqual(receipt.stable_not_delivered, false);
+});
+
+test("driver without reconcile capability returns typed unsupported unresolved", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = {
+    current: observation(time.now()),
+    submitted: [],
+    async observeTarget() { return this.current; },
+    async submitContinuation(input) {
+      this.submitted.push(input);
+      return {
+        dispatch_attempted: true,
+        submit_confirmed: false,
+        retryable: false,
+        status: "result_unknown"
+      };
+    }
+  };
+  const adapter = reconcileAdapter(driver, time);
+  await resultUnknownReceipt(adapter, driver, verified, "wake-reconcile");
+  const receipt = await adapter.reconcile(reconcileRequest(verified));
+  assert.equal(receipt.reconciliation_class, "UNRESOLVED");
+  assert.match(receipt.status, /unsupported/);
+  assert.notEqual(receipt.reconciliation_class, "CONFIRMED_NOT_DELIVERED");
+  assert.equal(adapter.wakeRecords.get("wake-reconcile").reconciliation_receipt, undefined);
+});
+
+test("unsupported browser reconciliation evidence is unresolved not confirmed", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  driver.reconcileResult = {
+    status: "unsupported",
+    journal_phase: null,
+    journal_binding_matched: null,
+    conversation_matches: null,
+    target_matches: null,
+    composer_exact_payload: null,
+    composer_empty: null,
+    exact_user_message_present: null,
+    stable_not_delivered: null,
+    baseline_user_message_count: null
+  };
+  const adapter = reconcileAdapter(driver, time);
+  await resultUnknownReceipt(adapter, driver, verified, "wake-reconcile");
+  const receipt = await adapter.reconcile(reconcileRequest(verified));
+  assert.equal(receipt.reconciliation_class, "UNRESOLVED");
+  assert.match(receipt.status, /unsupported/);
+  assert.equal(receipt.conversation_matches == null ? null : receipt.conversation_matches, null);
+  assert.notEqual(receipt.reconciliation_class, "CONFIRMED_NOT_DELIVERED");
+});
+
+test("UNRESOLVED is not persisted as the terminal idempotent reconciliation answer", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  driver.reconcileResult = {
+    ...driver.reconcileResult,
+    composer_exact_payload: false,
+    composer_empty: true,
+    exact_user_message_present: false,
+    baseline_user_message_count: 1,
+    stable_not_delivered: false
+  };
+  const adapter = reconcileAdapter(driver, time);
+  await resultUnknownReceipt(adapter, driver, verified, "wake-reconcile");
+  const first = await adapter.reconcile(reconcileRequest(verified));
+  assert.equal(first.reconciliation_class, "UNRESOLVED");
+  assert.equal(adapter.wakeRecords.get("wake-reconcile").reconciliation_receipt, undefined);
+  driver.reconcileResult = {
+    ...driver.reconcileResult,
+    composer_exact_payload: true,
+    composer_empty: false,
+    exact_user_message_present: false,
+    baseline_user_message_count: 1,
+    stable_not_delivered: true
+  };
+  const second = await adapter.reconcile(reconcileRequest(verified));
+  assert.equal(second.reconciliation_class, "CONFIRMED_NOT_DELIVERED");
+  assert.equal(adapter.wakeRecords.get("wake-reconcile").reconciliation_receipt.receipt_id, second.receipt_id);
+});
+
+test("CONFIRMED_NOT_DELIVERED verifier requires result_unknown and sufficient stable evidence", async () => {
+  const { verified, time } = verifiedFixture();
+  const driver = new Driver(observation(time.now()));
+  driver.reconcileResult = {
+    ...driver.reconcileResult,
+    baseline_user_message_count: 1,
+    stable_not_delivered: true,
+    composer_empty: false
+  };
+  const adapter = reconcileAdapter(driver, time);
+  const original = await resultUnknownReceipt(adapter, driver, verified, "wake-reconcile");
+  const receipt = await adapter.reconcile(reconcileRequest(verified));
+  const expected = {
+    wake_id: "wake-reconcile",
+    wake_nonce: "nonce-reconcile",
+    continuation_payload: "resume",
+    conversation_id: CONVERSATION,
+    browser_target_id: "browser-target-7",
+    target_generation: 4,
+    ownership_generation: 8,
+    original_receipt_id: original.receipt_id
+  };
+  verifyReentryReconciliationReceipt(SECRET, receipt, expected);
+  assert.throws(
+    () => verifyReentryReconciliationReceipt(SECRET, { ...receipt, journal_phase: "dispatch_armed" }, expected),
+    /authentication failed|inconsistent|result_unknown/
+  );
+  assert.throws(
+    () => verifyReentryReconciliationReceipt(SECRET, { ...receipt, composer_empty: true }, expected),
+    /authentication failed|inconsistent/
+  );
+  assert.throws(
+    () => verifyReentryReconciliationReceipt(SECRET, { ...receipt, composer_empty: null }, expected),
+    /authentication failed|inconsistent/
+  );
+});
+
+
+const INVOCATION_ID = "f98bbb53-3c0e-480b-814a-e0c1f75c98c6/3htx";
+
+function invocationOrigin(at = 1_800_000_000_100, overrides = {}) {
+  return {
+    host_type: "chatgpt_web",
+    invocation_id: INVOCATION_ID,
+    operation: "controller_privileged_mutation",
+    browser_target_id: "browser-target-origin-1",
+    top_frame_id: "frame-origin-1",
+    loader_id: "loader-origin-1",
+    secure_origin: "https://chatgpt.com",
+    conversation_id: CONVERSATION,
+    observed_at_ms: at,
+    source: "browser_cdp_invocation_origin_v1",
+    ...overrides
+  };
+}
+
+test("runtime invocation origin challenge never accepts or carries caller conversation identity", () => {
+  const time = clock();
+  const verifier = new RuntimeInvocationOriginVerifier(SECRET, {
+    clock: time.now,
+    hostEpoch: "host-epoch-a"
+  });
+  const challenge = verifier.issueChallenge({
+    invocation_id: INVOCATION_ID,
+    operation: "controller_privileged_mutation",
+    target_generation: 7,
+    ownership_generation: 7,
+    conversation_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+  });
+  assert.equal("conversation_id" in challenge, false);
+  assert.equal(challenge.invocation_id, INVOCATION_ID);
+  assert.equal(challenge.operation, "controller_privileged_mutation");
+});
+
+test("runtime invocation origin receipt binds machine origin and verifies exactly once", () => {
+  const time = clock();
+  const verifier = new RuntimeInvocationOriginVerifier(SECRET, {
+    clock: time.now,
+    hostEpoch: "host-epoch-a"
+  });
+  const challenge = verifier.issueChallenge({
+    invocation_id: INVOCATION_ID,
+    operation: "controller_privileged_mutation",
+    target_generation: 7,
+    ownership_generation: 7
+  });
+  time.add(50);
+  const receipt = signRuntimeInvocationOriginReceipt({
+    secret: SECRET,
+    challenge,
+    machineOrigin: invocationOrigin(time.now()),
+    hostEpoch: "host-epoch-a",
+    clock: time.now
+  });
+  const verified = verifier.verifyAndConsume(receipt, {
+    invocation_id: INVOCATION_ID,
+    operation: "controller_privileged_mutation",
+    conversation_id: CONVERSATION,
+    target_generation: 7,
+    ownership_generation: 7
+  });
+  assert.equal(verified.provenance, "runtime_invocation_origin_v1");
+  assert.equal(verified.conversation_id, CONVERSATION);
+  assert.equal(verified.browser_target_id, "browser-target-origin-1");
+  assert.equal(verified.top_frame_id, "frame-origin-1");
+  assert.equal(verified.loader_id, "loader-origin-1");
+  assert.equal(verified.invocation_id, INVOCATION_ID);
+  assert.equal(verified.operation, "controller_privileged_mutation");
+  assert.throws(() => verifier.verifyAndConsume(receipt), /already consumed|replay/i);
+});
+
+test("runtime invocation origin rejects foreign conversation operation generation and forged machine source", () => {
+  const cases = [
+    ["conversation", { expected: { conversation_id: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff" }, pattern: /conversation/i }],
+    ["operation", { expected: { operation: "different_operation" }, pattern: /operation/i }],
+    ["target generation", { expected: { target_generation: 8 }, pattern: /target generation/i }],
+    ["ownership generation", { expected: { ownership_generation: 8 }, pattern: /ownership generation/i }]
+  ];
+  for (const [name, spec] of cases) {
+    const time = clock();
+    const verifier = new RuntimeInvocationOriginVerifier(SECRET, { clock: time.now, hostEpoch: "host-epoch-a" });
+    const challenge = verifier.issueChallenge({
+      invocation_id: INVOCATION_ID,
+      operation: "controller_privileged_mutation",
+      target_generation: 7,
+      ownership_generation: 7
+    });
+    time.add(10);
+    const receipt = signRuntimeInvocationOriginReceipt({
+      secret: SECRET,
+      challenge,
+      machineOrigin: invocationOrigin(time.now()),
+      hostEpoch: "host-epoch-a",
+      clock: time.now
+    });
+    assert.throws(() => verifier.verifyAndConsume(receipt, spec.expected), spec.pattern, name);
+  }
+
+  assert.throws(
+    () => validateMachineInvocationOrigin(invocationOrigin(undefined, { source: "caller_supplied_conversation" })),
+    /machine invocation provenance/i
+  );
+});
+
+test("runtime invocation origin receipt expires and dies across Host epoch restart", () => {
+  const time = clock();
+  const originStateDir = mkdtempSync(join(tmpdir(), "lab-invocation-origin-state-"));
+  const originStatePath = join(originStateDir, "state.json");
+  const first = new RuntimeInvocationOriginVerifier(SECRET, {
+    clock: time.now,
+    hostEpoch: "host-epoch-a",
+    challengeTtlMs: 100,
+    receiptTtlMs: 50,
+    statePath: originStatePath
+  });
+  const challenge = first.issueChallenge({
+    invocation_id: INVOCATION_ID,
+    operation: "controller_privileged_mutation",
+    target_generation: 7,
+    ownership_generation: 7
+  });
+  time.add(10);
+  const receipt = signRuntimeInvocationOriginReceipt({
+    secret: SECRET,
+    challenge,
+    machineOrigin: invocationOrigin(time.now()),
+    hostEpoch: "host-epoch-a",
+    clock: time.now,
+    ttlMs: 50
+  });
+
+  const restarted = new RuntimeInvocationOriginVerifier(SECRET, {
+    clock: time.now,
+    hostEpoch: "host-epoch-b",
+    statePath: originStatePath
+  });
+  assert.throws(() => restarted.verifyAndConsume(receipt), /Host epoch/i);
+
+  time.add(60);
+  assert.throws(() => first.verifyAndConsume(receipt), /expired/i);
+});
+
+test("two concurrent Web conversation receipts cannot cross-consume", () => {
+  const time = clock();
+  const verifier = new RuntimeInvocationOriginVerifier(SECRET, { clock: time.now, hostEpoch: "host-epoch-a" });
+  const c1 = verifier.issueChallenge({ invocation_id: "invocation-a", operation: "op-a", target_generation: 7, ownership_generation: 7 });
+  const c2 = verifier.issueChallenge({ invocation_id: "invocation-b", operation: "op-a", target_generation: 7, ownership_generation: 7 });
+  time.add(10);
+  const r1 = signRuntimeInvocationOriginReceipt({
+    secret: SECRET,
+    challenge: c1,
+    machineOrigin: invocationOrigin(time.now(), { invocation_id: "invocation-a", operation: "op-a", conversation_id: CONVERSATION }),
+    hostEpoch: "host-epoch-a",
+    clock: time.now
+  });
+  const foreign = "cccccccc-dddd-eeee-ffff-000000000000";
+  const r2 = signRuntimeInvocationOriginReceipt({
+    secret: SECRET,
+    challenge: c2,
+    machineOrigin: invocationOrigin(time.now(), { invocation_id: "invocation-b", operation: "op-a", conversation_id: foreign, browser_target_id: "browser-target-origin-2" }),
+    hostEpoch: "host-epoch-a",
+    clock: time.now
+  });
+  assert.throws(() => verifier.verifyAndConsume(r1, { invocation_id: "invocation-b" }), /invocation/i);
+  assert.throws(() => verifier.verifyAndConsume(r2, { conversation_id: CONVERSATION }), /conversation/i);
+});
+
+function receiptMachineContext(overrides = {}) {
+  return {
+    conversation_id: CONVERSATION,
+    browser_target_id: "browser-target-7",
+    top_frame_id: "frame-top-9",
+    loader_id: "loader-doc-11",
+    secure_origin: "https://chatgpt.com",
+    generation_anchor_sha256: "a".repeat(64),
+    extension_binding_sha256: "b".repeat(64),
+    extension_instance_id_sha256: "c".repeat(64),
+    extension_loaded_at_ms: 1_800_000_000_000,
+    ...overrides
+  };
+}
+
+function receiptRequest(overrides = {}) {
+  return {
+    request_digest_profile: "lab_run_command_digest_v1",
+    bridge_call_id: "bc_test-call",
+    bridge_challenge_nonce: "bridge-challenge-nonce-test",
+    transport_binding_id: "tb_test-transport",
+    workspace: "/Users/echoman/Documents/ChatGPT/Local-Agent-Bridge",
+    production_release_revision: "a".repeat(40),
+    production_endpoint_generation: 7,
+    bridge_principal_id: "bridge-principal-test",
+    bridge_execution_session_id: "bridge-execution-session-test",
+    bridge_capability_id: "bridge-capability-test",
+    bridge_workspace_id: "local-agent-bridge-production",
+    tool_name: "run_command",
+    outer_request_sha256: "d".repeat(64),
+    forwarded_request_sha256: "e".repeat(64),
+    normalized_request_sha256: "f".repeat(64),
+    machine_context: receiptMachineContext(),
+    ...overrides
+  };
+}
+
+function receiptConsumeInput(overrides = {}) {
+  return {
+    ...receiptRequest(),
+    retry_outer_request_sha256: "4".repeat(64),
+    ...overrides
+  };
+}
+
+const CAPABILITY_SCHEMA_KEYS = [
+  "schema_version", "provenance", "request_digest_profile", "capability_id", "bridge_call_id", "bridge_challenge_nonce",
+  "transport_binding_id", "workspace", "production_release_revision", "production_endpoint_generation",
+  "bridge_principal_id", "bridge_execution_session_id", "bridge_capability_id", "bridge_workspace_id",
+  "tool_name", "outer_request_sha256", "forwarded_request_sha256", "normalized_request_sha256",
+  "conversation_id", "browser_target_id", "top_frame_id", "loader_id", "generation_anchor_sha256",
+  "secure_origin", "extension_binding_sha256", "extension_instance_id_sha256", "extension_loaded_at_ms",
+  "issued_at_unix_ms", "expires_at_unix_ms", "host_mac_sha256"
+].sort();
+
+const PRE_SCHEMA_KEYS = [
+  "schema_version", "provenance", "request_digest_profile", "pre_receipt_id", "capability_id", "host_tool_execution_id",
+  "bridge_call_id", "bridge_challenge_nonce", "transport_binding_id", "workspace",
+  "production_release_revision", "production_endpoint_generation", "bridge_principal_id",
+  "bridge_execution_session_id", "bridge_capability_id", "bridge_workspace_id", "tool_name",
+  "outer_request_sha256", "forwarded_request_sha256", "normalized_request_sha256", "retry_outer_request_sha256", "conversation_id",
+  "browser_target_id", "top_frame_id", "loader_id", "generation_anchor_sha256", "secure_origin",
+  "extension_binding_sha256", "extension_instance_id_sha256", "extension_loaded_at_ms", "pre_nonce",
+  "issued_at_unix_ms", "host_epoch_binding_sha256", "host_mac_sha256"
+].sort();
+
+const TERMINAL_SCHEMA_KEYS = [
+  "schema_version", "provenance", "request_digest_profile", "terminal_receipt_id", "pre_receipt_id", "pre_receipt_sha256",
+  "capability_id", "host_tool_execution_id", "bridge_call_id", "bridge_challenge_nonce",
+  "transport_binding_id", "workspace", "production_release_revision", "production_endpoint_generation",
+  "bridge_principal_id", "bridge_execution_session_id", "bridge_capability_id", "bridge_workspace_id",
+  "tool_name", "outer_request_sha256", "forwarded_request_sha256", "normalized_request_sha256", "retry_outer_request_sha256",
+  "conversation_id", "browser_target_id", "top_frame_id", "loader_id", "generation_anchor_sha256",
+  "secure_origin", "extension_binding_sha256", "extension_instance_id_sha256", "extension_loaded_at_ms",
+  "backend_route", "http_status", "response_body_sha256", "terminal_classification", "issued_at_unix_ms",
+  "host_epoch_binding_sha256", "host_mac_sha256"
+].sort();
+
+test("durable Host receipt journal binds only machine identity and exact request across restart", () => {
+  const time = clock();
+  const statePath = join(mkdtempSync(join(tmpdir(), "lab-tool-receipt-")), "receipts.json");
+  const journal = new ToolInvocationReceiptJournal(SECRET, {
+    clock: time.now,
+    statePath,
+    capabilityTtlMs: 100
+  });
+  const capability = journal.issueCapability({
+    ...receiptRequest(),
+    conversation_id: "caller-forged-conversation",
+    browser_target_id: "caller-forged-target",
+    caller_identity: "not-evidence"
+  });
+  assert.equal(capability.provenance, "lab_host_invocation_capability_v1");
+  assert.deepEqual(Object.keys(capability).sort(), CAPABILITY_SCHEMA_KEYS);
+  assert.equal(capability.conversation_id, CONVERSATION);
+  assert.equal(Object.hasOwn(capability, "caller_identity"), false);
+  assert.equal(Object.hasOwn(capability, "generation_request_ids"), false);
+
+  const restarted = new ToolInvocationReceiptJournal(SECRET, { clock: time.now, statePath, capabilityTtlMs: 100 });
+  assert.throws(
+    () => restarted.consumeCapability({
+      ...receiptConsumeInput({ transport_binding_id: "tb_other" }),
+      capability,
+      host_tool_execution_id: "hte_test-execution"
+    }),
+    /mismatch/i
+  );
+
+  const pre = restarted.consumeCapability({
+    ...receiptConsumeInput(),
+    capability,
+    host_tool_execution_id: "hte_test-execution"
+  });
+  assert.equal(pre.provenance, "lab_host_tool_pre_receipt_v1");
+  assert.deepEqual(Object.keys(pre).sort(), PRE_SCHEMA_KEYS);
+  assert.throws(
+    () => restarted.consumeCapability({
+      ...receiptConsumeInput(),
+      capability,
+      host_tool_execution_id: "hte_test-execution"
+    }),
+    /replay|mismatch/i
+  );
+
+  assert.throws(
+    () => restarted.terminalize({
+      ...receiptConsumeInput(),
+      pre_receipt: { ...pre, pre_receipt_id: "hpr_wrong" },
+      backend_route: "/v1/tools/run_command",
+      http_status: 200,
+      response_body_sha256: "1".repeat(64),
+      terminal_classification: "SUCCESS"
+    }),
+    /authentication|pre.*mismatch|mismatch.*pre/i
+  );
+  const terminal = restarted.terminalize({
+    ...receiptConsumeInput(),
+    pre_receipt: pre,
+    backend_route: "/v1/tools/run_command",
+    http_status: 200,
+    response_body_sha256: "1".repeat(64),
+    terminal_classification: "SUCCESS",
+    response_body: "must never persist"
+  });
+  assert.equal(terminal.provenance, "lab_host_tool_terminal_receipt_v1");
+  assert.deepEqual(Object.keys(terminal).sort(), TERMINAL_SCHEMA_KEYS);
+  assert.equal(JSON.stringify(restarted.inspectStateForTest()).includes("must never persist"), false);
+});
+
+test("Host receipt journal rejects expiry and every re-observed machine drift", () => {
+  const time = clock();
+  const journal = new ToolInvocationReceiptJournal(SECRET, { clock: time.now, capabilityTtlMs: 10 });
+  const capability = journal.issueCapability(receiptRequest());
+  for (const field of [
+    "conversation_id", "browser_target_id", "top_frame_id", "loader_id", "generation_anchor_sha256",
+    "secure_origin", "extension_binding_sha256", "extension_instance_id_sha256", "extension_loaded_at_ms"
+  ]) {
+    const changedValue = field === "conversation_id"
+      ? "7b9e4158-cc8c-83ea-9763-05a7fd51f597"
+      : field === "secure_origin"
+        ? "https://chatgpt.com:443"
+        : field === "extension_loaded_at_ms"
+          ? 1_800_000_000_001
+          : field.includes("sha256")
+            ? "9".repeat(64)
+            : "changed-" + field;
+    const changed = receiptMachineContext({ [field]: changedValue });
+    assert.throws(
+      () => journal.consumeCapability({
+        ...receiptConsumeInput({ machine_context: changed }), capability, host_tool_execution_id: "hte_" + field
+      }),
+      /mismatch|secure origin/i,
+      field
+    );
+  }
+  time.add(10);
+  assert.throws(
+    () => journal.consumeCapability({ ...receiptConsumeInput(), capability, host_tool_execution_id: "hte_expired" }),
+    /expired/i
+  );
+});
+
+test("two receipt journal instances permit exactly one consume after reloading durable state", () => {
+  const time = clock();
+  const statePath = join(mkdtempSync(join(tmpdir(), "lab-tool-receipt-race-")), "receipts.json");
+  const issuer = new ToolInvocationReceiptJournal(SECRET, { clock: time.now, statePath });
+  const capability = issuer.issueCapability(receiptRequest());
+  const first = new ToolInvocationReceiptJournal(SECRET, { clock: time.now, statePath });
+  const second = new ToolInvocationReceiptJournal(SECRET, { clock: time.now, statePath });
+  const pre = first.consumeCapability({
+    ...receiptConsumeInput(), capability, host_tool_execution_id: "hte_instance-one"
+  });
+  assert.equal(pre.host_tool_execution_id, "hte_instance-one");
+  assert.throws(
+    () => second.consumeCapability({
+      ...receiptConsumeInput(), capability, host_tool_execution_id: "hte_instance-two"
+    }),
+    /replay/i
+  );
+  const restarted = new ToolInvocationReceiptJournal(SECRET, { clock: time.now, statePath });
+  assert.throws(
+    () => restarted.consumeCapability({
+      ...receiptConsumeInput(), capability, host_tool_execution_id: "hte_after-restart"
+    }),
+    /replay/i
+  );
+});
+
+test("receipt binding rejects each Bridge-private context and request digest drift", () => {
+  const journal = new ToolInvocationReceiptJournal(SECRET);
+  const capability = journal.issueCapability(receiptRequest());
+  for (const [field, value] of [
+    ["bridge_challenge_nonce", "different-nonce"],
+    ["workspace", "/tmp/not-the-canonical-workspace"],
+    ["production_release_revision", "b".repeat(40)],
+    ["production_endpoint_generation", 8],
+    ["bridge_principal_id", "different-principal"],
+    ["bridge_execution_session_id", "different-session"],
+    ["bridge_capability_id", "different-capability"],
+    ["bridge_workspace_id", "different-workspace"],
+    ["outer_request_sha256", "1".repeat(64)],
+    ["forwarded_request_sha256", "2".repeat(64)],
+    ["normalized_request_sha256", "3".repeat(64)]
+  ]) {
+    assert.throws(
+      () => journal.consumeCapability({
+        ...receiptConsumeInput({ [field]: value }), capability, host_tool_execution_id: "hte_" + field
+      }),
+      /mismatch/i,
+      field
+    );
+  }
+});
+
+test("receipt digest profile and retry outer digest are mandatory and terminal-bound", () => {
+  const journal = new ToolInvocationReceiptJournal(SECRET);
+  assert.throws(
+    () => journal.issueCapability(receiptRequest({ request_digest_profile: undefined })),
+    /request_digest_profile/i
+  );
+  assert.throws(
+    () => journal.issueCapability(receiptRequest({ request_digest_profile: "wrong_profile" })),
+    /request_digest_profile/i
+  );
+  const capability = journal.issueCapability(receiptRequest());
+  assert.throws(
+    () => journal.consumeCapability({
+      ...receiptRequest(), capability, host_tool_execution_id: "hte_missing-retry"
+    }),
+    /retry_outer_request_sha256/i
+  );
+  assert.throws(
+    () => journal.consumeCapability({
+      ...receiptConsumeInput({ retry_outer_request_sha256: "not-a-digest" }),
+      capability,
+      host_tool_execution_id: "hte_invalid-retry"
+    }),
+    /retry_outer_request_sha256/i
+  );
+  const pre = journal.consumeCapability({
+    ...receiptConsumeInput(), capability, host_tool_execution_id: "hte_retry-bound"
+  });
+  assert.equal(pre.retry_outer_request_sha256, "4".repeat(64));
+  assert.throws(
+    () => journal.terminalize({
+      ...receiptConsumeInput({ retry_outer_request_sha256: "5".repeat(64) }),
+      pre_receipt: pre,
+      backend_route: "/v1/tools/run_command",
+      http_status: 200,
+      response_body_sha256: "1".repeat(64),
+      terminal_classification: "SUCCESS"
+    }),
+    /retry.*mismatch|mismatch.*retry/i
+  );
+});
+
+test("unprofiled capability and durable receipt state fail closed", () => {
+  const statePath = join(mkdtempSync(join(tmpdir(), "lab-tool-receipt-profile-")), "receipts.json");
+  const journal = new ToolInvocationReceiptJournal(SECRET, { statePath });
+  const capability = journal.issueCapability(receiptRequest());
+  const unprofiledCapability = { ...capability };
+  delete unprofiledCapability.request_digest_profile;
+  assert.throws(
+    () => journal.consumeCapability({
+      ...receiptConsumeInput(), capability: unprofiledCapability, host_tool_execution_id: "hte_old-capability"
+    }),
+    /authentication|profile/i
+  );
+  const persisted = JSON.parse(readFileSync(statePath, "utf8"));
+  delete persisted.records[0][1].binding.request_digest_profile;
+  writeFileSync(statePath, JSON.stringify(persisted));
+  assert.throws(
+    () => new ToolInvocationReceiptJournal(SECRET, { statePath }),
+    /profile|state/i
+  );
+});
+
+test("v2 receipt verifiers require exact signed receipt and terminal pre chain", () => {
+  const time = clock();
+  const journal = new ToolInvocationReceiptJournal(SECRET, { clock: time.now });
+  const capability = journal.issueCapability(receiptRequest());
+  const pre = journal.consumeCapability({ ...receiptConsumeInput(), capability, host_tool_execution_id: "hte_v2" });
+  const expected = { outer_request_sha256: "d".repeat(64), forwarded_request_sha256: "e".repeat(64), normalized_request_sha256: "f".repeat(64), retry_outer_request_sha256: "4".repeat(64) };
+  const preDigest = createHash("sha256").update(canonicalJsonForTest(pre)).digest("hex");
+  assert.equal(verifyToolPreReceipt({ secret: SECRET, receipt: pre, receipt_sha256: preDigest, expected_request_digests: expected, clock: time.now }).pre_receipt_id, pre.pre_receipt_id);
+  const terminal = journal.terminalize({ ...receiptConsumeInput(), pre_receipt: pre, backend_route: "/v1/tools/run_command", http_status: 200, response_body_sha256: "1".repeat(64), terminal_classification: "SUCCESS" });
+  const terminalDigest = createHash("sha256").update(canonicalJsonForTest(terminal)).digest("hex");
+  assert.equal(verifyToolTerminalReceipt({ secret: SECRET, receipt: terminal, receipt_sha256: terminalDigest, expected_request_digests: expected, expected_pre_chain: { pre_receipt_id: pre.pre_receipt_id, pre_receipt_sha256: preDigest, capability_id: pre.capability_id, host_tool_execution_id: pre.host_tool_execution_id }, clock: time.now }).terminal_receipt_id, terminal.terminal_receipt_id);
+  assert.throws(() => verifyToolPreReceipt({ secret: SECRET, receipt: { ...pre, controller_id: "caller" }, receipt_sha256: preDigest, expected_request_digests: expected, clock: time.now }), /keys/i);
+  assert.throws(() => verifyToolPreReceipt({ secret: SECRET, receipt: pre, receipt_sha256: "0".repeat(64), expected_request_digests: expected, clock: time.now }), /receipt_sha256/i);
+  assert.throws(() => verifyToolPreReceipt({ secret: SECRET, receipt: pre, receipt_sha256: preDigest, expected_request_digests: { ...expected, retry_outer_request_sha256: "0".repeat(64) }, clock: time.now }), /retry_outer_request_sha256/i);
+  assert.throws(() => verifyToolPreReceipt({ secret: SECRET, receipt: { ...pre, host_mac_sha256: "0".repeat(64) }, receipt_sha256: preDigest, expected_request_digests: expected, clock: time.now }), /authentication/i);
+  assert.throws(() => verifyToolTerminalReceipt({ secret: SECRET, receipt: terminal, receipt_sha256: terminalDigest, expected_request_digests: expected, expected_pre_chain: { pre_receipt_id: "hpr_other", pre_receipt_sha256: preDigest, capability_id: pre.capability_id, host_tool_execution_id: pre.host_tool_execution_id }, clock: time.now }), /pre_receipt_id/i);
+  time.add(15_001);
+  assert.throws(() => verifyToolPreReceipt({ secret: SECRET, receipt: pre, receipt_sha256: preDigest, expected_request_digests: expected, clock: time.now }), /stale/i);
 });

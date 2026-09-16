@@ -35,6 +35,7 @@ const RECORD = {
   payload_sha256: "a".repeat(64),
   phase: "prepared",
   dispatch_attempted: false,
+  baseline_user_message_count: 2,
   updated_at_ms: 1
 };
 
@@ -55,6 +56,29 @@ test("composer write survives Host crash and a restarted journal recovers only b
   assert.equal((await restartedJournal.list()).length, 0);
 });
 
+test("durable journal persists baseline_user_message_count and keeps missing baseline null", async () => {
+  const f = storageFixture();
+  const journal = createChromeSubmitJournal(f.chromeApi);
+  const stored = await journal.put({ ...RECORD, phase: "result_unknown", dispatch_attempted: true });
+  assert.equal(stored.baseline_user_message_count, 2);
+  const [kept] = await journal.list();
+  assert.equal(kept.baseline_user_message_count, 2);
+
+  const missing = await journal.put({
+    ...RECORD,
+    wake_id: "wake-missing-baseline",
+    baseline_user_message_count: undefined
+  });
+  assert.equal(missing.baseline_user_message_count, null);
+
+  const invalid = await journal.put({
+    ...RECORD,
+    wake_id: "wake-invalid-baseline",
+    baseline_user_message_count: -1
+  });
+  assert.equal(invalid.baseline_user_message_count, null);
+});
+
 test("dispatch_armed crash is promoted to RESULT_UNKNOWN without rollback or replay", async () => {
   const f = storageFixture();
   const journal = createChromeSubmitJournal(f.chromeApi);
@@ -72,6 +96,7 @@ test("dispatch_armed crash is promoted to RESULT_UNKNOWN without rollback or rep
   const [kept] = await journal.list();
   assert.equal(kept.phase, "result_unknown");
   assert.equal(kept.dispatch_attempted, true);
+  assert.equal(kept.baseline_user_message_count, 2);
 });
 
 test("journal with possible dispatch is retained and never rolled back", async () => {

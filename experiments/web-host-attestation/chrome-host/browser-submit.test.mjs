@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { submitContinuationThroughChrome } from "./extension/browser-submit.js";
+import { createHash } from "node:crypto";
+import { reconcileContinuationThroughChrome, submitContinuationThroughChrome } from "./extension/browser-submit.js";
 
 const CONVERSATION = "6a9e4158-cc8c-83ea-9763-05a7fd51f597";
 const OTHER = "6a9e41a2-266c-83ea-9104-e768ed4ad3f2";
@@ -174,6 +175,232 @@ function uncertainDispatchError() {
   };
   return error;
 }
+
+function reconcileFixture(overrides = {}) {
+  const payloadSha256 = overrides.payloadSha256 || createHash("sha256").update("resume").digest("hex");
+  const pageResults = overrides.pageResults || [{
+    status: "observed",
+    conversation_matches: true,
+    composer_exact_payload: true,
+    composer_empty: false,
+    exact_user_message_present: false
+  }];
+  const observations = overrides.observations || [{
+    browser_target_id: "target-1",
+    conversation_id: CONVERSATION
+  }];
+  const journal = overrides.journal || memoryJournal([{
+    schema_version: 1,
+    wake_id: "wake-reconcile-hash",
+    browser_target_id: "target-1",
+    conversation_id: CONVERSATION,
+    target_generation: 4,
+    ownership_generation: 8,
+    payload_sha256: payloadSha256,
+    phase: "result_unknown",
+    dispatch_attempted: true,
+    baseline_user_message_count: 1,
+    updated_at_ms: 1
+  }]);
+  const scriptInputs = [];
+  const observeCalls = [];
+  return {
+    payloadSha256,
+    journal,
+    scriptInputs,
+    observeCalls,
+    options: {
+      chromeApi: {
+        scripting: {
+          async executeScript(input) {
+            scriptInputs.push(input.args[1]);
+            if (overrides.scriptError) throw overrides.scriptError;
+            const result = pageResults[Math.min(scriptInputs.length - 1, pageResults.length - 1)];
+            return [{ frameId: 0, result }];
+          }
+        }
+      },
+      getTargets: async () => [target(overrides.targetConversation)],
+      observeTarget: async (targetId) => {
+        observeCalls.push(targetId);
+        if (overrides.observeError && observeCalls.length > (overrides.observeErrorAfter || 0)) {
+          throw overrides.observeError;
+        }
+        return observations[Math.min(observeCalls.length - 1, observations.length - 1)];
+      },
+      journal,
+      sleep: overrides.sleep || (async () => {}),
+      message: {
+        browser_target_id: "target-1",
+        conversation_id: CONVERSATION,
+        payload_sha256: payloadSha256,
+        wake_id: "wake-reconcile-hash",
+        target_generation: 4,
+        ownership_generation: 8
+      }
+    }
+  };
+}
+
+test("reconcile continuation uses durable RESULT_UNKNOWN binding and payload hash without prompt text", async () => {
+  const f = reconcileFixture();
+  const result = await reconcileContinuationThroughChrome(f.options);
+  assert.equal(result.journal_binding_matched, true);
+  assert.equal(result.journal_phase, "result_unknown");
+  assert.equal(result.composer_exact_payload, true);
+  assert.equal(result.baseline_user_message_count, 1);
+  assert.equal(f.scriptInputs[0].expected_payload_sha256, f.payloadSha256);
+  assert.equal(f.scriptInputs[0].baseline_user_message_count, 1);
+  assert.equal("payload" in f.scriptInputs[0], false);
+  assert.equal("wake_nonce" in f.scriptInputs[0], false);
+});
+
+test("missing journal baseline cannot be confirmed not delivered", async () => {
+  const payloadSha256 = createHash("sha256").update("resume").digest("hex");
+  const f = reconcileFixture({
+    journal: memoryJournal([{
+      schema_version: 1,
+      wake_id: "wake-reconcile-hash",
+      browser_target_id: "target-1",
+      conversation_id: CONVERSATION,
+      target_generation: 4,
+      ownership_generation: 8,
+      payload_sha256: payloadSha256,
+      phase: "result_unknown",
+      dispatch_attempted: true,
+      updated_at_ms: 1
+    }])
+  });
+  const result = await reconcileContinuationThroughChrome(f.options);
+  assert.equal(result.status, "invalid_baseline_user_message_count");
+  assert.equal(result.journal_binding_matched, true);
+  assert.equal(result.baseline_user_message_count, null);
+  assert.equal(result.exact_user_message_present, null);
+  assert.equal(result.composer_exact_payload, null);
+  assert.equal(f.scriptInputs.length, 0);
+});
+
+test("first stable page observation then exact new user message is not clearable", async () => {
+  const f = reconcileFixture({
+    pageResults: [
+      {
+        status: "observed",
+        conversation_matches: true,
+        composer_exact_payload: true,
+        composer_empty: false,
+        exact_user_message_present: false
+      },
+      {
+        status: "observed",
+        conversation_matches: true,
+        composer_exact_payload: false,
+        composer_empty: true,
+        exact_user_message_present: true
+      }
+    ]
+  });
+  const result = await reconcileContinuationThroughChrome(f.options);
+  assert.equal(result.exact_user_message_present, true);
+  assert.equal(result.stable_not_delivered, false);
+  assert.equal(f.scriptInputs.length, 2);
+  assert.equal(f.observeCalls.length >= 2, true);
+});
+
+test("two stable composer observations with no new message are stable not delivered", async () => {
+  const f = reconcileFixture();
+  const result = await reconcileContinuationThroughChrome(f.options);
+  assert.equal(result.exact_user_message_present, false);
+  assert.equal(result.composer_exact_payload, true);
+  assert.equal(result.composer_empty, false);
+  assert.equal(result.stable_not_delivered, true);
+  assert.equal(result.conversation_matches, true);
+  assert.equal(result.target_matches, true);
+  assert.equal(f.scriptInputs.length, 2);
+});
+
+test("second target or conversation drift stays unresolved", async () => {
+  const f = reconcileFixture({
+    observations: [
+      { browser_target_id: "target-1", conversation_id: CONVERSATION },
+      { browser_target_id: "target-1", conversation_id: OTHER }
+    ]
+  });
+  const result = await reconcileContinuationThroughChrome(f.options);
+  assert.equal(result.status, "observation_unresolved");
+  assert.equal(result.stable_not_delivered, null);
+  assert.notEqual(result.stable_not_delivered, false);
+  assert.notEqual(result.status, "confirmed_not_delivered");
+  assert.equal(result.conversation_matches, null);
+  assert.equal(result.target_matches, null);
+});
+
+test("composer empty on either reconcile observation is not stable not delivered", async () => {
+  const firstEmpty = await reconcileContinuationThroughChrome(reconcileFixture({
+    pageResults: [{
+      status: "observed",
+      conversation_matches: true,
+      composer_exact_payload: false,
+      composer_empty: true,
+      exact_user_message_present: false
+    }]
+  }).options);
+  assert.equal(firstEmpty.composer_empty, true);
+  assert.equal(firstEmpty.stable_not_delivered, false);
+
+  const secondEmpty = await reconcileContinuationThroughChrome(reconcileFixture({
+    pageResults: [
+      {
+        status: "observed",
+        conversation_matches: true,
+        composer_exact_payload: true,
+        composer_empty: false,
+        exact_user_message_present: false
+      },
+      {
+        status: "observed",
+        conversation_matches: true,
+        composer_exact_payload: false,
+        composer_empty: true,
+        exact_user_message_present: false
+      }
+    ]
+  }).options);
+  assert.equal(secondEmpty.composer_empty, true);
+  assert.equal(secondEmpty.stable_not_delivered, false);
+  assert.equal(secondEmpty.exact_user_message_present, false);
+});
+
+test("reconcile transport failure keeps unknown evidence null", async () => {
+  const f = reconcileFixture({
+    scriptError: new Error("script transport lost")
+  });
+  const result = await reconcileContinuationThroughChrome(f.options);
+  assert.equal(result.status, "observation_unresolved");
+  assert.equal(result.conversation_matches, null);
+  assert.equal(result.target_matches, null);
+  assert.equal(result.composer_exact_payload, null);
+  assert.equal(result.composer_empty, null);
+  assert.equal(result.exact_user_message_present, null);
+  assert.equal(result.stable_not_delivered, null);
+  assert.notEqual(result.stable_not_delivered, false);
+});
+
+test("incomplete page evidence does not manufacture stable_not_delivered false", async () => {
+  const f = reconcileFixture({
+    pageResults: [{
+      status: "observed",
+      conversation_matches: true
+    }]
+  });
+  const result = await reconcileContinuationThroughChrome(f.options);
+  assert.equal(result.conversation_matches, true);
+  assert.equal(result.composer_exact_payload, null);
+  assert.equal(result.composer_empty, null);
+  assert.equal(result.exact_user_message_present, null);
+  assert.equal(result.stable_not_delivered, null);
+  assert.notEqual(result.stable_not_delivered, false);
+  assert.notEqual(result.status, "confirmed_not_delivered");
+});
 
 test("wrong target fails before journal preparation or browser side effects", async () => {
   const f = fixture({ targetConversation: OTHER });
@@ -388,6 +615,7 @@ test("possible dispatch with unknown result never rolls back and remains RESULT_
   assert.equal(f.calls.some(call => call[0] === "rollback"), false);
   assert.equal(f.journal.records.get("wake-1").dispatch_attempted, true);
   assert.equal(f.journal.records.get("wake-1").phase, "result_unknown");
+  assert.equal(f.journal.records.get("wake-1").baseline_user_message_count, 2);
 });
 
 test("lost confirmation after trusted dispatch is result unknown and never rolls back", async () => {
@@ -398,6 +626,22 @@ test("lost confirmation after trusted dispatch is result unknown and never rolls
   assert.equal(result.retryable, false);
   assert.equal(result.status, "result_unknown");
   assert.equal(f.calls.some(call => call[0] === "rollback"), false);
+});
+
+test("dispatch_armed journal record keeps prepare baseline", async () => {
+  const f = fixture();
+  const phases = [];
+  const originalPut = f.journal.put.bind(f.journal);
+  f.journal.put = async record => {
+    phases.push({
+      phase: record.phase,
+      baseline: record.baseline_user_message_count
+    });
+    return originalPut(record);
+  };
+  await submitContinuationThroughChrome(f.options);
+  const armed = phases.find(entry => entry.phase === "dispatch_armed");
+  assert.equal(armed.baseline, 2);
 });
 
 test("submit confirmed requires exact new user-message evidence and retains a replay tombstone", async () => {
@@ -413,6 +657,7 @@ test("submit confirmed requires exact new user-message evidence and retains a re
   assert.equal(f.journal.records.size, 1);
   assert.equal(f.journal.records.get("wake-1").phase, "submit_confirmed");
   assert.equal(f.journal.records.get("wake-1").dispatch_attempted, true);
+  assert.equal(f.journal.records.get("wake-1").baseline_user_message_count, 2);
 });
 
 test("structured Host diagnostics records stages without prompt body", async () => {
