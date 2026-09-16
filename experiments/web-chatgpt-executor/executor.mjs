@@ -3,6 +3,16 @@ import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { attachAppExposureMethods } from "./chatgpt-app-exposure.mjs";
+import {
+  EXPOSURE_STATE,
+  canonicalPromptText,
+  ensureRequiredAppsExposed,
+  initialToolExposure,
+  resolveRequiredApps,
+  summarizeExposure
+} from "./tool-exposure.mjs";
+
 const here = dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_STATE_DIR = resolve(here, "state");
 
@@ -320,8 +330,9 @@ export async function prepareExecution(input, { stateDir = DEFAULT_STATE_DIR } =
     browser_session_attestation: "unavailable",
     conversation_id: null,
     conversation_attestation: "unavailable",
+    tool_exposure: initialToolExposure(input),
     status: "queued",
-    prompt_sha256: createHash("sha256").update(prompt).digest("hex"),
+    prompt_sha256: createHash("sha256").update(canonicalPromptText(prompt)).digest("hex"),
     prompt_length: Buffer.byteLength(prompt),
     created_at: createdAt,
     started_at: null,
@@ -348,7 +359,15 @@ async function defaultBrowserModules() {
   };
 }
 
-async function pollUntilTerminal({ browser, record, stateDir, timeoutMs, pollIntervalMs, config }) {
+async function pollUntilTerminal({
+  browser,
+  record,
+  stateDir,
+  timeoutMs,
+  pollIntervalMs,
+  config,
+  requiredConversationId = null
+}) {
   const deadline = Date.now() + timeoutMs;
   let last = null;
   while (Date.now() < deadline) {
@@ -362,6 +381,18 @@ async function pollUntilTerminal({ browser, record, stateDir, timeoutMs, pollInt
       record.browser_session_attestation = session.browser_session_attestation;
     }
     const observedConversation = stableConversationId(last?.conversationId);
+    if (
+      requiredConversationId &&
+      observedConversation &&
+      observedConversation !== requiredConversationId
+    ) {
+      throw new Error(
+        "reused ChatGPT conversation mismatch: expected " +
+          requiredConversationId +
+          ", observed " +
+          observedConversation
+      );
+    }
     if (observedConversation && observedConversation !== record.conversation_id) {
       record.conversation_id = observedConversation;
       record.conversation_attestation = "ui_observed";
@@ -400,13 +431,41 @@ export async function executePrepared(
   } = {}
 ) {
   const modules = browserModules || (await defaultBrowserModules());
-  const browser = modules.createBrowser();
+  const browser = attachAppExposureMethods(modules.createBrowser());
   const prompt = String(input?.prompt || "");
   if (!prompt.trim()) throw new Error("prompt is required");
+  const requiredApps = resolveRequiredApps({
+    ...input,
+    tool_exposure: record.tool_exposure,
+    required_apps: record.tool_exposure?.required_apps
+  });
+  const openNewChat = input?.new_chat !== false;
+  const requestedConversationId = stableConversationId(input?.conversation_id);
 
   try {
+    if (!openNewChat && !requestedConversationId) {
+      throw new Error("new_chat=false requires an explicit stable bound conversation_id");
+    }
     const dispatched = await browser.runExclusive(async () => {
-      await browser.newChat({ temporary: false }, { includeStatus: false });
+      if (openNewChat) {
+        await browser.newChat({ temporary: false }, { includeStatus: false });
+      } else {
+        if (typeof browser.status !== "function") {
+          throw new Error("conversation reuse requires browser status verification");
+        }
+        const currentStatus = await browser.status({ includeSettings: false });
+        const currentConversationId = stableConversationId(currentStatus?.conversationId);
+        if (currentConversationId !== requestedConversationId) {
+          throw new Error(
+            "reused ChatGPT conversation mismatch: expected " +
+              requestedConversationId +
+              ", observed " +
+              String(currentConversationId || "unbound")
+          );
+        }
+        record.conversation_id = currentConversationId;
+        record.conversation_attestation = "ui_observed";
+      }
       const modes = await browser.listModes();
       const personalMode = selectPersonalChatMode(modes);
       if (normalize(modes.current) !== normalize(personalMode)) {
@@ -414,12 +473,47 @@ export async function executePrepared(
       }
       const modelRoute = await modelRouter(browser, record.model_requested);
       const reasoningRoute = await reasoningRouter(browser, record.reasoning_effort_requested);
-      const sent = await browser.sendMessage({
-        prompt,
-        newChat: false,
-        temporary: false,
-        wait: false
-      });
+      let sent;
+      if (requiredApps.length) {
+        if (typeof browser.writePrompt !== "function" || typeof browser.submitPrompt !== "function") {
+          throw new Error(
+            "required Web tool app needs a safe writePrompt + submitPrompt browser boundary"
+          );
+        }
+        // chatgpt-web-mcp sendMessage() calls writePrompt(), which uses fill() and
+        // replaces composer contents. Write the logical prompt first, then select
+        // and confirm the per-message app exposure on that exact composer, and
+        // finally submit without another composer rewrite.
+        await browser.writePrompt(prompt);
+        const exposure = await ensureRequiredAppsExposed(browser, requiredApps, {
+          execution_id: record.execution_id,
+          conversation_id: record.conversation_id,
+          turn_id: record.execution_id,
+          expected_prompt_sha256: record.prompt_sha256
+        });
+        record.tool_exposure = {
+          ...record.tool_exposure,
+          ...exposure,
+          required_apps: requiredApps
+        };
+        if (exposure.state !== EXPOSURE_STATE.CONFIRMED) {
+          throw new Error(
+            "required Web tool app is not confirmed for this message: " +
+              requiredApps.join(", ") +
+              " (" +
+              exposure.state +
+              ")"
+          );
+        }
+        sent = await browser.submitPrompt({ wait: false });
+      } else {
+        sent = await browser.sendMessage({
+          prompt,
+          newChat: false,
+          temporary: false,
+          wait: false
+        });
+      }
       return { personalMode, modelRoute, reasoningRoute, sent };
     }, { name: "wex-dispatch-" + record.execution_id });
 
@@ -431,7 +525,8 @@ export async function executePrepared(
     record.updated_at = record.started_at;
     record.browser_session_id = session.browser_session_id;
     record.browser_session_attestation = session.browser_session_attestation;
-    record.conversation_id = stableConversationId(dispatched.sent?.conversationId);
+    record.conversation_id =
+      stableConversationId(dispatched.sent?.conversationId) || record.conversation_id;
     record.conversation_attestation = record.conversation_id ? "ui_observed" : "pending";
     await persistRecord(stateDir, record);
     await emitEvent(stateDir, record, "started", {
@@ -444,7 +539,8 @@ export async function executePrepared(
       stateDir,
       timeoutMs,
       pollIntervalMs,
-      config: modules.config
+      config: modules.config,
+      requiredConversationId: openNewChat ? null : requestedConversationId
     });
 
     const modelFacts = classifyModelAttestation(
@@ -483,6 +579,17 @@ export async function executePrepared(
     });
     return record;
   } catch (error) {
+    if (error?.exposure) {
+      record.tool_exposure = {
+        ...(record.tool_exposure || initialToolExposure(input)),
+        ...summarizeExposure({
+          required_apps: requiredApps,
+          results: Array.isArray(error.exposure.results)
+            ? error.exposure.results
+            : [error.exposure]
+        })
+      };
+    }
     record.status = "failed";
     record.updated_at = nowIso();
     record.terminal_at = record.updated_at;
@@ -543,15 +650,32 @@ async function cli(argv) {
     throw new Error("--assignment-id and --prompt-file are required");
   }
   const prompt = await readFile(resolve(args.prompt_file), "utf8");
+  const assignment = {
+    assignment_id: args.assignment_id,
+    task_id: args.task_id,
+    attempt: Number(args.attempt || 1),
+    model: args.model,
+    reasoning_effort: args.reasoning_effort,
+    prompt
+  };
+  if (args.local_tool_app_required != null) {
+    assignment.local_tool_app_required =
+      args.local_tool_app_required === "true" || args.local_tool_app_required === "1";
+  }
+  if (args.required_apps) {
+    assignment.required_apps = String(args.required_apps)
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
+  }
+  if (args.new_chat != null) {
+    assignment.new_chat = args.new_chat !== "false";
+  }
+  if (args.conversation_id) {
+    assignment.conversation_id = args.conversation_id;
+  }
   const record = await executeWebAssignment(
-    {
-      assignment_id: args.assignment_id,
-      task_id: args.task_id,
-      attempt: Number(args.attempt || 1),
-      model: args.model,
-      reasoning_effort: args.reasoning_effort,
-      prompt
-    },
+    assignment,
     {
       stateDir: args.state_dir || DEFAULT_STATE_DIR,
       timeoutMs: Number(args.timeout_ms || 180000),

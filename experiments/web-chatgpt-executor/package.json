@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test executor.test.mjs"
+    "test": "node --test executor.test.mjs tool-exposure.test.mjs chatgpt-app-exposure.test.mjs"
   },
   "dependencies": {
     "chatgpt-web-mcp": "github:Goudu666/chatgpt-web-mcp#4a87c728bacbadc4ff05cdffa061eb5cf3265e49"
