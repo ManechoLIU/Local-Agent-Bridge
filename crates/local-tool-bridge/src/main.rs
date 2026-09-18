@@ -1,5 +1,6 @@
 use axum::body::Body;
 use bridge_security_core::{Capability, CapabilityAuthority, CapabilityGrant, ExecutionContext};
+use collaboration_adapter::{LarkCliAdminSpec, LarkCliInstallSpec, LarkCliProvider};
 use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use local_tool_bridge::{
@@ -11,7 +12,7 @@ use std::{
     os::fd::AsRawFd,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::net::{UnixListener, UnixStream};
 use tower::ServiceExt;
@@ -117,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let capabilities = capability_set_from_env()?;
+    let provider_admin_enabled = capabilities.contains(&Capability::ProviderAdmin);
     let policy = ToolPolicy::catdesk_default();
     let context = ExecutionContext {
         principal_id: principal_id.clone(),
@@ -241,6 +243,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+    if provider_admin_enabled {
+        let home = PathBuf::from(
+            env::var("HOME").map_err(|_| "HOME is required for Feishu admin provider state")?,
+        );
+        let provider_root = feishu_provider_root(&home);
+        let (runtime_home, config_dir) = feishu_private_paths(&home);
+        let npm_program = env::var("LAB_FEISHU_NPM")
+            .unwrap_or_else(|_| "/opt/homebrew/bin/npm".into());
+        let install = LarkCliInstallSpec::new(
+            Path::new(&npm_program),
+            provider_root.join("npm"),
+        )
+        .map_err(|error| format!("Feishu installer configuration rejected: {}", error.message))?;
+        let admin = LarkCliAdminSpec::new(install, runtime_home, config_dir)
+            .map_err(|error| format!("Feishu admin configuration rejected: {}", error.message))?;
+        ingress = ingress.with_feishu_admin(
+            admin,
+            Duration::from_secs(15 * 60),
+            1024 * 1024,
+        )?;
+    }
+
+    let feishu_settings = feishu_settings_from_values(
+        env::var("LAB_FEISHU_CLI").ok(),
+        env::var("LAB_FEISHU_PROFILE").ok(),
+        env::var("LAB_FEISHU_TIMEOUT_MS").ok(),
+        env::var("LAB_FEISHU_OUTPUT_LIMIT").ok(),
+    )?;
+    if let Some(settings) = &feishu_settings {
+        let home = PathBuf::from(
+            env::var("HOME").map_err(|_| "HOME is required for Feishu private provider state")?,
+        );
+        let (runtime_home, config_dir) = feishu_private_paths(&home);
+        let provider = LarkCliProvider::new_isolated(
+            Path::new(&settings.cli_path),
+            settings.profile.clone(),
+            runtime_home,
+            config_dir,
+        )
+        .map_err(|error| format!("Feishu provider configuration rejected: {}", error.message))?;
+        ingress = ingress.with_feishu_provider(
+            provider,
+            Duration::from_millis(settings.timeout_ms),
+            settings.output_limit,
+        )?;
+    }
     let app = ingress.router();
 
     let socket = PathBuf::from(&socket_path);
@@ -262,11 +310,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = UnixListener::bind(&socket)?;
     set_socket_private(&socket)?;
     eprintln!(
-        "local-tool-bridge ready socket={} backend={} host_backend={} computer_backend={} host_receipts={} runtime_hook={} capability_id={} production_release={} production_generation={}",
+        "local-tool-bridge ready socket={} backend={} host_backend={} computer_backend={} feishu_provider={} host_receipts={} runtime_hook={} capability_id={} production_release={} production_generation={}",
         socket.display(),
         backend_url,
         host_backend_url.as_deref().unwrap_or("disabled"),
         computer_backend_url.as_deref().unwrap_or("disabled"),
+        if feishu_settings.is_some() { "enabled" } else { "disabled" },
         host_receipt_socket.as_deref().unwrap_or("disabled"),
         runtime_hook_socket.as_deref().unwrap_or("disabled"),
         capability_id,
@@ -371,6 +420,10 @@ fn required_production_release_fence() -> Result<ProductionReleaseFence, Box<dyn
 fn capability_set_from_env() -> Result<Vec<Capability>, Box<dyn std::error::Error>> {
     let raw = env::var("LAB_BRIDGE_CAPABILITIES")
         .unwrap_or_else(|_| "discovery,file_read,file_write,file_move,shell,process_jobs".into());
+    parse_capability_set(&raw).map_err(Into::into)
+}
+
+fn parse_capability_set(raw: &str) -> Result<Vec<Capability>, String> {
     raw.split(',')
         .filter(|value| !value.trim().is_empty())
         .map(|value| match value.trim() {
@@ -383,9 +436,83 @@ fn capability_set_from_env() -> Result<Vec<Capability>, Box<dyn std::error::Erro
             "process_jobs" => Ok(Capability::ProcessJobs),
             "browser" => Ok(Capability::Browser),
             "computer" => Ok(Capability::Computer),
-            other => Err(format!("unknown LAB_BRIDGE_CAPABILITIES value: {other}").into()),
+            "collaboration_read" => Ok(Capability::CollaborationRead),
+            "collaboration_write" => Ok(Capability::CollaborationWrite),
+            "provider_admin" => Ok(Capability::ProviderAdmin),
+            other => Err(format!("unknown LAB_BRIDGE_CAPABILITIES value: {other}")),
         })
         .collect()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FeishuSettings {
+    cli_path: String,
+    profile: Option<String>,
+    timeout_ms: u64,
+    output_limit: usize,
+}
+
+fn feishu_settings_from_values(
+    cli_path: Option<String>,
+    profile: Option<String>,
+    timeout_ms: Option<String>,
+    output_limit: Option<String>,
+) -> Result<Option<FeishuSettings>, String> {
+    let Some(cli_path) = cli_path else {
+        if profile.is_some() || timeout_ms.is_some() || output_limit.is_some() {
+            return Err("LAB_FEISHU_CLI is required when any Feishu setting is configured".into());
+        }
+        return Ok(None);
+    };
+    let cli_path = cli_path.trim().to_string();
+    if cli_path.is_empty() {
+        return Err("LAB_FEISHU_CLI must not be empty".into());
+    }
+    let profile = match profile {
+        Some(profile) => {
+            let profile = profile.trim().to_string();
+            if profile.is_empty() {
+                return Err("LAB_FEISHU_PROFILE must not be empty when configured".into());
+            }
+            Some(profile)
+        }
+        None => None,
+    };
+    let timeout_ms = match timeout_ms {
+        Some(value) => value
+            .parse::<u64>()
+            .map_err(|_| "LAB_FEISHU_TIMEOUT_MS must be an integer".to_string())?,
+        None => 30_000,
+    };
+    if timeout_ms == 0 || timeout_ms > 120_000 {
+        return Err("LAB_FEISHU_TIMEOUT_MS must be between 1 and 120000".into());
+    }
+    let output_limit = match output_limit {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| "LAB_FEISHU_OUTPUT_LIMIT must be an integer".to_string())?,
+        None => 1024 * 1024,
+    };
+    if output_limit == 0 || output_limit > 4 * 1024 * 1024 {
+        return Err("LAB_FEISHU_OUTPUT_LIMIT must be between 1 and 4194304".into());
+    }
+    Ok(Some(FeishuSettings {
+        cli_path,
+        profile,
+        timeout_ms,
+        output_limit,
+    }))
+}
+
+fn feishu_provider_root(home: &Path) -> PathBuf {
+    home.join(".local-agent-bridge")
+        .join("providers")
+        .join("feishu")
+}
+
+fn feishu_private_paths(home: &Path) -> (PathBuf, PathBuf) {
+    let root = feishu_provider_root(home);
+    (root.join("home"), root.join("config"))
 }
 
 fn current_euid() -> u32 {
@@ -506,4 +633,98 @@ fn set_socket_private(path: &Path) -> std::io::Result<()> {
         ));
     }
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(test)]
+mod feishu_config_tests {
+    use super::*;
+
+    #[test]
+    fn collaboration_capabilities_are_explicit_and_separate() {
+        let capabilities = parse_capability_set(
+            "discovery,collaboration_read,collaboration_write,provider_admin",
+        )
+        .unwrap();
+        assert_eq!(
+            capabilities,
+            vec![
+                Capability::Discovery,
+                Capability::CollaborationRead,
+                Capability::CollaborationWrite,
+                Capability::ProviderAdmin,
+            ]
+        );
+        assert!(parse_capability_set("discovery,feishu_raw").is_err());
+    }
+
+    #[test]
+    fn feishu_config_is_optional_but_partial_configuration_fails_closed() {
+        assert!(feishu_settings_from_values(None, None, None, None).unwrap().is_none());
+        assert!(
+            feishu_settings_from_values(
+                None,
+                Some("lab-feishu".into()),
+                None,
+                None,
+            )
+            .is_err()
+        );
+        let settings = feishu_settings_from_values(
+            Some("/opt/homebrew/bin/lark-cli".into()),
+            Some("lab-feishu".into()),
+            Some("45000".into()),
+            Some("131072".into()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(settings.cli_path, "/opt/homebrew/bin/lark-cli");
+        assert_eq!(settings.profile.as_deref(), Some("lab-feishu"));
+        assert_eq!(settings.timeout_ms, 45_000);
+        assert_eq!(settings.output_limit, 131_072);
+    }
+
+    #[test]
+    fn feishu_private_paths_stay_under_lab_provider_root() {
+        let (runtime_home, config_dir) =
+            feishu_private_paths(Path::new("/Users/tester"));
+        assert_eq!(
+            runtime_home,
+            PathBuf::from("/Users/tester/.local-agent-bridge/providers/feishu/home")
+        );
+        assert_eq!(
+            config_dir,
+            PathBuf::from("/Users/tester/.local-agent-bridge/providers/feishu/config")
+        );
+    }
+
+    #[test]
+    fn feishu_config_bounds_timeout_and_output() {
+        assert!(
+            feishu_settings_from_values(
+                Some("/opt/homebrew/bin/lark-cli".into()),
+                None,
+                Some("0".into()),
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            feishu_settings_from_values(
+                Some("/opt/homebrew/bin/lark-cli".into()),
+                None,
+                Some("120001".into()),
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            feishu_settings_from_values(
+                Some("/opt/homebrew/bin/lark-cli".into()),
+                None,
+                None,
+                Some("4194305".into()),
+            )
+            .is_err()
+        );
+    }
 }

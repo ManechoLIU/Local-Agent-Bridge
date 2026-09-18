@@ -9,6 +9,9 @@ use bridge_security_core::{
     Capability, CapabilityAuthority, ExecutionContext, IssuedCapability, sign_request,
     sign_request_for_execution,
 };
+use collaboration_adapter::{LarkCliAdminSpec, LarkCliProvider};
+
+mod collaboration_tools;
 use reqwest::Url;
 use sha2::{Digest, Sha256};
 use std::{
@@ -608,6 +611,20 @@ impl ToolPolicy {
             .insert("computer_type", Capability::Computer)
             .insert("computer_key", Capability::Computer)
             .insert("computer_scroll", Capability::Computer)
+            .insert("feishu_status", Capability::CollaborationRead)
+            .insert("feishu_base_list_tables", Capability::CollaborationRead)
+            .insert("feishu_base_list_fields", Capability::CollaborationRead)
+            .insert("feishu_base_list_records", Capability::CollaborationRead)
+            .insert("feishu_chat_search", Capability::CollaborationRead)
+            .insert("feishu_message_list", Capability::CollaborationRead)
+            .insert("feishu_base_create_record", Capability::CollaborationWrite)
+            .insert("feishu_base_update_record", Capability::CollaborationWrite)
+            .insert("feishu_message_send", Capability::CollaborationWrite)
+            .insert("feishu_message_reply", Capability::CollaborationWrite)
+            .insert("feishu_setup_start", Capability::ProviderAdmin)
+            .insert("feishu_setup_poll", Capability::ProviderAdmin)
+            .insert("feishu_auth_begin", Capability::ProviderAdmin)
+            .insert("feishu_auth_complete", Capability::ProviderAdmin)
     }
 
     pub fn required_capability(&self, method: &str, tool_name: &str) -> Result<Capability, String> {
@@ -677,6 +694,8 @@ struct BridgeIngressInner {
     host_backend: Option<BackendTarget>,
     host_release_fence: Option<ProductionReleaseFence>,
     computer_backend: Option<BackendTarget>,
+    collaboration: Option<collaboration_tools::CollaborationRuntime>,
+    feishu_admin: Option<collaboration_tools::FeishuAdminRuntime>,
     client: reqwest::Client,
     policy: ToolPolicy,
     state_dir: Option<PathBuf>,
@@ -738,6 +757,8 @@ impl BridgeIngress {
                 host_backend: None,
                 host_release_fence: None,
                 computer_backend: None,
+                collaboration: None,
+                feishu_admin: None,
                 client: backend_client()?,
                 policy,
                 state_dir: Some(state_dir.into()),
@@ -773,6 +794,8 @@ impl BridgeIngress {
                 host_backend: None,
                 host_release_fence: None,
                 computer_backend: None,
+                collaboration: None,
+                feishu_admin: None,
                 client: backend_client()?,
                 policy,
                 state_dir: Some(state_dir.into()),
@@ -829,6 +852,40 @@ impl BridgeIngress {
             url: backend_url,
             key: backend_key.to_string(),
         });
+        Ok(self)
+    }
+
+    pub fn with_feishu_provider(
+        mut self,
+        provider: LarkCliProvider,
+        timeout: Duration,
+        output_limit: usize,
+    ) -> Result<Self, String> {
+        let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
+            "Feishu provider must be configured before BridgeIngress is cloned".to_string()
+        })?;
+        inner.collaboration = Some(collaboration_tools::CollaborationRuntime::new(
+            provider,
+            timeout,
+            output_limit,
+        )?);
+        Ok(self)
+    }
+
+    pub fn with_feishu_admin(
+        mut self,
+        spec: LarkCliAdminSpec,
+        timeout: Duration,
+        output_limit: usize,
+    ) -> Result<Self, String> {
+        let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
+            "Feishu admin runtime must be configured before BridgeIngress is cloned".to_string()
+        })?;
+        inner.feishu_admin = Some(collaboration_tools::FeishuAdminRuntime::new(
+            spec,
+            timeout,
+            output_limit,
+        )?);
         Ok(self)
     }
 
@@ -1025,8 +1082,19 @@ async fn handle_mcp(
         };
     }
 
+    if method == "tools/call" && collaboration_tools::is_feishu_admin_tool(tool_name) {
+        return handle_feishu_admin_call(&state, &parsed, tool_name).await;
+    }
+
+    if method == "tools/call" && tool_name.starts_with("feishu_") {
+        return handle_feishu_call(&state, &parsed, tool_name).await;
+    }
+
     if method == "tools/list"
-        && (state.inner.host_backend.is_some() || state.inner.computer_backend.is_some())
+        && (state.inner.host_backend.is_some()
+            || state.inner.computer_backend.is_some()
+            || state.inner.collaboration.is_some()
+            || state.inner.feishu_admin.is_some())
     {
         return match forward_merged_tools_list(&state, &headers, &proof.to_headers(), body).await {
             Ok(response) => response,
@@ -1074,6 +1142,223 @@ async fn handle_mcp(
         Ok(response) => response,
         Err(error) => text_response(StatusCode::BAD_GATEWAY, &error),
     }
+}
+
+async fn handle_feishu_admin_call(
+    state: &BridgeIngress,
+    parsed: &serde_json::Value,
+    tool_name: &str,
+) -> Response<Body> {
+    let runtime = match state.inner.feishu_admin.as_ref() {
+        Some(runtime) => runtime.clone(),
+        None => {
+            return text_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Feishu admin runtime is not configured",
+            );
+        }
+    };
+    let arguments = parsed
+        .get("params")
+        .and_then(|value| value.get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let id = parsed
+        .get("id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    let result: Result<serde_json::Value, Response<Body>> = match tool_name {
+        "feishu_setup_start" => {
+            let action = match collaboration_tools::parse_feishu_setup_start(&arguments) {
+                Ok(action) => action,
+                Err(error) => return text_response(StatusCode::BAD_REQUEST, &error),
+            };
+            runtime
+                .start_setup(&action)
+                .map_err(|_| text_response(StatusCode::INTERNAL_SERVER_ERROR, "Feishu setup job failed to start"))
+        }
+        "feishu_setup_poll" => {
+            let job_id = match collaboration_tools::parse_feishu_setup_poll(&arguments) {
+                Ok(job_id) => job_id,
+                Err(error) => return text_response(StatusCode::BAD_REQUEST, &error),
+            };
+            runtime
+                .poll_setup(&job_id)
+                .map_err(|error| text_response(StatusCode::BAD_REQUEST, &error))
+        }
+        "feishu_auth_begin" => {
+            if let Err(error) = collaboration_tools::parse_feishu_auth_begin(&arguments) {
+                return text_response(StatusCode::BAD_REQUEST, &error);
+            }
+            match tokio::task::spawn_blocking(move || runtime.auth_begin()).await {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(error)) => Err(feishu_admin_provider_error(id.clone(), error)),
+                Err(_) => Err(text_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Feishu auth worker failed",
+                )),
+            }
+        }
+        "feishu_auth_complete" => {
+            let flow_id = match collaboration_tools::parse_feishu_auth_complete(&arguments) {
+                Ok(flow_id) => flow_id,
+                Err(error) => return text_response(StatusCode::BAD_REQUEST, &error),
+            };
+            match tokio::task::spawn_blocking(move || runtime.auth_complete(&flow_id)).await {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(error)) => Err(feishu_admin_provider_error(id.clone(), error)),
+                Err(_) => Err(text_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Feishu auth worker failed",
+                )),
+            }
+        }
+        _ => return text_response(StatusCode::BAD_REQUEST, "unsupported Feishu admin tool"),
+    };
+
+    match result {
+        Ok(data) => {
+            let text = serde_json::to_string(&data).unwrap_or_else(|_| "{}".into());
+            json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "id":id,
+                    "result":{
+                        "content":[{"type":"text","text":text}],
+                        "structuredContent":data,
+                    }
+                }),
+            )
+        }
+        Err(response) => response,
+    }
+}
+
+fn feishu_admin_provider_error(
+    id: serde_json::Value,
+    error: collaboration_adapter::CollaborationError,
+) -> Response<Body> {
+    let kind = collaboration_tools::error_kind_name(&error.kind);
+    let message = match error.kind {
+        collaboration_adapter::CollaborationErrorKind::InvalidArgument => error.message,
+        collaboration_adapter::CollaborationErrorKind::CliUnavailable => {
+            "Feishu setup executable is unavailable".into()
+        }
+        collaboration_adapter::CollaborationErrorKind::PermissionDenied => {
+            "Feishu setup permission was denied".into()
+        }
+        _ => "Feishu setup/auth operation failed".into(),
+    };
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":id,
+            "error":{
+                "code":-32011,
+                "message":message,
+                "data":{
+                    "provider":"feishu",
+                    "kind":kind,
+                    "dispatch_attempted":error.dispatch_attempted,
+                }
+            }
+        }),
+    )
+}
+
+async fn handle_feishu_call(
+    state: &BridgeIngress,
+    parsed: &serde_json::Value,
+    tool_name: &str,
+) -> Response<Body> {
+    let runtime = match state.inner.collaboration.as_ref() {
+        Some(runtime) => runtime.clone(),
+        None => {
+            return text_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Feishu provider is not configured",
+            );
+        }
+    };
+    let arguments = parsed
+        .get("params")
+        .and_then(|value| value.get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let operation = match collaboration_tools::parse_feishu_operation(
+        tool_name,
+        &arguments,
+        &format!("lab-{}", Uuid::new_v4()),
+    ) {
+        Ok(operation) => operation,
+        Err(error) => return text_response(StatusCode::BAD_REQUEST, &error),
+    };
+    let id = parsed
+        .get("id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    match tokio::task::spawn_blocking(move || runtime.execute(&operation)).await {
+        Ok(Ok(data)) => {
+            let text = serde_json::to_string(&data).unwrap_or_else(|_| "{}".into());
+            let value = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{"type":"text","text":text}],
+                    "structuredContent": data,
+                }
+            });
+            json_response(StatusCode::OK, value)
+        }
+        Ok(Err(error)) => {
+            let kind = collaboration_tools::error_kind_name(&error.kind);
+            let message = match error.kind {
+                collaboration_adapter::CollaborationErrorKind::InvalidArgument => error.message,
+                collaboration_adapter::CollaborationErrorKind::CliUnavailable => {
+                    "Feishu CLI is unavailable or not configured".into()
+                }
+                collaboration_adapter::CollaborationErrorKind::AuthRequired => {
+                    "Feishu authorization is required".into()
+                }
+                collaboration_adapter::CollaborationErrorKind::PermissionDenied => {
+                    "Feishu permission was denied".into()
+                }
+                _ => "Feishu provider call failed".into(),
+            };
+            json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "id":id,
+                    "error":{
+                        "code":-32010,
+                        "message":message,
+                        "data":{
+                            "provider":"feishu",
+                            "backend":"lark-cli",
+                            "kind":kind,
+                            "dispatch_attempted":error.dispatch_attempted,
+                        }
+                    }
+                }),
+            )
+        }
+        Err(_) => text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Feishu provider worker failed",
+        ),
+    }
+}
+
+fn json_response(status: StatusCode, value: serde_json::Value) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(value.to_string()))
+        .unwrap_or_else(|_| Response::new(Body::from("response build failed")))
 }
 
 #[derive(Debug)]
@@ -2836,6 +3121,37 @@ async fn forward_merged_tools_list(
             validate_host_tools_fence(extra_tools, &state.inner.host_release_fence)?;
         }
         tools.extend(extra_tools.iter().cloned());
+    }
+    if state.inner.collaboration.is_some() || state.inner.feishu_admin.is_some() {
+        let mut names = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        if state.inner.collaboration.is_some() {
+            for tool in collaboration_tools::feishu_tool_definitions() {
+                let name = tool
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "Feishu tool definition has no name".to_string())?;
+                if !names.insert(name.to_string()) {
+                    return Err(format!("duplicate merged tool name: {name}"));
+                }
+                tools.push(tool);
+            }
+        }
+        if state.inner.feishu_admin.is_some() {
+            for tool in collaboration_tools::feishu_admin_tool_definitions() {
+                let name = tool
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| "Feishu admin tool definition has no name".to_string())?;
+                if !names.insert(name.to_string()) {
+                    return Err(format!("duplicate merged tool name: {name}"));
+                }
+                tools.push(tool);
+            }
+        }
     }
     let response = Response::builder()
         .status(StatusCode::OK)

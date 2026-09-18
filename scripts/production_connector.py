@@ -140,6 +140,28 @@ REQUIRED_TOOLS = frozenset(
         "cancel_command",
     }
 )
+FEISHU_REQUIRED_TOOLS = frozenset(
+    {
+        "feishu_status",
+        "feishu_base_list_tables",
+        "feishu_base_list_fields",
+        "feishu_base_list_records",
+        "feishu_chat_search",
+        "feishu_message_list",
+        "feishu_base_create_record",
+        "feishu_base_update_record",
+        "feishu_message_send",
+        "feishu_message_reply",
+    }
+)
+FEISHU_ADMIN_TOOLS = frozenset(
+    {
+        "feishu_setup_start",
+        "feishu_setup_poll",
+        "feishu_auth_begin",
+        "feishu_auth_complete",
+    }
+)
 RUNTIME_VERIFIER_BUNDLE_RELATIVE_PATHS = (
     "chrome-host/runtime-verifier-cli.mjs",
     "chrome-host/integration.mjs",
@@ -378,6 +400,17 @@ def production_component_env(
         "LAB_HOST_ADAPTER_SOCKET": str(layout["host_socket"]),
         "LAB_RUNTIME_HOST_TOOL_HOOK_SOCKET": str(layout["runtime_hook_socket"]),
     }
+    dependencies = _validate_runtime_dependencies(manifest)
+    feishu_admin_enabled = manifest.get("feishu_admin_enabled") is True
+    feishu = dependencies.get("feishu_cli")
+    if feishu_admin_enabled:
+        bridge["LAB_BRIDGE_CAPABILITIES"] += ",provider_admin"
+        bridge["LAB_FEISHU_NPM"] = "/opt/homebrew/bin/npm"
+    if feishu is not None:
+        bridge["LAB_BRIDGE_CAPABILITIES"] += ",collaboration_read,collaboration_write"
+        bridge["LAB_FEISHU_CLI"] = str(feishu["path"])
+        bridge["LAB_FEISHU_TIMEOUT_MS"] = "30000"
+        bridge["LAB_FEISHU_OUTPUT_LIMIT"] = str(1024 * 1024)
     return {"host": host, "bridge": bridge}
 
 
@@ -4629,6 +4662,7 @@ def _start_local_runtime_unlocked(
         )
         started[-1] = (bridge, bridge_identity, False)
         tools = _wait_for_bridge(bridge, layout)
+        validate_tool_surface(tools, installed.get("required_tools") or REQUIRED_TOOLS)
 
         state = {
             "schema_version": 1,
@@ -5637,7 +5671,24 @@ def _validate_manifest_contract(manifest: dict[str, Any]) -> None:
         raise RuntimeError(
             "production Bridge capability renewal policy is invalid, unbounded, or noncanonical"
         )
-    _validate_runtime_dependencies(manifest)
+    dependencies = _validate_runtime_dependencies(manifest)
+    required_tools = manifest.get("required_tools")
+    if not isinstance(required_tools, list) or not all(
+        isinstance(value, str) and value for value in required_tools
+    ):
+        raise RuntimeError("production required_tools is invalid")
+    feishu_admin_enabled = manifest.get("feishu_admin_enabled", False)
+    if not isinstance(feishu_admin_enabled, bool):
+        raise RuntimeError("production Feishu admin flag must be boolean")
+    if feishu_admin_enabled and "feishu_cli" in dependencies:
+        raise RuntimeError("Feishu setup release and pinned Feishu runtime are mutually exclusive")
+    expected_tools = set(REQUIRED_TOOLS)
+    if feishu_admin_enabled:
+        expected_tools.update(FEISHU_ADMIN_TOOLS)
+    if "feishu_cli" in dependencies:
+        expected_tools.update(FEISHU_REQUIRED_TOOLS)
+    if set(required_tools) != expected_tools:
+        raise RuntimeError("production required_tools does not match runtime dependencies")
 
 
 def _private_dir(path: Path) -> None:
@@ -6102,6 +6153,40 @@ def _python_runtime_dependency(python_executable: Path | None = None) -> dict[st
     return {"path": str(path), "inode": info.st_ino, "sha256": _sha256_file(path)}
 
 
+def _feishu_cli_runtime_dependency(
+    feishu_cli_executable: Path | None,
+    feishu_cli_version: str | None,
+) -> dict[str, Any] | None:
+    if feishu_cli_executable is None:
+        if feishu_cli_version is not None:
+            raise RuntimeError("Feishu CLI version requires an executable pin")
+        return None
+    version = str(feishu_cli_version or "").strip()
+    if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None:
+        raise RuntimeError("Feishu CLI version must be an exact semantic version")
+    raw = Path(feishu_cli_executable).expanduser()
+    if not raw.is_absolute():
+        raise RuntimeError("Feishu CLI executable path must be absolute")
+    try:
+        path = raw.resolve(strict=True)
+        info = path.stat()
+    except FileNotFoundError as error:
+        raise RuntimeError("Feishu CLI executable is unavailable") from error
+    if (
+        not path.is_file()
+        or info.st_uid not in {0, os.geteuid()}
+        or stat.S_IMODE(info.st_mode) & 0o022
+        or not os.access(path, os.X_OK)
+    ):
+        raise RuntimeError("Feishu CLI executable is not a trusted executable file")
+    return {
+        "path": str(path),
+        "inode": info.st_ino,
+        "sha256": _sha256_file(path),
+        "version": version,
+    }
+
+
 def _validate_runtime_dependencies(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
     dependencies = manifest.get("runtime_dependencies")
     node = dependencies.get("node") if isinstance(dependencies, dict) else None
@@ -6149,10 +6234,53 @@ def _validate_runtime_dependencies(manifest: dict[str, Any]) -> dict[str, dict[s
         or _sha256_file(python_file) != python_digest
     ):
         raise RuntimeError("production Runtime Host tool hook Python pin mismatch")
-    return {
+    validated = {
         "node": {"path": raw_path, "sha256": expected_sha256},
         "python": {"path": python_path, "inode": python_inode, "sha256": python_digest},
     }
+    feishu = dependencies.get("feishu_cli") if isinstance(dependencies, dict) else None
+    if feishu is not None:
+        if not isinstance(feishu, dict):
+            raise RuntimeError("production Feishu CLI dependency must be an object")
+        feishu_path = feishu.get("path")
+        feishu_inode = feishu.get("inode")
+        feishu_digest = feishu.get("sha256")
+        feishu_version = feishu.get("version")
+        if (
+            not isinstance(feishu_path, str)
+            or not Path(feishu_path).is_absolute()
+            or not isinstance(feishu_inode, int)
+            or feishu_inode < 1
+            or not isinstance(feishu_digest, str)
+            or len(feishu_digest) != 64
+            or not isinstance(feishu_version, str)
+            or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", feishu_version) is None
+        ):
+            raise RuntimeError("production Feishu CLI pin is invalid")
+        feishu_file = Path(feishu_path)
+        try:
+            feishu_resolved = feishu_file.resolve(strict=True)
+            feishu_info = feishu_file.lstat()
+        except FileNotFoundError as error:
+            raise RuntimeError("production Feishu CLI is unavailable") from error
+        if (
+            feishu_resolved != feishu_file
+            or feishu_file.is_symlink()
+            or not feishu_file.is_file()
+            or feishu_info.st_uid not in {0, os.geteuid()}
+            or stat.S_IMODE(feishu_info.st_mode) & 0o022
+            or feishu_info.st_ino != feishu_inode
+            or not os.access(feishu_file, os.X_OK)
+            or _sha256_file(feishu_file) != feishu_digest
+        ):
+            raise RuntimeError("production Feishu CLI pin or hash mismatch")
+        validated["feishu_cli"] = {
+            "path": feishu_path,
+            "inode": feishu_inode,
+            "sha256": feishu_digest,
+            "version": feishu_version,
+        }
+    return validated
 
 
 def _catdesk_runner_source(manifest: dict[str, Any], layout: dict[str, Path]) -> str:
@@ -6205,9 +6333,16 @@ def validate_workspace(path: Path) -> Path:
     return resolved
 
 
-def validate_tool_surface(tools: Iterable[str]) -> set[str]:
+def validate_tool_surface(
+    tools: Iterable[str], required_tools: Iterable[str] | None = None
+) -> set[str]:
     observed = {str(value) for value in tools if isinstance(value, str)}
-    missing = sorted(REQUIRED_TOOLS.difference(observed))
+    required = {
+        str(value)
+        for value in (required_tools if required_tools is not None else REQUIRED_TOOLS)
+        if isinstance(value, str)
+    }
+    missing = sorted(required.difference(observed))
     if missing:
         raise RuntimeError(
             "stale or incomplete production tool surface; missing required tools: "
@@ -6242,10 +6377,30 @@ def release_manifest(
     release_revision: str,
     endpoint_generation: int,
     node_executable: Path | None = None,
+    feishu_cli_executable: Path | None = None,
+    feishu_cli_version: str | None = None,
+    feishu_admin_enabled: bool = False,
 ) -> dict[str, Any]:
     root = validate_workspace(workspace or canonical_workspace())
     revision = _release_revision(release_revision)
     generation = _endpoint_generation(endpoint_generation)
+    runtime_dependencies: dict[str, Any] = {
+        "node": _node_runtime_dependency(node_executable),
+        "python": _python_runtime_dependency(),
+    }
+    if not isinstance(feishu_admin_enabled, bool):
+        raise RuntimeError("Feishu admin flag must be boolean")
+    required_tools = set(REQUIRED_TOOLS)
+    feishu_cli = _feishu_cli_runtime_dependency(
+        feishu_cli_executable, feishu_cli_version
+    )
+    if feishu_admin_enabled and feishu_cli is not None:
+        raise RuntimeError("Feishu setup release and pinned Feishu runtime are mutually exclusive")
+    if feishu_admin_enabled:
+        required_tools.update(FEISHU_ADMIN_TOOLS)
+    if feishu_cli is not None:
+        runtime_dependencies["feishu_cli"] = feishu_cli
+        required_tools.update(FEISHU_REQUIRED_TOOLS)
     return {
         "schema_version": 1,
         "connector_id": CONNECTOR_ID,
@@ -6256,13 +6411,11 @@ def release_manifest(
         "endpoint_generation": generation,
         "fail_closed": True,
         "silent_legacy_fallback_allowed": False,
+        "feishu_admin_enabled": feishu_admin_enabled,
         "historical_connectors_forbidden": list(HISTORICAL_CONNECTOR_NAMES),
         "workspace": str(root),
-        "required_tools": sorted(REQUIRED_TOOLS),
-        "runtime_dependencies": {
-            "node": _node_runtime_dependency(node_executable),
-            "python": _python_runtime_dependency(),
-        },
+        "required_tools": sorted(required_tools),
+        "runtime_dependencies": runtime_dependencies,
         "tunnel": {
             "profile_name": TUNNEL_PROFILE_NAME,
             "legacy_profile_names_forbidden": list(HISTORICAL_TUNNEL_PROFILE_NAMES),
@@ -6314,7 +6467,9 @@ def validate_release_handshake(manifest: dict[str, Any], observed: dict[str, Any
             f"production connector workspace mismatch: expected {expected_workspace}, got {actual_workspace}"
         )
 
-    validate_tool_surface(observed.get("tools") or [])
+    validate_tool_surface(
+        observed.get("tools") or [], manifest.get("required_tools") or REQUIRED_TOOLS
+    )
 
     tunnel = manifest["tunnel"]
     if observed.get("tunnel_profile_name") != tunnel["profile_name"]:

@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 axum = "0.8"
 bridge-security-core = { path = "../bridge-security-core" }
+collaboration-adapter = { path = "../collaboration-adapter" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 hyper = { version = "1", features = ["http1", "server"] }

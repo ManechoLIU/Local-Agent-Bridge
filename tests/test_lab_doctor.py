@@ -60,6 +60,53 @@ class LabDoctorTests(unittest.TestCase):
             report["layers"]["web_executor"]["state"], doctor.UNINSTRUMENTED
         )
 
+
+    def test_feishu_setup_surface_is_reported_as_setup_not_business_ready(self):
+        status = healthy_status()
+        status["tools"] += [
+            "feishu_setup_start",
+            "feishu_setup_poll",
+            "feishu_auth_begin",
+            "feishu_auth_complete",
+        ]
+        report = doctor.build_report(status, scope="full")
+        layer = report["layers"]["collaboration"]
+        self.assertEqual(layer["state"], doctor.DEGRADED)
+        self.assertEqual(layer["evidence"]["mode"], "SETUP")
+        self.assertFalse(layer["evidence"]["business_tools_ready"])
+
+    def test_feishu_pinned_surface_with_auth_is_healthy(self):
+        status = healthy_status()
+        status["tools"] += [
+            "feishu_status",
+            "feishu_base_list_tables",
+            "feishu_base_list_fields",
+            "feishu_base_list_records",
+            "feishu_chat_search",
+            "feishu_message_list",
+            "feishu_base_create_record",
+            "feishu_base_update_record",
+            "feishu_message_send",
+            "feishu_message_reply",
+        ]
+        status["feishu_auth_ready"] = True
+        report = doctor.build_report(status, scope="full")
+        layer = report["layers"]["collaboration"]
+        self.assertEqual(layer["state"], doctor.HEALTHY)
+        self.assertEqual(layer["evidence"]["mode"], "PINNED")
+        self.assertEqual(layer["evidence"]["auth_state"], "AUTH_READY")
+
+    def test_feishu_setup_and_business_tools_mixed_is_broken(self):
+        status = healthy_status()
+        status["tools"] += [
+            "feishu_setup_start",
+            "feishu_status",
+        ]
+        report = doctor.build_report(status, scope="full")
+        layer = report["layers"]["collaboration"]
+        self.assertEqual(layer["state"], doctor.BROKEN)
+        self.assertEqual(layer["repair_state"], "deploy_single_feishu_release_mode")
+
     def test_bridge_failure_does_not_overwrite_other_layer_health(self):
         status = healthy_status()
         status["bridge_ready"] = False

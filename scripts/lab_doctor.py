@@ -34,6 +34,29 @@ WEB_EXECUTION_ID_RE = re.compile(
 WEB_EXECUTION_EXPOSURE_MAX_AGE_SECONDS = 300
 WEB_EXECUTION_EXPOSURE_MAX_FUTURE_SKEW_SECONDS = 30
 
+FEISHU_ADMIN_TOOLS = frozenset(
+    {
+        "feishu_setup_start",
+        "feishu_setup_poll",
+        "feishu_auth_begin",
+        "feishu_auth_complete",
+    }
+)
+FEISHU_BUSINESS_TOOLS = frozenset(
+    {
+        "feishu_status",
+        "feishu_base_list_tables",
+        "feishu_base_list_fields",
+        "feishu_base_list_records",
+        "feishu_chat_search",
+        "feishu_message_list",
+        "feishu_base_create_record",
+        "feishu_base_update_record",
+        "feishu_message_send",
+        "feishu_message_reply",
+    }
+)
+
 M0_REQUIRED_LAYERS = (
     "backend",
     "bridge_process",
@@ -51,6 +74,7 @@ FULL_LAYER_ORDER = (
     "mcp",
     "auth_session",
     "tool_registry",
+    "collaboration",
     "workspace",
     "execution",
     "jobs",
@@ -267,6 +291,107 @@ def _m0_contract() -> tuple[set[str], int]:
     )
 
 
+def project_feishu_layer(status: dict[str, Any], tools: Iterable[str]) -> dict[str, Any]:
+    observed = {value for value in tools if isinstance(value, str)}
+    admin = observed.intersection(FEISHU_ADMIN_TOOLS)
+    business = observed.intersection(FEISHU_BUSINESS_TOOLS)
+
+    if admin and business:
+        return _layer(
+            BROKEN,
+            "Feishu setup/admin and pinned business tools are mixed in one release",
+            repair_state="deploy_single_feishu_release_mode",
+            evidence={
+                "mode": "MIXED",
+                "admin_tools": sorted(admin),
+                "business_tools": sorted(business),
+                "business_tools_ready": False,
+                "auth_state": "UNKNOWN",
+            },
+        )
+
+    if admin:
+        missing = sorted(FEISHU_ADMIN_TOOLS.difference(admin))
+        if missing:
+            return _layer(
+                BROKEN,
+                "Feishu setup/admin tool surface is incomplete",
+                repair_state="redeploy_feishu_setup_release",
+                evidence={
+                    "mode": "SETUP",
+                    "missing_tools": missing,
+                    "business_tools_ready": False,
+                    "auth_state": "UNKNOWN",
+                },
+            )
+        return _layer(
+            DEGRADED,
+            "Feishu setup release is active; install/config/auth may proceed but business tools are not pinned yet",
+            repair_state="complete_feishu_setup_then_pin_release",
+            evidence={
+                "mode": "SETUP",
+                "business_tools_ready": False,
+                "auth_state": "UNKNOWN",
+            },
+        )
+
+    if business:
+        missing = sorted(FEISHU_BUSINESS_TOOLS.difference(business))
+        if missing:
+            return _layer(
+                BROKEN,
+                "Pinned Feishu business tool surface is incomplete",
+                repair_state="redeploy_pinned_feishu_release",
+                evidence={
+                    "mode": "PINNED",
+                    "missing_tools": missing,
+                    "business_tools_ready": False,
+                    "auth_state": "UNKNOWN",
+                },
+            )
+        auth_ready = status.get("feishu_auth_ready")
+        auth_state = (
+            "AUTH_READY"
+            if auth_ready is True
+            else "AUTH_REQUIRED"
+            if auth_ready is False
+            else "UNKNOWN"
+        )
+        return _layer(
+            HEALTHY if auth_ready is True else DEGRADED,
+            (
+                "Pinned Feishu provider and Base/IM tools are ready"
+                if auth_ready is True
+                else "Pinned Feishu provider is exposed but authorization is not ready"
+                if auth_ready is False
+                else "Pinned Feishu provider is exposed; authorization readiness is not instrumented"
+            ),
+            repair_state=(
+                "none"
+                if auth_ready is True
+                else "complete_feishu_authorization"
+                if auth_ready is False
+                else "probe_feishu_authorization"
+            ),
+            evidence={
+                "mode": "PINNED",
+                "business_tools_ready": True,
+                "auth_state": auth_state,
+            },
+        )
+
+    return _layer(
+        UNINSTRUMENTED,
+        "Feishu collaboration provider is not enabled in this release",
+        repair_state="none",
+        evidence={
+            "mode": "DISABLED",
+            "business_tools_ready": False,
+            "auth_state": "UNKNOWN",
+        },
+    )
+
+
 def project_m0_layers(
     status: dict[str, Any], *, exposure: dict[str, Any] | None = None
 ) -> dict[str, dict[str, Any]]:
@@ -375,6 +500,7 @@ def project_m0_layers(
             repair_state="rediscover_capabilities" if not mcp_ready else "none",
             evidence={"tools": sorted(tools)},
         ),
+        "collaboration": project_feishu_layer(status, tools),
         "workspace": _layer(
             DEGRADED if backend_ready and bridge_ready else BROKEN,
             "workspace isolation exists, but doctor lacks a dedicated workspace probe"

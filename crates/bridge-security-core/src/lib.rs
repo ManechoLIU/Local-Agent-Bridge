@@ -21,6 +21,9 @@ pub enum Capability {
     FileMove,
     Shell,
     ProcessJobs,
+    CollaborationRead,
+    CollaborationWrite,
+    ProviderAdmin,
     Browser,
     Computer,
 }

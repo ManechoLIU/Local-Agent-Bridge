@@ -458,6 +458,143 @@ class ProductionConnectorContractTests(unittest.TestCase):
         self.assertIn("local-agent-bridge-poc", manifest["tunnel"]["legacy_profile_names_forbidden"])
         self.assertIn("Local Bridge Identity Probe", manifest["historical_connectors_forbidden"])
 
+
+    def test_feishu_setup_release_exposes_only_admin_tools_and_provider_admin(self):
+        manifest = pc.release_manifest(
+            pc.canonical_workspace(),
+            release_revision=REVISION,
+            endpoint_generation=7,
+            feishu_admin_enabled=True,
+        )
+        self.assertNotIn("feishu_cli", manifest["runtime_dependencies"])
+        for tool in pc.FEISHU_ADMIN_TOOLS:
+            self.assertIn(tool, manifest["required_tools"])
+        for tool in pc.FEISHU_REQUIRED_TOOLS:
+            self.assertNotIn(tool, manifest["required_tools"])
+
+        layout = pc.production_layout(
+            manifest,
+            runtime_root=Path("/tmp/lab-feishu-setup-runtime"),
+            bridge_socket=Path("/tmp/lab-feishu-setup.sock"),
+        )
+        bridge_env = pc.production_component_env(
+            manifest, layout, catdesk_slug="private-slug"
+        )["bridge"]
+        self.assertIn("provider_admin", bridge_env["LAB_BRIDGE_CAPABILITIES"])
+        self.assertNotIn("collaboration_read", bridge_env["LAB_BRIDGE_CAPABILITIES"])
+        self.assertNotIn("LAB_FEISHU_CLI", bridge_env)
+
+    def test_feishu_setup_and_pinned_runtime_are_mutually_exclusive(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            cli = Path(raw_root) / "lark-cli"
+            cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            cli.chmod(0o700)
+            with self.assertRaisesRegex(RuntimeError, "setup|mutually|exclusive"):
+                pc.release_manifest(
+                    pc.canonical_workspace(),
+                    release_revision=REVISION,
+                    endpoint_generation=7,
+                    feishu_admin_enabled=True,
+                    feishu_cli_executable=cli,
+                    feishu_cli_version="1.0.96",
+                )
+
+    def test_feishu_runtime_dependency_is_optional_pinned_and_expands_bridge_surface(self):
+        plain = self._manifest()
+        self.assertNotIn("feishu_cli", plain["runtime_dependencies"])
+        plain_layout = pc.production_layout(
+            plain,
+            runtime_root=Path("/tmp/lab-feishu-plain-runtime"),
+            bridge_socket=Path("/tmp/lab-feishu-plain.sock"),
+        )
+        plain_env = pc.production_component_env(
+            plain, plain_layout, catdesk_slug="private-slug"
+        )["bridge"]
+        self.assertNotIn("LAB_FEISHU_CLI", plain_env)
+        self.assertNotIn("collaboration_read", plain_env["LAB_BRIDGE_CAPABILITIES"])
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            target = root / "lark-cli-1.0.96"
+            target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            target.chmod(0o700)
+            symlink = root / "lark-cli"
+            symlink.symlink_to(target)
+
+            manifest = pc.release_manifest(
+                pc.canonical_workspace(),
+                release_revision=REVISION,
+                endpoint_generation=7,
+                feishu_cli_executable=symlink,
+                feishu_cli_version="1.0.96",
+            )
+            dep = manifest["runtime_dependencies"]["feishu_cli"]
+            self.assertEqual(dep["path"], str(target.resolve(strict=True)))
+            self.assertEqual(dep["version"], "1.0.96")
+            self.assertEqual(dep["inode"], target.stat().st_ino)
+            self.assertEqual(dep["sha256"], pc._sha256_file(target))
+            for tool in pc.FEISHU_REQUIRED_TOOLS:
+                self.assertIn(tool, manifest["required_tools"])
+
+            layout = pc.production_layout(
+                manifest,
+                runtime_root=root / "runtime",
+                bridge_socket=root / "socket" / "bridge.sock",
+            )
+            bridge_env = pc.production_component_env(
+                manifest, layout, catdesk_slug="private-slug"
+            )["bridge"]
+            self.assertEqual(bridge_env["LAB_FEISHU_CLI"], dep["path"])
+            self.assertEqual(bridge_env["LAB_FEISHU_TIMEOUT_MS"], "30000")
+            self.assertEqual(bridge_env["LAB_FEISHU_OUTPUT_LIMIT"], str(1024 * 1024))
+            self.assertIn("collaboration_read", bridge_env["LAB_BRIDGE_CAPABILITIES"])
+            self.assertIn("collaboration_write", bridge_env["LAB_BRIDGE_CAPABILITIES"])
+
+    def test_feishu_runtime_dependency_rejects_unpinned_or_tampered_cli(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            cli = root / "lark-cli"
+            cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            cli.chmod(0o700)
+
+            with self.assertRaisesRegex(RuntimeError, "version"):
+                pc.release_manifest(
+                    pc.canonical_workspace(),
+                    release_revision=REVISION,
+                    endpoint_generation=7,
+                    feishu_cli_executable=cli,
+                    feishu_cli_version="latest",
+                )
+            with self.assertRaisesRegex(RuntimeError, "version|required"):
+                pc.release_manifest(
+                    pc.canonical_workspace(),
+                    release_revision=REVISION,
+                    endpoint_generation=7,
+                    feishu_cli_executable=cli,
+                )
+
+            manifest = pc.release_manifest(
+                pc.canonical_workspace(),
+                release_revision=REVISION,
+                endpoint_generation=7,
+                feishu_cli_executable=cli,
+                feishu_cli_version="1.0.96",
+            )
+            cli.write_text("#!/bin/sh\necho tampered\n", encoding="utf-8")
+            cli.chmod(0o700)
+            with self.assertRaisesRegex(RuntimeError, "Feishu.*pin|hash"):
+                pc._validate_runtime_dependencies(manifest)
+
+    def test_tool_surface_requires_feishu_tools_only_for_feishu_release(self):
+        base = set(pc.REQUIRED_TOOLS)
+        pc.validate_tool_surface(base)
+        with self.assertRaisesRegex(RuntimeError, "feishu_status"):
+            pc.validate_tool_surface(base, base | set(pc.FEISHU_REQUIRED_TOOLS))
+        pc.validate_tool_surface(
+            base | set(pc.FEISHU_REQUIRED_TOOLS),
+            base | set(pc.FEISHU_REQUIRED_TOOLS),
+        )
+
     def test_release_manifest_rejects_invalid_revision_or_generation(self):
         with self.assertRaises(RuntimeError):
             pc.release_manifest(pc.canonical_workspace(), release_revision="dirty", endpoint_generation=1)
