@@ -33,6 +33,9 @@ mod macos {
                 assert_eq!(shot["pid"], identity.pid);
                 assert!(shot["width"].as_u64().unwrap() <= 640);
                 assert!(shot["height"].as_u64().unwrap() <= 480);
+                assert_eq!(shot["image_sha256"].as_str().unwrap().len(), 64);
+                assert!(shot["bounds"]["width"].as_f64().unwrap() > 0.0);
+                assert!(shot["bounds"]["height"].as_f64().unwrap() > 0.0);
             } else {
                 assert!(provider.screenshot(&identity, 640, 480).is_err());
             }

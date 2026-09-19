@@ -16,6 +16,7 @@ fn compile_swift(src: &str, out_name: &str) -> PathBuf {
 fn main() {
     println!("cargo:rerun-if-changed=native/macos_helper.swift");
     println!("cargo:rerun-if-changed=native/harmless_fixture.swift");
+    println!("cargo:rerun-if-changed=native/canvas_fixture.swift");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
@@ -31,5 +32,13 @@ fn main() {
     println!(
         "cargo:rustc-env=COMPUTER_RUNTIME_HARMLESS_FIXTURE={}",
         fixture.display()
+    );
+    let canvas = compile_swift(
+        "native/canvas_fixture.swift",
+        "computer-runtime-canvas-fixture",
+    );
+    println!(
+        "cargo:rustc-env=COMPUTER_RUNTIME_CANVAS_FIXTURE={}",
+        canvas.display()
     );
 }

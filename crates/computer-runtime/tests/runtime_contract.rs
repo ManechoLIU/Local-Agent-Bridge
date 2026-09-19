@@ -102,11 +102,13 @@ impl ComputerProvider for MockProvider {
         Ok(json!({
             "window_id":window.window_id,
             "pid":window.pid,
-            "width":max_width.min(800),
-            "height":max_height.min(600),
+            "width":max_width,
+            "height":max_height,
             "mime_type":"image/png",
             "bytes":3,
-            "data_base64":"YWJj"
+            "data_base64":"YWJj",
+            "image_sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "bounds":{"x":10,"y":20,"width":800,"height":600}
         }))
     }
 
@@ -135,6 +137,44 @@ impl ComputerProvider for MockProvider {
             element.element_id, element.window_id, element.pid
         ));
         Ok(json!({"clicked":true}))
+    }
+
+    fn click_xy(
+        &self,
+        window: &WindowIdentity,
+        x: f64,
+        y: f64,
+        button: &str,
+    ) -> Result<Value, String> {
+        self.actions.lock().unwrap().push(format!(
+            "click_xy:{}:{}:{x:.3}:{y:.3}:{button}",
+            window.window_id, window.pid
+        ));
+        Ok(json!({"clicked":true,"x":x,"y":y,"button":button}))
+    }
+    fn list_displays(&self) -> Result<Value, String> {
+        self.actions.lock().unwrap().push("list_displays".into());
+        Ok(json!([{"display_id":1,"main":true,"bounds":{"x":0,"y":0,"width":1440,"height":900},"scale":2.0}]))
+    }
+    fn focus_window(&self, window: &WindowIdentity) -> Result<Value, String> {
+        self.actions.lock().unwrap().push(format!("focus:{}:{}", window.window_id, window.pid));
+        Ok(json!({"focused":true}))
+    }
+    fn move_xy(&self, window: &WindowIdentity, x: f64, y: f64) -> Result<Value, String> {
+        self.actions.lock().unwrap().push(format!("move_xy:{}:{}:{x:.3}:{y:.3}", window.window_id, window.pid));
+        Ok(json!({"moved":true,"x":x,"y":y}))
+    }
+    fn drag_xy(&self, window: &WindowIdentity, x1: f64, y1: f64, x2: f64, y2: f64) -> Result<Value, String> {
+        self.actions.lock().unwrap().push(format!("drag_xy:{}:{}:{x1:.3}:{y1:.3}:{x2:.3}:{y2:.3}", window.window_id, window.pid));
+        Ok(json!({"dragged":true}))
+    }
+    fn paste(&self, window: &WindowIdentity, text: &str) -> Result<Value, String> {
+        self.actions.lock().unwrap().push(format!("paste:{}:{}:{}", window.window_id, window.pid, text.chars().count()));
+        Ok(json!({"pasted":true,"characters":text.chars().count()}))
+    }
+    fn set_value(&self, element: &ElementIdentity, value: &str) -> Result<Value, String> {
+        self.actions.lock().unwrap().push(format!("set_value:{}:{}", element.element_id, value.chars().count()));
+        Ok(json!({"set":true}))
     }
 
     fn type_text(&self, window: &WindowIdentity, text: &str) -> Result<Value, String> {
@@ -507,6 +547,347 @@ async fn screenshot_find_click_type_key_scroll_are_window_and_element_observatio
             .count(),
         1,
         "forged element must fail before provider side effect"
+    );
+}
+
+#[tokio::test]
+async fn constrained_coordinate_click_binds_fresh_screenshot_observation() {
+    let provider = MockProvider::default();
+    let actions = Arc::clone(&provider.actions);
+    let app = ComputerRuntime::new(KEY.as_bytes(), provider)
+        .unwrap()
+        .router();
+    let (session, generation) = open_session(&app, "exec-a").await;
+
+    let window_observation = observation_id(
+        call(
+            &app,
+            "exec-a",
+            "windows",
+            "computer_list_windows",
+            json!({"session_id":session,"expected_session_generation":generation}),
+        )
+        .await,
+    )
+    .await;
+
+    let screenshot = call(
+        &app,
+        "exec-a",
+        "shot",
+        "computer_screenshot",
+        json!({
+            "session_id":session,
+            "expected_session_generation":generation,
+            "observation_id":window_observation,
+            "window_id":"wid_fixture",
+            "pid":4242,
+            "max_width":640,
+            "max_height":480
+        }),
+    )
+    .await;
+    assert_eq!(screenshot.status(), StatusCode::OK);
+    let shot = body_json(screenshot).await["result"]["structuredContent"].clone();
+    let shot_observation = shot["observation_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        shot["image_sha256"],
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(shot["width"], 640);
+    assert_eq!(shot["height"], 480);
+
+    let click = call(
+        &app,
+        "exec-a",
+        "click-at",
+        "computer_click_at",
+        json!({
+            "session_id":session,
+            "expected_session_generation":generation,
+            "observation_id":shot_observation,
+            "window_id":"wid_fixture",
+            "pid":4242,
+            "image_x":320,
+            "image_y":240
+        }),
+    )
+    .await;
+    assert_eq!(click.status(), StatusCode::OK);
+    let click_value = body_json(click).await;
+    let click_obs = click_value["result"]["structuredContent"]["observation_id"]
+        .as_str()
+        .unwrap();
+    assert_ne!(click_obs, shot_observation, "click_at must re-observe");
+    let calls = actions.lock().unwrap().clone();
+    assert!(
+        calls.iter().any(|value| value == "click_xy:wid_fixture:4242:410.625:320.625:left"),
+        "expected mapped coordinate click, got {calls:?}"
+    );
+    assert!(
+        calls.iter().filter(|value| value.starts_with("screenshot:")).count() >= 2,
+        "click_at must capture a follow-up observation, got {calls:?}"
+    );
+
+    let out_of_bounds = call(
+        &app,
+        "exec-a",
+        "click-oob",
+        "computer_click_at",
+        json!({
+            "session_id":session,
+            "expected_session_generation":generation,
+            "observation_id":shot_observation,
+            "window_id":"wid_fixture",
+            "pid":4242,
+            "image_x":640,
+            "image_y":0
+        }),
+    )
+    .await;
+    assert_eq!(out_of_bounds.status(), StatusCode::FORBIDDEN);
+
+    let wrong_window = call(
+        &app,
+        "exec-a",
+        "click-wrong-window",
+        "computer_click_at",
+        json!({
+            "session_id":session,
+            "expected_session_generation":generation,
+            "observation_id":shot_observation,
+            "window_id":"wid_other",
+            "pid":4242,
+            "image_x":1,
+            "image_y":1
+        }),
+    )
+    .await;
+    assert_eq!(wrong_window.status(), StatusCode::FORBIDDEN);
+
+    let no_frame = call(
+        &app,
+        "exec-a",
+        "click-no-frame",
+        "computer_click_at",
+        json!({
+            "session_id":session,
+            "expected_session_generation":generation,
+            "observation_id":window_observation,
+            "window_id":"wid_fixture",
+            "pid":4242,
+            "image_x":1,
+            "image_y":1
+        }),
+    )
+    .await;
+    assert_eq!(no_frame.status(), StatusCode::FORBIDDEN);
+
+    assert_eq!(
+        actions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|value| value.starts_with("click_xy:"))
+            .count(),
+        1,
+        "fail-closed click_at must not reach the provider"
+    );
+}
+
+#[tokio::test]
+async fn constrained_coordinate_click_maps_retina_pixels_through_logical_window_bounds() {
+    let provider = MockProvider::default();
+    let actions = Arc::clone(&provider.actions);
+    let app = ComputerRuntime::new(KEY.as_bytes(), provider)
+        .unwrap()
+        .router();
+    let (session, generation) = open_session(&app, "exec-a").await;
+    let window_observation = observation_id(
+        call(
+            &app,
+            "exec-a",
+            "windows",
+            "computer_list_windows",
+            json!({"session_id":session,"expected_session_generation":generation}),
+        )
+        .await,
+    )
+    .await;
+    let shot = body_json(
+        call(
+            &app,
+            "exec-a",
+            "shot",
+            "computer_screenshot",
+            json!({
+                "session_id":session,
+                "expected_session_generation":generation,
+                "observation_id":window_observation,
+                "window_id":"wid_fixture",
+                "pid":4242,
+                "max_width":1600,
+                "max_height":1200
+            }),
+        )
+        .await,
+    )
+    .await["result"]["structuredContent"]
+        .clone();
+    assert_eq!(shot["width"], 1600);
+    assert_eq!(shot["height"], 1200);
+    assert_eq!(shot["scale_x"], 0.5);
+    assert_eq!(shot["scale_y"], 0.5);
+    let click = call(
+        &app,
+        "exec-a",
+        "click-retina",
+        "computer_click_at",
+        json!({
+            "session_id":session,
+            "expected_session_generation":generation,
+            "observation_id":shot["observation_id"],
+            "window_id":"wid_fixture",
+            "pid":4242,
+            "image_x":800,
+            "image_y":600
+        }),
+    )
+    .await;
+    assert_eq!(click.status(), StatusCode::OK);
+    let calls = actions.lock().unwrap().clone();
+    assert!(
+        calls.iter().any(|value| value == "click_xy:wid_fixture:4242:410.250:320.250:left"),
+        "expected retina mapping, got {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn helper_parity_actions_are_observation_bound() {
+    let provider = MockProvider::default();
+    let actions = Arc::clone(&provider.actions);
+    let app = ComputerRuntime::new(KEY.as_bytes(), provider).unwrap().router();
+    let (session, generation) = open_session(&app, "exec-a").await;
+    let window_observation = observation_id(
+        call(&app, "exec-a", "windows", "computer_list_windows", json!({"session_id":session,"expected_session_generation":generation})).await,
+    ).await;
+    let displays = call(&app, "exec-a", "displays", "computer_list_displays", json!({"session_id":session,"expected_session_generation":generation})).await;
+    assert_eq!(displays.status(), StatusCode::OK);
+    let shot = body_json(call(&app, "exec-a", "shot", "computer_screenshot", json!({
+        "session_id":session,"expected_session_generation":generation,"observation_id":window_observation,
+        "window_id":"wid_fixture","pid":4242,"max_width":640,"max_height":480
+    })).await).await["result"]["structuredContent"].clone();
+    let shot_obs = shot["observation_id"].as_str().unwrap();
+    assert_eq!(call(&app, "exec-a", "focus", "computer_focus_window", json!({
+        "session_id":session,"expected_session_generation":generation,"observation_id":window_observation,
+        "window_id":"wid_fixture","pid":4242
+    })).await.status(), StatusCode::OK);
+    assert_eq!(call(&app, "exec-a", "move", "computer_move_at", json!({
+        "session_id":session,"expected_session_generation":generation,"observation_id":shot_obs,
+        "window_id":"wid_fixture","pid":4242,"image_x":10,"image_y":10
+    })).await.status(), StatusCode::OK);
+    assert_eq!(call(&app, "exec-a", "drag", "computer_drag_at", json!({
+        "session_id":session,"expected_session_generation":generation,"observation_id":shot_obs,
+        "window_id":"wid_fixture","pid":4242,"from_image_x":10,"from_image_y":10,"to_image_x":20,"to_image_y":20
+    })).await.status(), StatusCode::OK);
+    assert_eq!(call(&app, "exec-a", "paste", "computer_paste", json!({
+        "session_id":session,"expected_session_generation":generation,"observation_id":window_observation,
+        "window_id":"wid_fixture","pid":4242,"text":"hello"
+    })).await.status(), StatusCode::OK);
+    let find = body_json(call(&app, "exec-a", "find", "computer_find", json!({
+        "session_id":session,"expected_session_generation":generation,"observation_id":window_observation,
+        "window_id":"wid_fixture","pid":4242,"query":"Fixture","max_results":5
+    })).await).await;
+    let el_obs = find["result"]["structuredContent"]["observation_id"].as_str().unwrap();
+    assert_eq!(call(&app, "exec-a", "set", "computer_set_value", json!({
+        "session_id":session,"expected_session_generation":generation,"observation_id":el_obs,
+        "element_id":"axp:0:fixture","window_id":"wid_fixture","pid":4242,"value":"abc"
+    })).await.status(), StatusCode::OK);
+    assert_eq!(call(&app, "exec-a", "right", "computer_click_at", json!({
+        "session_id":session,"expected_session_generation":generation,"observation_id":shot_obs,
+        "window_id":"wid_fixture","pid":4242,"image_x":11,"image_y":11,"button":"right"
+    })).await.status(), StatusCode::OK);
+    let forged = call(&app, "exec-a", "drag-oob", "computer_drag_at", json!({
+        "session_id":session,"expected_session_generation":generation,"observation_id":shot_obs,
+        "window_id":"wid_fixture","pid":4242,"from_image_x":10,"from_image_y":10,"to_image_x":640,"to_image_y":0
+    })).await;
+    assert_eq!(forged.status(), StatusCode::FORBIDDEN);
+    let calls = actions.lock().unwrap().clone();
+    assert!(calls.iter().any(|v| v == "focus:wid_fixture:4242"));
+    assert!(calls.iter().any(|v| v.starts_with("move_xy:")));
+    assert!(calls.iter().any(|v| v.starts_with("drag_xy:")));
+    assert!(calls.iter().any(|v| v.starts_with("paste:")));
+    assert!(calls.iter().any(|v| v.starts_with("set_value:")));
+    assert!(calls.iter().any(|v| v.ends_with(":right")));
+}
+
+#[tokio::test]
+async fn constrained_coordinate_click_rejects_expired_screenshot_observation() {
+    let provider = MockProvider::default();
+    let actions = Arc::clone(&provider.actions);
+    let app = ComputerRuntime::new_with_observation_limits(
+        KEY.as_bytes(),
+        provider,
+        Duration::from_millis(5),
+        8,
+    )
+    .unwrap()
+    .router();
+    let (session, generation) = open_session(&app, "exec-a").await;
+    let window_observation = observation_id(
+        call(
+            &app,
+            "exec-a",
+            "windows",
+            "computer_list_windows",
+            json!({"session_id":session,"expected_session_generation":generation}),
+        )
+        .await,
+    )
+    .await;
+    let shot_observation = observation_id(
+        call(
+            &app,
+            "exec-a",
+            "shot",
+            "computer_screenshot",
+            json!({
+                "session_id":session,
+                "expected_session_generation":generation,
+                "observation_id":window_observation,
+                "window_id":"wid_fixture",
+                "pid":4242,
+                "max_width":640,
+                "max_height":480
+            }),
+        )
+        .await,
+    )
+    .await;
+    std::thread::sleep(Duration::from_millis(12));
+    let expired = call(
+        &app,
+        "exec-a",
+        "click-expired",
+        "computer_click_at",
+        json!({
+            "session_id":session,
+            "expected_session_generation":generation,
+            "observation_id":shot_observation,
+            "window_id":"wid_fixture",
+            "pid":4242,
+            "image_x":1,
+            "image_y":1
+        }),
+    )
+    .await;
+    assert_eq!(expired.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !actions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|value| value.starts_with("click_xy:"))
     );
 }
 

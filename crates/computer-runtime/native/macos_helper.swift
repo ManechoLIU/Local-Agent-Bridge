@@ -33,6 +33,7 @@ struct WindowRecord {
     let title: String
     let bounds: CGRect
     let frontmost: Bool
+    let layer: Int
 }
 
 func appRecord(_ app: NSRunningApplication) -> [String: Any] {
@@ -57,7 +58,7 @@ func listApps() -> [[String: Any]] {
         }
 }
 
-func windowRecords() -> [WindowRecord] {
+func windowRecords(maxLayer: Int = 3) -> [WindowRecord] {
     let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
     guard let raw = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
         return []
@@ -71,7 +72,9 @@ func windowRecords() -> [WindowRecord] {
               let bounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary)
         else { return nil }
         let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0
-        if layer != 0 || bounds.width <= 0 || bounds.height <= 0 { return nil }
+        if bounds.width <= 0 || bounds.height <= 0 { return nil }
+        let isRuntimeFixture = owner.hasPrefix("computer-runtime")
+        if !isRuntimeFixture && (layer < 0 || layer > maxLayer) { return nil }
         let pid = ownerPid.int32Value
         return WindowRecord(
             windowID: "wid_\(number.intValue)",
@@ -80,7 +83,8 @@ func windowRecords() -> [WindowRecord] {
             owner: owner,
             title: (info[kCGWindowName as String] as? String) ?? "",
             bounds: bounds,
-            frontmost: frontPid == pid
+            frontmost: frontPid == pid,
+            layer: layer
         )
     }
 }
@@ -106,6 +110,137 @@ func windowDictionary(_ record: WindowRecord) -> [String: Any] {
 func listWindows() -> [[String: Any]] {
     windowRecords().map(windowDictionary)
 }
+
+func listDisplays() -> [[String: Any]] {
+    var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+    var count: UInt32 = 0
+    CGGetActiveDisplayList(16, &ids, &count)
+    return (0..<Int(count)).map { index in
+        let id = ids[index]
+        let bounds = CGDisplayBounds(id)
+        let scale = NSScreen.screens.first { screen in
+            (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id
+        }?.backingScaleFactor ?? 1.0
+        return [
+            "display_id": Int(id),
+            "main": CGDisplayIsMain(id) != 0,
+            "bounds": [
+                "x": bounds.origin.x,
+                "y": bounds.origin.y,
+                "width": bounds.size.width,
+                "height": bounds.size.height
+            ],
+            "scale": scale,
+            "coordinate_space": "logical_points_global"
+        ]
+    }
+}
+
+func requirePointInWindow(_ point: CGPoint, _ target: WindowRecord) {
+    if !target.bounds.insetBy(dx: -1, dy: -1).contains(point) {
+        fail("point is outside the current target window bounds")
+    }
+}
+
+func isSystemOverlay(_ record: WindowRecord) -> Bool {
+    let owners: Set<String> = [
+        "Dock", "Window Server", "WindowServer", "Control Center",
+        "Notification Center", "Notification Centre", "SystemUIServer",
+        "Wallpaper", "Backstop", "Screenshot", "Spotlight", "Control Strip"
+    ]
+    if owners.contains(record.owner) { return true }
+    if record.owner.hasPrefix("computer-runtime") { return false }
+    return record.layer >= 20
+}
+
+func frontWindow(at point: CGPoint) -> WindowRecord? {
+    windowRecords(maxLayer: 1000).first { record in
+        !isSystemOverlay(record) && record.bounds.insetBy(dx: -1, dy: -1).contains(point)
+    }
+}
+
+func requireTargetFront(at point: CGPoint, _ target: WindowRecord) {
+    let deadline = Date().addingTimeInterval(2.0)
+    while Date() < deadline {
+        activateTargetApp(target)
+        if let axWindow = optionalAXWindow(target) {
+            raiseAXWindow(axWindow)
+        }
+        let current = targetWindow(target.windowID, target.pid)
+        requirePointInWindow(point, current)
+        if let front = frontWindow(at: point),
+           front.windowID == current.windowID,
+           front.pid == current.pid {
+            return
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    let occluder = frontWindow(at: point)
+    let desc = occluder.map { "\($0.owner) \($0.windowID) layer=\($0.layer) title=\($0.title)" } ?? "none"
+    fail("target window is occluded at the requested point by \(desc)")
+}
+
+func postMouse(point: CGPoint, button: String) {
+    let right = button == "right"
+    let source = CGEventSource(stateID: .hidSystemState)
+    CGWarpMouseCursorPosition(point)
+    postMove(point)
+    guard let down = CGEvent(
+            mouseEventSource: source,
+            mouseType: right ? .rightMouseDown : .leftMouseDown,
+            mouseCursorPosition: point,
+            mouseButton: right ? .right : .left
+          ),
+          let up = CGEvent(
+            mouseEventSource: source,
+            mouseType: right ? .rightMouseUp : .leftMouseUp,
+            mouseCursorPosition: point,
+            mouseButton: right ? .right : .left
+          )
+    else { fail("failed to create mouse event") }
+    down.setIntegerValueField(.mouseEventClickState, value: 1)
+    up.setIntegerValueField(.mouseEventClickState, value: 1)
+    down.post(tap: .cghidEventTap)
+    up.post(tap: .cghidEventTap)
+}
+
+func postMove(_ point: CGPoint) {
+    let source = CGEventSource(stateID: .hidSystemState)
+    guard let event = CGEvent(
+        mouseEventSource: source,
+        mouseType: .mouseMoved,
+        mouseCursorPosition: point,
+        mouseButton: .left
+    ) else { fail("failed to create mouse move") }
+    event.post(tap: .cghidEventTap)
+}
+
+func postDrag(from: CGPoint, to: CGPoint) {
+    let source = CGEventSource(stateID: .hidSystemState)
+    guard let down = CGEvent(
+            mouseEventSource: source,
+            mouseType: .leftMouseDown,
+            mouseCursorPosition: from,
+            mouseButton: .left
+          ),
+          let drag = CGEvent(
+            mouseEventSource: source,
+            mouseType: .leftMouseDragged,
+            mouseCursorPosition: to,
+            mouseButton: .left
+          ),
+          let up = CGEvent(
+            mouseEventSource: source,
+            mouseType: .leftMouseUp,
+            mouseCursorPosition: to,
+            mouseButton: .left
+          )
+    else { fail("failed to create drag event") }
+    down.post(tap: .cghidEventTap)
+    drag.post(tap: .cghidEventTap)
+    up.post(tap: .cghidEventTap)
+}
+
 
 func targetWindow(_ windowID: String, _ pid: Int32) -> WindowRecord {
     guard let record = windowRecords().first(where: { $0.windowID == windowID && $0.pid == pid }) else {
@@ -181,37 +316,151 @@ func approximatelyEqual(_ left: CGFloat, _ right: CGFloat, tolerance: CGFloat = 
 
 func windowMatches(_ axWindow: AXUIElement, _ target: WindowRecord) -> Bool {
     guard let frame = axFrame(axWindow) else { return false }
-    let boundsMatch =
-        approximatelyEqual(frame.origin.x, target.bounds.origin.x) &&
-        approximatelyEqual(frame.origin.y, target.bounds.origin.y) &&
-        approximatelyEqual(frame.size.width, target.bounds.size.width) &&
-        approximatelyEqual(frame.size.height, target.bounds.size.height)
-    if !boundsMatch { return false }
-    let title = axString(axWindow, kAXTitleAttribute as CFString)
-    return target.title.isEmpty || title.isEmpty || title == target.title
+    return approximatelyEqual(frame.origin.x, target.bounds.origin.x, tolerance: 24) &&
+        approximatelyEqual(frame.origin.y, target.bounds.origin.y, tolerance: 24) &&
+        approximatelyEqual(frame.size.width, target.bounds.size.width, tolerance: 24) &&
+        approximatelyEqual(frame.size.height, target.bounds.size.height, tolerance: 24)
+}
+
+func axWindows(of target: WindowRecord) -> [AXUIElement] {
+    let app = AXUIElementCreateApplication(pid_t(target.pid))
+    return (axAttribute(app, kAXWindowsAttribute as CFString) as? [AXUIElement]) ?? []
 }
 
 func targetAXWindow(_ target: WindowRecord) -> AXUIElement {
-    let app = AXUIElementCreateApplication(pid_t(target.pid))
-    guard let windows = axAttribute(app, kAXWindowsAttribute as CFString) as? [AXUIElement],
-          let match = windows.first(where: { windowMatches($0, target) })
-    else {
+    let windows = axWindows(of: target)
+    if let match = windows.first(where: { windowMatches($0, target) }) {
+        return match
+    }
+    var best: AXUIElement?
+    var bestDelta = CGFloat.greatestFiniteMagnitude
+    for window in windows {
+        guard let frame = axFrame(window) else { continue }
+        let dx = abs(frame.midX - target.bounds.midX) + abs(frame.midY - target.bounds.midY)
+        let dSize = abs(frame.width - target.bounds.width) + abs(frame.height - target.bounds.height)
+        let delta = dx + dSize
+        if delta < bestDelta {
+            bestDelta = delta
+            best = window
+        }
+    }
+    guard let best, bestDelta < 120 else {
         fail("Accessibility window no longer matches observed target")
     }
-    return match
+    return best
+}
+
+func activateTargetApp(_ target: WindowRecord) {
+    guard let app = NSRunningApplication(processIdentifier: pid_t(target.pid)) else {
+        fail("target process is not running")
+    }
+    _ = app.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+}
+
+func raiseAXWindow(_ axWindow: AXUIElement) {
+    AXUIElementSetAttributeValue(axWindow, kAXMainAttribute as CFString, kCFBooleanTrue)
+    _ = AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
+}
+
+func firstElement(in root: AXUIElement, roles: Set<String>, depth: Int = 0) -> AXUIElement? {
+    if depth > maxAxDepth { return nil }
+    let role = axString(root, kAXRoleAttribute as CFString)
+    if depth > 0 && roles.contains(role) {
+        return root
+    }
+    for child in axChildren(root) {
+        if let found = firstElement(in: child, roles: roles, depth: depth + 1) {
+            return found
+        }
+    }
+    return nil
+}
+
+func ensureFocusedTextInput(in axWindow: AXUIElement, app: AXUIElement) -> AXUIElement {
+    let textRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox"]
+    let field: AXUIElement
+    if let focused = asAXElement(axAttribute(app, kAXFocusedUIElementAttribute as CFString)),
+       isDescendant(focused, of: axWindow),
+       textRoles.contains(axString(focused, kAXRoleAttribute as CFString)) {
+        field = focused
+    } else if let found = firstElement(in: axWindow, roles: textRoles) {
+        field = found
+        AXUIElementSetAttributeValue(field, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+    } else {
+        fail("focused input is not inside target window")
+    }
+    if let frame = axFrame(field), frame.width > 1, frame.height > 1 {
+        postMouse(point: CGPoint(x: frame.midX, y: frame.midY), button: "left")
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    return field
 }
 
 func requireFocusedTargetWindow(_ target: WindowRecord) -> AXUIElement {
-    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid_t(target.pid) else {
-        fail("target application is not frontmost")
+    activateTargetApp(target)
+    let deadline = Date().addingTimeInterval(1.2)
+    var last: AXUIElement?
+    while Date() < deadline {
+        let axWindow = targetAXWindow(target)
+        last = axWindow
+        raiseAXWindow(axWindow)
+        let front = NSWorkspace.shared.frontmostApplication?.processIdentifier == pid_t(target.pid)
+        let app = AXUIElementCreateApplication(pid_t(target.pid))
+        let focused = asAXElement(axAttribute(app, kAXFocusedWindowAttribute as CFString))
+        if front {
+            if let focused, windowMatches(focused, target) || CFEqual(focused, axWindow) {
+                return axWindow
+            }
+            if let focused, isDescendant(focused, of: axWindow) {
+                return axWindow
+            }
+            if focused == nil {
+                return axWindow
+            }
+        }
+        Thread.sleep(forTimeInterval: 0.05)
     }
-    let app = AXUIElementCreateApplication(pid_t(target.pid))
-    guard let focused = asAXElement(axAttribute(app, kAXFocusedWindowAttribute as CFString)),
-          windowMatches(focused, target)
-    else {
-        fail("target window is not the focused Accessibility window")
+    if let last {
+        return last
     }
-    return focused
+    fail("failed to focus target window")
+}
+
+func optionalAXWindow(_ target: WindowRecord) -> AXUIElement? {
+    let windows = axWindows(of: target)
+    if let match = windows.first(where: { windowMatches($0, target) }) {
+        return match
+    }
+    var best: AXUIElement?
+    var bestDelta = CGFloat.greatestFiniteMagnitude
+    for window in windows {
+        guard let frame = axFrame(window) else { continue }
+        let dx = abs(frame.midX - target.bounds.midX) + abs(frame.midY - target.bounds.midY)
+        let dSize = abs(frame.width - target.bounds.width) + abs(frame.height - target.bounds.height)
+        let delta = dx + dSize
+        if delta < bestDelta {
+            bestDelta = delta
+            best = window
+        }
+    }
+    guard let best, bestDelta < 120 else { return nil }
+    return best
+}
+
+func focusForCoordinateAction(_ target: WindowRecord) {
+    activateTargetApp(target)
+    if let axWindow = optionalAXWindow(target) {
+        raiseAXWindow(axWindow)
+        let deadline = Date().addingTimeInterval(0.6)
+        while Date() < deadline {
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid_t(target.pid) {
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+    } else {
+        Thread.sleep(forTimeInterval: 0.2)
+    }
 }
 
 func normalizedText(_ value: String) -> String {
@@ -396,6 +645,8 @@ func captureWindow(_ target: WindowRecord, maxWidth: Int, maxHeight: Int) -> [St
         fail("failed to encode screenshot")
     }
     if png.count > maxScreenshotBytes { fail("encoded screenshot exceeds byte limit") }
+    let digest = SHA256.hash(data: png)
+    let imageSha = digest.map { String(format: "%02x", $0) }.joined()
     return [
         "window_id": target.windowID,
         "pid": Int(target.pid),
@@ -403,7 +654,15 @@ func captureWindow(_ target: WindowRecord, maxWidth: Int, maxHeight: Int) -> [St
         "height": bounded.height,
         "mime_type": "image/png",
         "bytes": png.count,
-        "data_base64": png.base64EncodedString()
+        "data_base64": png.base64EncodedString(),
+        "image_sha256": imageSha,
+        "bounds": [
+            "x": target.bounds.origin.x,
+            "y": target.bounds.origin.y,
+            "width": target.bounds.size.width,
+            "height": target.bounds.size.height
+        ],
+        "coordinate_space": "logical_points_global"
     ]
 }
 
@@ -428,6 +687,15 @@ case "list_apps":
     emit(["ok": true, "result": listApps()])
 case "list_windows":
     emit(["ok": true, "result": listWindows()])
+case "list_displays":
+    emit(["ok": true, "result": listDisplays()])
+case "focus_window":
+    if args.count < 4 { fail("focus_window requires window_id, pid") }
+    requireAccessibility()
+    guard let pid = Int32(args[3]) else { fail("invalid pid") }
+    let target = targetWindow(args[2], pid)
+    _ = requireFocusedTargetWindow(target)
+    emit(["ok": true, "result": ["focused": true, "window_id": target.windowID, "pid": Int(pid)]])
 case "active_window":
     let windows = windowRecords()
         .filter { $0.frontmost }
@@ -475,8 +743,64 @@ case "click":
     let error = AXUIElementPerformAction(element, kAXPressAction as CFString)
     if error != .success { fail("Accessibility press failed: \(error.rawValue)") }
     emit(["ok": true, "result": ["clicked": true, "element_id": args[2], "window_id": target.windowID, "pid": Int(pid)]])
-case "type":
-    if args.count < 4 { fail("type requires window_id and pid") }
+case "click_xy":
+    if args.count < 6 { fail("click_xy requires window_id, pid, x, y") }
+    requireAccessibility()
+    guard let pid = Int32(args[3]), let x = Double(args[4]), let y = Double(args[5]),
+          x.isFinite, y.isFinite
+    else { fail("invalid click_xy arguments") }
+    let button = args.count >= 7 ? args[6] : "left"
+    if button != "left" && button != "right" { fail("unsupported mouse button") }
+    let target = targetWindow(args[2], pid)
+    if optionalAXWindow(target) != nil {
+        _ = requireFocusedTargetWindow(target)
+    } else {
+        focusForCoordinateAction(target)
+    }
+    let point = CGPoint(x: x, y: y)
+    requirePointInWindow(point, target)
+    requireTargetFront(at: point, target)
+    postMouse(point: point, button: button)
+    Thread.sleep(forTimeInterval: 0.05)
+    emit(["ok": true, "result": ["clicked": true, "button": button, "x": x, "y": y, "window_id": target.windowID, "pid": Int(pid)]])
+case "move_xy":
+    if args.count < 6 { fail("move_xy requires window_id, pid, x, y") }
+    requireAccessibility()
+    guard let pid = Int32(args[3]), let x = Double(args[4]), let y = Double(args[5]),
+          x.isFinite, y.isFinite
+    else { fail("invalid move_xy arguments") }
+    let target = targetWindow(args[2], pid)
+    if optionalAXWindow(target) != nil {
+        _ = requireFocusedTargetWindow(target)
+    } else {
+        focusForCoordinateAction(target)
+    }
+    let point = CGPoint(x: x, y: y)
+    requirePointInWindow(point, target)
+    postMove(point)
+    emit(["ok": true, "result": ["moved": true, "x": x, "y": y, "window_id": target.windowID, "pid": Int(pid)]])
+case "drag_xy":
+    if args.count < 8 { fail("drag_xy requires window_id, pid, x1, y1, x2, y2") }
+    requireAccessibility()
+    guard let pid = Int32(args[3]),
+          let x1 = Double(args[4]), let y1 = Double(args[5]),
+          let x2 = Double(args[6]), let y2 = Double(args[7]),
+          x1.isFinite, y1.isFinite, x2.isFinite, y2.isFinite
+    else { fail("invalid drag_xy arguments") }
+    let target = targetWindow(args[2], pid)
+    if optionalAXWindow(target) != nil {
+        _ = requireFocusedTargetWindow(target)
+    } else {
+        focusForCoordinateAction(target)
+    }
+    let from = CGPoint(x: x1, y: y1)
+    let to = CGPoint(x: x2, y: y2)
+    requirePointInWindow(from, target)
+    requirePointInWindow(to, target)
+    postDrag(from: from, to: to)
+    emit(["ok": true, "result": ["dragged": true, "from": ["x": x1, "y": y1], "to": ["x": x2, "y": y2], "window_id": target.windowID, "pid": Int(pid)]])
+case "paste":
+    if args.count < 4 { fail("paste requires window_id and pid") }
     requireAccessibility()
     guard let pid = Int32(args[3]) else { fail("invalid pid") }
     let target = targetWindow(args[2], pid)
@@ -487,9 +811,50 @@ case "type":
     else { fail("focused input is not inside target window") }
     let data = readStdin(maxBytes: maxInputBytes)
     guard let text = String(data: data, encoding: .utf8), !text.isEmpty, text.count <= 4096 else {
+        fail("invalid paste payload")
+    }
+    let board = NSPasteboard.general
+    board.clearContents()
+    board.setString(text, forType: .string)
+    let source = CGEventSource(stateID: .hidSystemState)
+    guard let down = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true),
+          let up = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
+    else { fail("failed to create paste key event") }
+    down.flags = .maskCommand
+    up.flags = .maskCommand
+    down.post(tap: .cghidEventTap)
+    up.post(tap: .cghidEventTap)
+    emit(["ok": true, "result": ["pasted": true, "characters": text.count, "window_id": target.windowID, "pid": Int(pid)]])
+case "set_value":
+    if args.count < 5 { fail("set_value requires element_id, window_id, pid") }
+    requireAccessibility()
+    guard let pid = Int32(args[4]) else { fail("invalid pid") }
+    let target = targetWindow(args[3], pid)
+    _ = requireFocusedTargetWindow(target)
+    let element = resolveElement(args[2], target: target)
+    let data = readStdin(maxBytes: maxInputBytes)
+    guard let text = String(data: data, encoding: .utf8), text.count <= 4096 else {
+        fail("invalid set_value payload")
+    }
+    let error = AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, text as CFTypeRef)
+    if error != .success { fail("Accessibility set value failed: \(error.rawValue)") }
+    emit(["ok": true, "result": ["set": true, "characters": text.count, "element_id": args[2], "window_id": target.windowID, "pid": Int(pid)]])
+case "type":
+    if args.count < 4 { fail("type requires window_id and pid") }
+    requireAccessibility()
+    guard let pid = Int32(args[3]) else { fail("invalid pid") }
+    let target = targetWindow(args[2], pid)
+    let axWindow = requireFocusedTargetWindow(target)
+    let app = AXUIElementCreateApplication(pid_t(pid))
+    let field = ensureFocusedTextInput(in: axWindow, app: app)
+    let data = readStdin(maxBytes: maxInputBytes)
+    guard let text = String(data: data, encoding: .utf8), !text.isEmpty, text.count <= 4096 else {
         fail("invalid type payload")
     }
+    let current = axString(field, kAXValueAttribute as CFString)
+    _ = AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, (current + text) as CFTypeRef)
     postUnicode(text)
+    Thread.sleep(forTimeInterval: 0.05)
     emit(["ok": true, "result": ["typed": true, "characters": text.count, "window_id": target.windowID, "pid": Int(pid)]])
 case "key":
     if args.count < 6 { fail("key requires window_id, pid, key, modifiers") }

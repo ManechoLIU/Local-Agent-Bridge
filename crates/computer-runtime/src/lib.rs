@@ -79,6 +79,46 @@ pub trait ComputerProvider: Send + Sync + 'static {
         let _ = element;
         Err("click is not implemented by provider".into())
     }
+    fn click_xy(
+        &self,
+        window: &WindowIdentity,
+        x: f64,
+        y: f64,
+        button: &str,
+    ) -> Result<Value, String> {
+        let _ = (window, x, y, button);
+        Err("click_xy is not implemented by provider".into())
+    }
+    fn list_displays(&self) -> Result<Value, String> {
+        Err("list_displays is not implemented by provider".into())
+    }
+    fn focus_window(&self, window: &WindowIdentity) -> Result<Value, String> {
+        let _ = window;
+        Err("focus_window is not implemented by provider".into())
+    }
+    fn move_xy(&self, window: &WindowIdentity, x: f64, y: f64) -> Result<Value, String> {
+        let _ = (window, x, y);
+        Err("move_xy is not implemented by provider".into())
+    }
+    fn drag_xy(
+        &self,
+        window: &WindowIdentity,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    ) -> Result<Value, String> {
+        let _ = (window, x1, y1, x2, y2);
+        Err("drag_xy is not implemented by provider".into())
+    }
+    fn paste(&self, window: &WindowIdentity, text: &str) -> Result<Value, String> {
+        let _ = (window, text);
+        Err("paste is not implemented by provider".into())
+    }
+    fn set_value(&self, element: &ElementIdentity, value: &str) -> Result<Value, String> {
+        let _ = (element, value);
+        Err("set_value is not implemented by provider".into())
+    }
     fn type_text(&self, window: &WindowIdentity, text: &str) -> Result<Value, String> {
         let _ = (window, text);
         Err("type is not implemented by provider".into())
@@ -216,6 +256,69 @@ impl ComputerProvider for NativeMacProvider {
     fn click(&self, e: &ElementIdentity) -> Result<Value, String> {
         self.helper(&["click", &e.element_id, &e.window_id, &e.pid.to_string()])
     }
+    fn click_xy(
+        &self,
+        w: &WindowIdentity,
+        x: f64,
+        y: f64,
+        button: &str,
+    ) -> Result<Value, String> {
+        self.helper(&[
+            "click_xy",
+            &w.window_id,
+            &w.pid.to_string(),
+            &format!("{x:.3}"),
+            &format!("{y:.3}"),
+            button,
+        ])
+    }
+    fn list_displays(&self) -> Result<Value, String> {
+        self.helper(&["list_displays"])
+    }
+    fn focus_window(&self, w: &WindowIdentity) -> Result<Value, String> {
+        self.helper(&["focus_window", &w.window_id, &w.pid.to_string()])
+    }
+    fn move_xy(&self, w: &WindowIdentity, x: f64, y: f64) -> Result<Value, String> {
+        self.helper(&[
+            "move_xy",
+            &w.window_id,
+            &w.pid.to_string(),
+            &format!("{x:.3}"),
+            &format!("{y:.3}"),
+        ])
+    }
+    fn drag_xy(
+        &self,
+        w: &WindowIdentity,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    ) -> Result<Value, String> {
+        self.helper(&[
+            "drag_xy",
+            &w.window_id,
+            &w.pid.to_string(),
+            &format!("{x1:.3}"),
+            &format!("{y1:.3}"),
+            &format!("{x2:.3}"),
+            &format!("{y2:.3}"),
+        ])
+    }
+    fn paste(&self, w: &WindowIdentity, text: &str) -> Result<Value, String> {
+        self.helper_stdin(&["paste", &w.window_id, &w.pid.to_string()], text.as_bytes())
+    }
+    fn set_value(&self, e: &ElementIdentity, value: &str) -> Result<Value, String> {
+        self.helper_stdin(
+            &[
+                "set_value",
+                &e.element_id,
+                &e.window_id,
+                &e.pid.to_string(),
+            ],
+            value.as_bytes(),
+        )
+    }
     fn type_text(&self, w: &WindowIdentity, text: &str) -> Result<Value, String> {
         self.helper_stdin(&["type", &w.window_id, &w.pid.to_string()], text.as_bytes())
     }
@@ -255,12 +358,32 @@ struct ComputerSession {
 }
 
 #[derive(Clone, Debug)]
+struct Rect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+#[derive(Clone, Debug)]
+struct ScreenshotFrame {
+    image_sha256: String,
+    image_width: u32,
+    image_height: u32,
+    window: WindowIdentity,
+    bounds: Rect,
+    scale_x: f64,
+    scale_y: f64,
+}
+
+#[derive(Clone, Debug)]
 struct Observation {
     id: String,
     created: Instant,
     apps: Vec<AppIdentity>,
     windows: Vec<WindowIdentity>,
     elements: Vec<ElementIdentity>,
+    screenshot: Option<ScreenshotFrame>,
 }
 
 struct RuntimeInner<P: ComputerProvider> {
@@ -268,6 +391,7 @@ struct RuntimeInner<P: ComputerProvider> {
     provider: P,
     sessions: Mutex<HashMap<String, ComputerSession>>,
     observation_ttl: Duration,
+    screenshot_ttl: Duration,
     max_observations: usize,
 }
 
@@ -295,7 +419,8 @@ impl<P: ComputerProvider> ComputerRuntime<P> {
                 backend_key_sha256,
                 provider,
                 sessions: Mutex::new(HashMap::new()),
-                observation_ttl: Duration::from_secs(30),
+                observation_ttl: Duration::from_secs(180),
+                screenshot_ttl: Duration::from_secs(45),
                 max_observations: 32,
             }),
         })
@@ -313,6 +438,7 @@ impl<P: ComputerProvider> ComputerRuntime<P> {
         let runtime = Self::new(backend_key, provider)?;
         let mut inner = Arc::try_unwrap(runtime.inner).map_err(|_| "unexpected shared runtime")?;
         inner.observation_ttl = ttl;
+        inner.screenshot_ttl = ttl;
         inner.max_observations = max;
         Ok(Self {
             inner: Arc::new(inner),
@@ -473,6 +599,7 @@ async fn call_tool<P: ComputerProvider>(
                     apps: identities,
                     windows: vec![],
                     elements: vec![],
+                    screenshot: None,
                 },
             )
             .await?;
@@ -500,6 +627,7 @@ async fn call_tool<P: ComputerProvider>(
                     apps: vec![],
                     windows: identities,
                     elements: vec![],
+                    screenshot: None,
                 },
             )
             .await?;
@@ -531,6 +659,7 @@ async fn call_tool<P: ComputerProvider>(
                     apps: vec![],
                     windows: identities,
                     elements: vec![],
+                    screenshot: None,
                 },
             )
             .await?;
@@ -589,11 +718,49 @@ async fn call_tool<P: ComputerProvider>(
                     let max_width = bounded_u32(arguments, "max_width", 1, 4096)?;
                     let max_height = bounded_u32(arguments, "max_height", 1, 4096)?;
                     require_provider_permission(runtime, "screen_recording")?;
-                    runtime
+                    let shot = runtime
                         .inner
                         .provider
                         .screenshot(&window, max_width, max_height)
-                        .map_err(ToolError::Provider)
+                        .map_err(ToolError::Provider)?;
+                    let frame = screenshot_frame_from_provider(&shot, &window)?;
+                    let new_id = format!("obs_{}", Uuid::new_v4());
+                    let session = sessions.get_mut(session_id).ok_or_else(|| {
+                        ToolError::Forbidden("unknown or closed Computer session".into())
+                    })?;
+                    push_observation(
+                        session,
+                        runtime.inner.max_observations,
+                        Observation {
+                            id: new_id.clone(),
+                            created: Instant::now(),
+                            apps: vec![],
+                            windows: vec![window.clone()],
+                            elements: vec![],
+                            screenshot: Some(frame.clone()),
+                        },
+                    );
+                    Ok(json!({
+                        "session_id": session_id,
+                        "observation_id": new_id,
+                        "window_id": window.window_id,
+                        "pid": window.pid,
+                        "width": frame.image_width,
+                        "height": frame.image_height,
+                        "mime_type": shot.get("mime_type").cloned().unwrap_or(json!("image/png")),
+                        "bytes": shot.get("bytes").cloned().unwrap_or(Value::Null),
+                        "data_base64": shot.get("data_base64").cloned().unwrap_or(Value::Null),
+                        "image_sha256": frame.image_sha256,
+                        "scale_x": frame.scale_x,
+                        "scale_y": frame.scale_y,
+                        "coordinate_space": "logical_points_global",
+                        "bounds": {
+                            "x": frame.bounds.x,
+                            "y": frame.bounds.y,
+                            "width": frame.bounds.width,
+                            "height": frame.bounds.height
+                        }
+                    }))
                 }
                 "computer_find" => {
                     let query = bounded_text(arguments, "query", 256)?;
@@ -618,6 +785,7 @@ async fn call_tool<P: ComputerProvider>(
                             apps: vec![],
                             windows: vec![window.clone()],
                             elements,
+                            screenshot: None,
                         },
                     );
                     Ok(json!({"session_id":session_id,"observation_id":new_id,"elements":found}))
@@ -679,6 +847,207 @@ async fn call_tool<P: ComputerProvider>(
                 .inner
                 .provider
                 .click(&element)
+                .map_err(ToolError::Provider)
+        }
+        "computer_click_at" => {
+            let session_id = string_arg(arguments, "session_id")?;
+            let generation = generation_arg(arguments)?;
+            let observation_id = string_arg(arguments, "observation_id")?;
+            let window = WindowIdentity {
+                window_id: string_arg(arguments, "window_id")?.into(),
+                pid: i32_arg(arguments, "pid")?,
+            };
+            let image_x = image_coord(arguments, "image_x")?;
+            let image_y = image_coord(arguments, "image_y")?;
+            let button = click_button(arguments)?;
+            let (screen_x, screen_y, frame) = {
+                let sessions = runtime.inner.sessions.lock().await;
+                let session = ensure_session_owner(&sessions, session_id, generation, binding)?;
+                let observed = fresh_screenshot_observation(
+                    session,
+                    observation_id,
+                    runtime.inner.observation_ttl,
+                    runtime.inner.screenshot_ttl,
+                )?;
+                let (x, y) = map_click_at(observed, &window, image_x, image_y)?;
+                let frame = observed
+                    .screenshot
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| {
+                        ToolError::Forbidden("observation does not contain a screenshot frame".into())
+                    })?;
+                (x, y, frame)
+            };
+            require_provider_permission(runtime, "accessibility")?;
+            let clicked = runtime
+                .inner
+                .provider
+                .click_xy(&window, screen_x, screen_y, &button)
+                .map_err(ToolError::Provider)?;
+            let shot = runtime
+                .inner
+                .provider
+                .screenshot(&window, frame.image_width, frame.image_height)
+                .map_err(ToolError::Provider)?;
+            let new_frame = screenshot_frame_from_provider(&shot, &window)?;
+            let new_id = format!("obs_{}", Uuid::new_v4());
+            store_observation(
+                runtime,
+                session_id,
+                generation,
+                binding,
+                Observation {
+                    id: new_id.clone(),
+                    created: Instant::now(),
+                    apps: vec![],
+                    windows: vec![window.clone()],
+                    elements: vec![],
+                    screenshot: Some(new_frame.clone()),
+                },
+            )
+            .await?;
+            Ok(json!({
+                "clicked": true,
+                "button": button,
+                "x": screen_x,
+                "y": screen_y,
+                "session_id": session_id,
+                "observation_id": new_id,
+                "window_id": window.window_id,
+                "pid": window.pid,
+                "image_sha256": new_frame.image_sha256,
+                "result": clicked
+            }))
+        }
+        "computer_list_displays" => {
+            let session_id = string_arg(arguments, "session_id")?;
+            let generation = generation_arg(arguments)?;
+            ensure_session(&runtime.inner.sessions, session_id, generation, binding).await?;
+            runtime
+                .inner
+                .provider
+                .list_displays()
+                .map_err(ToolError::Provider)
+        }
+        "computer_focus_window"
+        | "computer_paste" => {
+            let session_id = string_arg(arguments, "session_id")?;
+            let generation = generation_arg(arguments)?;
+            let observation_id = string_arg(arguments, "observation_id")?;
+            let window = WindowIdentity {
+                window_id: string_arg(arguments, "window_id")?.into(),
+                pid: i32_arg(arguments, "pid")?,
+            };
+            {
+                let sessions = runtime.inner.sessions.lock().await;
+                let session = ensure_session_owner(&sessions, session_id, generation, binding)?;
+                let observed =
+                    fresh_observation(session, observation_id, runtime.inner.observation_ttl)?;
+                if !observed.windows.contains(&window) {
+                    return Err(ToolError::Forbidden(
+                        "target window was not present in the referenced session observation"
+                            .into(),
+                    ));
+                }
+            }
+            require_provider_permission(runtime, "accessibility")?;
+            if name == "computer_paste" {
+                let text = bounded_text(arguments, "text", 4096)?;
+                runtime
+                    .inner
+                    .provider
+                    .paste(&window, text)
+                    .map_err(ToolError::Provider)
+            } else {
+                runtime
+                    .inner
+                    .provider
+                    .focus_window(&window)
+                    .map_err(ToolError::Provider)
+            }
+        }
+        "computer_move_at" | "computer_drag_at" => {
+            let session_id = string_arg(arguments, "session_id")?;
+            let generation = generation_arg(arguments)?;
+            let observation_id = string_arg(arguments, "observation_id")?;
+            let window = WindowIdentity {
+                window_id: string_arg(arguments, "window_id")?.into(),
+                pid: i32_arg(arguments, "pid")?,
+            };
+            if name == "computer_move_at" {
+                let image_x = image_coord(arguments, "image_x")?;
+                let image_y = image_coord(arguments, "image_y")?;
+                let (screen_x, screen_y) = {
+                    let sessions = runtime.inner.sessions.lock().await;
+                    let session = ensure_session_owner(&sessions, session_id, generation, binding)?;
+                    let observed = fresh_screenshot_observation(
+                        session,
+                        observation_id,
+                        runtime.inner.observation_ttl,
+                        runtime.inner.screenshot_ttl,
+                    )?;
+                    map_click_at(observed, &window, image_x, image_y)?
+                };
+                require_provider_permission(runtime, "accessibility")?;
+                runtime
+                    .inner
+                    .provider
+                    .move_xy(&window, screen_x, screen_y)
+                    .map_err(ToolError::Provider)
+            } else {
+                let from_x = image_coord(arguments, "from_image_x")?;
+                let from_y = image_coord(arguments, "from_image_y")?;
+                let to_x = image_coord(arguments, "to_image_x")?;
+                let to_y = image_coord(arguments, "to_image_y")?;
+                let (x1, y1, x2, y2) = {
+                    let sessions = runtime.inner.sessions.lock().await;
+                    let session = ensure_session_owner(&sessions, session_id, generation, binding)?;
+                    let observed = fresh_screenshot_observation(
+                        session,
+                        observation_id,
+                        runtime.inner.observation_ttl,
+                        runtime.inner.screenshot_ttl,
+                    )?;
+                    let (x1, y1) = map_click_at(observed, &window, from_x, from_y)?;
+                    let (x2, y2) = map_click_at(observed, &window, to_x, to_y)?;
+                    (x1, y1, x2, y2)
+                };
+                require_provider_permission(runtime, "accessibility")?;
+                runtime
+                    .inner
+                    .provider
+                    .drag_xy(&window, x1, y1, x2, y2)
+                    .map_err(ToolError::Provider)
+            }
+        }
+        "computer_set_value" => {
+            let session_id = string_arg(arguments, "session_id")?;
+            let generation = generation_arg(arguments)?;
+            let observation_id = string_arg(arguments, "observation_id")?;
+            let element = ElementIdentity {
+                element_id: string_arg(arguments, "element_id")?.into(),
+                window_id: string_arg(arguments, "window_id")?.into(),
+                pid: i32_arg(arguments, "pid")?,
+            };
+            let value = bounded_text(arguments, "value", 4096)?;
+            {
+                let sessions = runtime.inner.sessions.lock().await;
+                let session = ensure_session_owner(&sessions, session_id, generation, binding)?;
+                let observed =
+                    fresh_observation(session, observation_id, runtime.inner.observation_ttl)?;
+                if !observed.elements.contains(&element) {
+                    return Err(ToolError::Forbidden(
+                        "target element was not present in the referenced session observation"
+                            .into(),
+                    ));
+                }
+            }
+            require_provider_permission(runtime, "accessibility")?;
+            runtime
+                .inner
+                .provider
+                .set_value(&element, value)
                 .map_err(ToolError::Provider)
         }
         _ => Err(ToolError::Forbidden(format!(
@@ -885,6 +1254,140 @@ fn element_identities(
         })
         .collect()
 }
+fn json_f64(value: &Value, name: &str) -> Result<f64, ToolError> {
+    value
+        .get(name)
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite())
+        .ok_or_else(|| ToolError::Provider(format!("screenshot is missing {name}")))
+}
+
+fn parse_bounds(value: &Value) -> Result<Rect, ToolError> {
+    let bounds = value
+        .get("bounds")
+        .ok_or_else(|| ToolError::Provider("screenshot is missing bounds".into()))?;
+    let rect = Rect {
+        x: json_f64(bounds, "x")?,
+        y: json_f64(bounds, "y")?,
+        width: json_f64(bounds, "width")?,
+        height: json_f64(bounds, "height")?,
+    };
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return Err(ToolError::Provider(
+            "screenshot window bounds must be positive".into(),
+        ));
+    }
+    Ok(rect)
+}
+
+fn screenshot_frame_from_provider(
+    shot: &Value,
+    window: &WindowIdentity,
+) -> Result<ScreenshotFrame, ToolError> {
+    let image_width = shot
+        .get("width")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ToolError::Provider("screenshot is missing width".into()))?;
+    let image_height = shot
+        .get("height")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ToolError::Provider("screenshot is missing height".into()))?;
+    let image_width = u32::try_from(image_width)
+        .map_err(|_| ToolError::Provider("invalid screenshot width".into()))?;
+    let image_height = u32::try_from(image_height)
+        .map_err(|_| ToolError::Provider("invalid screenshot height".into()))?;
+    if image_width == 0 || image_height == 0 {
+        return Err(ToolError::Provider(
+            "screenshot image size must be positive".into(),
+        ));
+    }
+    let image_sha256 = shot
+        .get("image_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::Provider("screenshot is missing image_sha256".into()))?;
+    if image_sha256.len() != 64 || !image_sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ToolError::Provider(
+            "screenshot image_sha256 is not a SHA-256 hex digest".into(),
+        ));
+    }
+    let shot_window = WindowIdentity {
+        window_id: shot
+            .get("window_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::Provider("screenshot is missing window_id".into()))?
+            .into(),
+        pid: i32::try_from(
+            shot.get("pid")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| ToolError::Provider("screenshot is missing pid".into()))?,
+        )
+        .map_err(|_| ToolError::Provider("invalid screenshot pid".into()))?,
+    };
+    if &shot_window != window {
+        return Err(ToolError::Provider(
+            "screenshot window identity does not match the requested window".into(),
+        ));
+    }
+    let bounds = parse_bounds(shot)?;
+    Ok(ScreenshotFrame {
+        image_sha256: image_sha256.to_ascii_lowercase(),
+        image_width,
+        image_height,
+        window: window.clone(),
+        bounds: bounds.clone(),
+        scale_x: bounds.width / f64::from(image_width),
+        scale_y: bounds.height / f64::from(image_height),
+    })
+}
+
+fn click_button(arguments: &Value) -> Result<String, ToolError> {
+    match arguments.get("button") {
+        None => Ok("left".into()),
+        Some(Value::String(value)) if value == "left" || value == "right" => Ok(value.clone()),
+        _ => Err(ToolError::BadRequest("unsupported mouse button".into())),
+    }
+}
+
+fn image_coord(arguments: &Value, name: &str) -> Result<u32, ToolError> {
+    let raw = arguments
+        .get(name)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| ToolError::BadRequest(format!("missing argument: {name}")))?;
+    if raw < 0 {
+        return Err(ToolError::BadRequest(format!("invalid argument: {name}")));
+    }
+    u32::try_from(raw).map_err(|_| ToolError::BadRequest(format!("invalid argument: {name}")))
+}
+
+fn map_click_at(
+    observed: &Observation,
+    window: &WindowIdentity,
+    image_x: u32,
+    image_y: u32,
+) -> Result<(f64, f64), ToolError> {
+    let frame = observed.screenshot.as_ref().ok_or_else(|| {
+        ToolError::Forbidden("observation does not contain a screenshot frame".into())
+    })?;
+    if &frame.window != window {
+        return Err(ToolError::Forbidden(
+            "screenshot observation is bound to a different window".into(),
+        ));
+    }
+    if image_x >= frame.image_width || image_y >= frame.image_height {
+        return Err(ToolError::Forbidden(
+            "click coordinates are outside the screenshot observation".into(),
+        ));
+    }
+    if frame.scale_x <= 0.0 || frame.scale_y <= 0.0 {
+        return Err(ToolError::Forbidden(
+            "screenshot observation has invalid coordinate scale".into(),
+        ));
+    }
+    let screen_x = frame.bounds.x + (f64::from(image_x) + 0.5) * frame.scale_x;
+    let screen_y = frame.bounds.y + (f64::from(image_y) + 0.5) * frame.scale_y;
+    Ok((screen_x, screen_y))
+}
+
 fn fresh_observation<'a>(
     session: &'a ComputerSession,
     id: &str,
@@ -899,6 +1402,19 @@ fn fresh_observation<'a>(
         })?;
     if o.created.elapsed() > ttl {
         return Err(ToolError::Forbidden("Computer observation expired".into()));
+    }
+    Ok(o)
+}
+
+fn fresh_screenshot_observation<'a>(
+    session: &'a ComputerSession,
+    id: &str,
+    observation_ttl: Duration,
+    screenshot_ttl: Duration,
+) -> Result<&'a Observation, ToolError> {
+    let o = fresh_observation(session, id, observation_ttl)?;
+    if o.screenshot.is_some() && o.created.elapsed() > screenshot_ttl {
+        return Err(ToolError::Forbidden("Computer screenshot observation expired".into()));
     }
     Ok(o)
 }
@@ -1050,6 +1566,31 @@ fn tool_specs() -> Vec<Value> {
             json!({"type":"object","required":["session_id","expected_session_generation","observation_id","element_id","window_id","pid"],"properties":{"session_id":{"type":"string"},"expected_session_generation":{"type":"integer"},"observation_id":{"type":"string"},"element_id":{"type":"string"},"window_id":{"type":"string"},"pid":{"type":"integer"}}}),
         ),
         tool_spec(
+            "computer_click_at",
+            json!({"type":"object","required":["session_id","expected_session_generation","observation_id","window_id","pid","image_x","image_y"],"properties":{"session_id":{"type":"string"},"expected_session_generation":{"type":"integer","minimum":1},"observation_id":{"type":"string"},"window_id":{"type":"string"},"pid":{"type":"integer"},"image_x":{"type":"integer","minimum":0},"image_y":{"type":"integer","minimum":0},"button":{"type":"string","enum":["left","right"]}}}),
+        ),
+        tool_spec("computer_list_displays", session_schema()),
+        tool_spec(
+            "computer_focus_window",
+            json!({"type":"object","required":["session_id","expected_session_generation","observation_id","window_id","pid"],"properties":{"session_id":{"type":"string"},"expected_session_generation":{"type":"integer","minimum":1},"observation_id":{"type":"string"},"window_id":{"type":"string"},"pid":{"type":"integer"}}}),
+        ),
+        tool_spec(
+            "computer_move_at",
+            json!({"type":"object","required":["session_id","expected_session_generation","observation_id","window_id","pid","image_x","image_y"],"properties":{"session_id":{"type":"string"},"expected_session_generation":{"type":"integer","minimum":1},"observation_id":{"type":"string"},"window_id":{"type":"string"},"pid":{"type":"integer"},"image_x":{"type":"integer","minimum":0},"image_y":{"type":"integer","minimum":0}}}),
+        ),
+        tool_spec(
+            "computer_drag_at",
+            json!({"type":"object","required":["session_id","expected_session_generation","observation_id","window_id","pid","from_image_x","from_image_y","to_image_x","to_image_y"],"properties":{"session_id":{"type":"string"},"expected_session_generation":{"type":"integer","minimum":1},"observation_id":{"type":"string"},"window_id":{"type":"string"},"pid":{"type":"integer"},"from_image_x":{"type":"integer","minimum":0},"from_image_y":{"type":"integer","minimum":0},"to_image_x":{"type":"integer","minimum":0},"to_image_y":{"type":"integer","minimum":0}}}),
+        ),
+        tool_spec(
+            "computer_paste",
+            window_schema(json!({"text":{"type":"string","maxLength":4096}}), &["text"]),
+        ),
+        tool_spec(
+            "computer_set_value",
+            json!({"type":"object","required":["session_id","expected_session_generation","observation_id","element_id","window_id","pid","value"],"properties":{"session_id":{"type":"string"},"expected_session_generation":{"type":"integer","minimum":1},"observation_id":{"type":"string"},"element_id":{"type":"string"},"window_id":{"type":"string"},"pid":{"type":"integer"},"value":{"type":"string","maxLength":4096}}}),
+        ),
+        tool_spec(
             "computer_type",
             window_schema(
                 json!({"text":{"type":"string","maxLength":4096}}),
@@ -1099,7 +1640,56 @@ fn window_schema(extra: Value, extra_required: &[&str]) -> Value {
 }
 
 fn tool_spec(name: &str, input_schema: Value) -> Value {
-    json!({"name":name,"description":format!("Computer Runtime v1 tool: {name}"),"inputSchema":input_schema})
+    let title = computer_tool_title(name);
+    json!({
+        "name": name,
+        "title": title,
+        "description": format!("{title}. LAB Computer Runtime v1 desktop tool."),
+        "annotations": {
+            "readOnlyHint": computer_tool_read_only(name),
+            "destructiveHint": false,
+            "openWorldHint": false
+        },
+        "inputSchema": input_schema
+    })
+}
+
+fn computer_tool_title(name: &str) -> &'static str {
+    match name {
+        "computer_session_open" => "Open desktop session",
+        "computer_session_close" => "Close desktop session",
+        "computer_permissions" => "Check desktop permissions",
+        "computer_list_apps" => "List desktop apps",
+        "computer_list_windows" => "List desktop windows",
+        "computer_active_window" => "Get active desktop window",
+        "computer_activate_app" => "Activate desktop app",
+        "computer_screenshot" => "Capture desktop window screenshot",
+        "computer_find" => "Find desktop UI element",
+        "computer_click" => "Click desktop UI element",
+        "computer_click_at" => "Click desktop coordinates",
+        "computer_list_displays" => "List displays",
+        "computer_focus_window" => "Focus desktop window",
+        "computer_move_at" => "Move desktop cursor",
+        "computer_drag_at" => "Drag on desktop",
+        "computer_paste" => "Paste into desktop window",
+        "computer_set_value" => "Set desktop UI value",
+        "computer_type" => "Type into desktop window",
+        "computer_key" => "Press desktop key",
+        "computer_scroll" => "Scroll desktop window",
+        _ => "Desktop computer tool",
+    }
+}
+
+fn computer_tool_read_only(name: &str) -> bool {
+    matches!(
+        name,
+        "computer_permissions"
+            | "computer_list_apps"
+            | "computer_list_windows"
+            | "computer_active_window"
+            | "computer_screenshot"
+            | "computer_find"
+    )
 }
 
 fn json_response(status: StatusCode, value: Value) -> Response<Body> {

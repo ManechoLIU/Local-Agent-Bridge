@@ -139,6 +139,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "collaboration-adapter"
+version = "0.1.0"
+
+[[package]]
 name = "computer-runtime"
 version = "0.1.0"
 dependencies = [
@@ -572,6 +576,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bridge-security-core",
+ "collaboration-adapter",
  "hyper",
  "hyper-util",
  "libc",

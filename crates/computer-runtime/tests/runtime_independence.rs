@@ -73,9 +73,15 @@ fn computer_runtime_process_starts_without_adaptive_agent_runtime() {
         }
     };
 
-    assert!(response.starts_with("HTTP/1.1 200"), "unexpected response: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "unexpected response: {response}"
+    );
     assert!(response.contains("computer_screenshot"));
     assert!(response.contains("computer_click"));
+    assert!(response.contains("computer_click_at"));
+    assert!(response.contains("computer_drag_at"));
+    assert!(response.contains("computer_paste"));
     assert!(response.contains("computer_scroll"));
 
     let _ = child.0.kill();

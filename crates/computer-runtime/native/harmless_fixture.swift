@@ -4,6 +4,7 @@ import Foundation
 final class FixtureDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     let markerDir: String
     let windowTitle: String
+    var typedWatch: Timer?
     let window = NSWindow(
         contentRect: NSRect(x: 48, y: 48, width: 440, height: 180),
         styleMask: [.titled, .closable],
@@ -35,21 +36,28 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         window.contentView = content
         window.title = windowTitle
         window.isReleasedWhenClosed = false
-        window.level = .normal
+        window.level = .floating
         window.center()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.regular)
+        NSApp.setActivationPolicy(.accessory)
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(field)
-        NSApp.activate(ignoringOtherApps: true)
+        ()
+        typedWatch = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let value = self.field.stringValue
+            if !value.isEmpty {
+                self.write("typed", data: Data(value.utf8))
+            }
+        }
         write("ready.json", data: try! JSONSerialization.data(withJSONObject: [
             "ok": true,
             "pid": Int(ProcessInfo.processInfo.processIdentifier),
             "title": windowTitle
         ], options: []))
-        DispatchQueue.main.asyncAfter(deadline: .now() + 90) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) {
             NSApp.terminate(nil)
         }
     }
