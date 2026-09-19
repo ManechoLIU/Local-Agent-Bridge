@@ -697,6 +697,7 @@ struct BridgeIngressInner {
     host_backend: Option<BackendTarget>,
     host_release_fence: Option<ProductionReleaseFence>,
     computer_backend: Option<BackendTarget>,
+    process_backend: Option<BackendTarget>,
     collaboration: Option<collaboration_tools::CollaborationRuntime>,
     feishu_admin: Option<collaboration_tools::FeishuAdminRuntime>,
     client: reqwest::Client,
@@ -760,6 +761,7 @@ impl BridgeIngress {
                 host_backend: None,
                 host_release_fence: None,
                 computer_backend: None,
+                process_backend: None,
                 collaboration: None,
                 feishu_admin: None,
                 client: backend_client()?,
@@ -797,6 +799,7 @@ impl BridgeIngress {
                 host_backend: None,
                 host_release_fence: None,
                 computer_backend: None,
+                process_backend: None,
                 collaboration: None,
                 feishu_admin: None,
                 client: backend_client()?,
@@ -852,6 +855,23 @@ impl BridgeIngress {
             "computer backend must be configured before BridgeIngress is cloned".to_string()
         })?;
         inner.computer_backend = Some(BackendTarget {
+            url: backend_url,
+            key: backend_key.to_string(),
+        });
+        Ok(self)
+    }
+
+    pub fn with_process_backend(
+        mut self,
+        backend_url: &str,
+        backend_key: &str,
+    ) -> Result<Self, String> {
+        let backend_url = validate_backend_url(backend_url)?;
+        validate_backend_key(backend_key)?;
+        let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
+            "process backend must be configured before BridgeIngress is cloned".to_string()
+        })?;
+        inner.process_backend = Some(BackendTarget {
             url: backend_url,
             key: backend_key.to_string(),
         });
@@ -1094,6 +1114,7 @@ async fn handle_mcp(
     if method == "tools/list"
         && (state.inner.host_backend.is_some()
             || state.inner.computer_backend.is_some()
+            || state.inner.process_backend.is_some()
             || state.inner.collaboration.is_some()
             || state.inner.feishu_admin.is_some())
     {
@@ -1123,6 +1144,8 @@ async fn handle_mcp(
                 );
             }
         }
+    } else if method == "tools/call" && tool_name == "run_command" {
+        backend_for_run_command(&state)
     } else {
         &state.inner.default_backend
     };
@@ -1840,7 +1863,7 @@ async fn handle_protected_run_command(
     .map_err(|error| FlowError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let backend = match send_to_backend_buffered(
         state,
-        &state.inner.default_backend,
+        backend_for_run_command(state),
         incoming,
         &proof.to_headers(),
         Bytes::from(record.frozen_forwarded.clone()),
@@ -1917,7 +1940,7 @@ async fn handle_protected_run_command(
             format!("RESULT_UNKNOWN_AFTER_DISPATCH: {error}"),
         ));
     }
-    let backend_route = state.inner.default_backend.url.path().to_string();
+    let backend_route = backend_for_run_command(state).url.path().to_string();
     let terminal_classification = if backend.status.is_success() {
         "SUCCESS"
     } else {
@@ -3222,6 +3245,12 @@ async fn forward_merged_tools_list(
             forward_to_backend(state, computer, incoming, proof_headers, body.clone()).await?,
         ));
     }
+    if let Some(process) = state.inner.process_backend.as_ref() {
+        responses.push((
+            "process",
+            forward_to_backend(state, process, incoming, proof_headers, body.clone()).await?,
+        ));
+    }
     let request_id = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|value| value.get("id").cloned())
@@ -3265,6 +3294,19 @@ async fn forward_merged_tools_list(
             .ok_or_else(|| format!("{kind} tools/list response has no result.tools array"))?;
         if kind == "host" {
             validate_host_tools_fence(extra_tools, &state.inner.host_release_fence)?;
+        }
+        if kind == "process" {
+            let process_names = extra_tools
+                .iter()
+                .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect::<HashSet<_>>();
+            tools.retain(|tool| {
+                tool.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|name| !process_names.contains(name))
+                    .unwrap_or(true)
+            });
         }
         tools.extend(extra_tools.iter().cloned());
     }
@@ -3404,6 +3446,14 @@ fn validate_host_fence_value(
         return Err("Host production release fence does not match Bridge release fence".into());
     }
     Ok(())
+}
+
+fn backend_for_run_command(state: &BridgeIngress) -> &BackendTarget {
+    state
+        .inner
+        .process_backend
+        .as_ref()
+        .unwrap_or(&state.inner.default_backend)
 }
 
 fn validate_backend_url(value: &str) -> Result<Url, String> {

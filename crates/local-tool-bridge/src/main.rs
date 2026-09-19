@@ -243,6 +243,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+    let process_backend_url = env::var("LAB_PROCESS_BACKEND_URL").ok();
+    let process_backend_key_file = env::var("LAB_PROCESS_BACKEND_KEY_FILE").ok();
+    match (
+        process_backend_url.as_deref(),
+        process_backend_key_file.as_deref(),
+    ) {
+        (Some(url), Some(key_file)) => {
+            let process_key = read_private_secret_file(Path::new(key_file))?;
+            ingress = ingress.with_process_backend(url, &process_key)?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "LAB_PROCESS_BACKEND_URL and LAB_PROCESS_BACKEND_KEY_FILE must be configured together"
+                    .into(),
+            );
+        }
+    }
     if provider_admin_enabled {
         let home = PathBuf::from(
             env::var("HOME").map_err(|_| "HOME is required for Feishu admin provider state")?,
@@ -310,11 +328,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = UnixListener::bind(&socket)?;
     set_socket_private(&socket)?;
     eprintln!(
-        "local-tool-bridge ready socket={} backend={} host_backend={} computer_backend={} feishu_provider={} host_receipts={} runtime_hook={} capability_id={} production_release={} production_generation={}",
+        "local-tool-bridge ready socket={} backend={} host_backend={} computer_backend={} process_backend={} feishu_provider={} host_receipts={} runtime_hook={} capability_id={} production_release={} production_generation={}",
         socket.display(),
         backend_url,
         host_backend_url.as_deref().unwrap_or("disabled"),
         computer_backend_url.as_deref().unwrap_or("disabled"),
+        process_backend_url.as_deref().unwrap_or("disabled"),
         if feishu_settings.is_some() { "enabled" } else { "disabled" },
         host_receipt_socket.as_deref().unwrap_or("disabled"),
         runtime_hook_socket.as_deref().unwrap_or("disabled"),
