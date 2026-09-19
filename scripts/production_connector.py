@@ -4701,6 +4701,7 @@ def _bridge_capability_lease_status(
         "FileMove",
         "Shell",
         "ProcessJobs",
+        "Computer",
     }
     installed = _read_json_object(layout["release_manifest"])
     if isinstance((installed.get("runtime_dependencies") or {}).get("feishu_cli"), dict):
