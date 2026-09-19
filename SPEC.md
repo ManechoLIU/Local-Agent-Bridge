@@ -56,6 +56,48 @@
 - 当前临时 CatDesk loopback backend 也只在上述 v1 边界内成立：same-UID 恶意进程可尝试绕过 Local Tool Bridge 直接访问本机 backend。正式文档与 UI 不得把当前方案描述成 same-UID malware isolation。
 - 若未来把 same-UID hostile process 纳入安全目标，必须升级为独立 OS principal / sandbox worker、受认证的 backend peer，或把 Files/Shell/Jobs backend 直接并入 Local Tool Bridge，从结构上移除可绕过的同 UID backend。
 
+## 2026-09-17 用户确认：LAB 主路径迁移与自有 Computer Engine
+
+### 产品结果与优先级
+
+用户已确认：日常本机操作默认通过 Local Agent Bridge；AI-Bridge 保留为显式应急兜底，不自动或静默回落。优先修复/核验当前总控身份绑定，并尽快完成当前登录账户的 LAB 接入。身份链阻塞不能暂停不依赖 Controller 权限的产品文档、离线测试及隔离开发。
+
+登录账户、浏览器 profile、Web conversation、Bridge execution session、logical Controller 是不同身份。账户登录成功不得被描述成总控已绑定。沿用唯一项目 Controller；只通过正式 Host/Runtime 接口进行 fresh attestation 与 ownership/generation 校验，不手工编辑注册表、回执或 CLOSED/acceptance 状态。
+
+### 第一阶段：LAB Connect 迁移
+
+目标路径：`ChatGPT Web / other agent -> supported connector/tunnel -> Local Agent Bridge -> Files / Shell / Process / Jobs -> local machine`。
+
+- 明确展示服务就绪、Connector 安装、当前回合工具暴露、实际执行来源四个不同状态。服务在线不等于当前聊天已接入。
+- 迁移期间不卸载、不停掉唯一仍可用的救援通道；只有 LAB 直连实际验收通过后，才在可恢复的独立测试中验证 AI-Bridge OFF。
+- 完成真实文件读写编辑、受约束命令、任务成功/失败/取消/超时及重连测试；执行证据必须指向 LAB，而不是经 AI-Bridge shell 转发后声称已经完成迁移。
+- 普通 Files/Shell/Jobs 独立运行不得被总控生命周期或项目治理服务强制阻塞。Controller 专用保护配置可以要求可信 Runtime hook，但不能代替普通独立产品配置。
+- 请求发送后的不确定结果不自动重放；旧 wake 必须先 reconciliation。只有签名确认未送达才允许新的 distinct wake。
+
+### 第二阶段：替代外部 Computer Helper
+
+在现有 `crates/computer-runtime` 上演进自有 Computer Engine，不新造重复 runtime。采用 **Accessibility/结构化 UI 优先 + 视觉定位兜底 + 受约束坐标执行**。
+
+结构化信息不足时，允许接入外部 Agent/可替换视觉 provider 对截图定位；不要求首版内置本地 OCR 或自研视觉模型，也不把特定模型供应商写入本机执行核心。模型置信度只能辅助判断，不能替代授权或身份校验。
+
+闭环：`observe -> AX grounding -> optional visual grounding -> bounded action -> fresh observe -> outcome verification`。
+
+视觉/坐标动作必须绑定 session/generation、observation、window ID + PID、截图 hash、截图与桌面坐标变换、目标框及 TTL；动作前重验窗口/焦点/几何/遮挡等必要条件，拒绝过期、跨窗口、超界及来源不明坐标。截图 hash 仅标识观察快照，不能证明当前屏幕未变。
+
+原生授权仍由用户通过系统界面授予；不得操作系统权限提示、绕过 macOS 隐私控制或把视觉兜底当作绕过权限的方法。默认不得操作登录凭据、系统安全授权弹窗等敏感目标；高风险动作按产品授权策略停下。用户手动输入或窗口漂移时应停止/重新观察，不能盲点重试。
+
+### 分阶段验收
+
+| 阶段 | 用户可观察结果 | 通过条件 |
+| --- | --- | --- |
+| 身份优先 | 当前工作入口可被正式验证 | machine current-entry + 唯一 Controller + 当前 ownership/generation；之后单独验证 confirmed wake、post-wake CLOSED、accept-live-e2e |
+| LAB Connect | 当前账户/聊天实际调用 LAB | Connector 与生产工具清单一致；真实 Files/Shell/Jobs 调用成功且无 AI-Bridge 执行依赖 |
+| 原生桌面基础 | 自有引擎操作 harmless fixture | 真实 screenshot/find/click/type/key/scroll、权限撤销与 stale target 负例；独立 review |
+| 混合视觉 | 无 AX 控件也能安全定位与操作 | Canvas/自绘 fixture、缩放/Retina/多屏坐标、窗口移动/遮挡/焦点竞争、越界/TTL/重放拒绝、动作结果复核 |
+| Helper 退役 | 自有执行面不依赖旧 Helper | 外部 Helper OFF 的独立 E2E；故障有分层诊断、显式恢复和可审计来源 |
+
+以上是已确认的目标/验收合同，不表示已经实现或通过。稳定性优于旧方案的结论需要同负载、同环境的成功率、延迟、超时/恢复、误操作与拒绝率数据支持。
+
 ## 2026-09-19 用户确认：官方 CLI 协作面（飞书先行）
 
 本条覆盖并取代此前未提交的「v1 固定 10 个 feishu_* / 未知 fail-closed」合同。产品真相只保留这一份。不在 `docs/product-planning-layer-design.md` 再写一套飞书方案；规划层管的是 Planning vs Runtime，以及模型 Provider，不是飞书命令表。

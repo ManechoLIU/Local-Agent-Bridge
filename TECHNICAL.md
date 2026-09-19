@@ -142,6 +142,33 @@ The Host HMAC key remains in a local Native Messaging process. Runtime-facing ca
 
 The Runtime-facing integration exposes challenge issuance, Host attestation request, verifier consumption and re-entry delegation, but owns no Runtime lifecycle, Assignment ledger, retry scheduler or wake system. The Host harness is now 56/56 PASS. Real Chrome for Testing and the existing authenticated Personal Web profile both load the fixed-ID extension and connect to the Native Messaging Host; authenticated exact-conversation Host-signed attestation and a real confirmed submit have passed. `runtime-verifier-cli.mjs` now performs fresh challenge → Host machine evidence → exact target/generation/ownership verification and persists a one-shot verified-target receipt that survives verifier restart; `submit_reentry` can consume only that receipt, never a caller-supplied verified object. The Host installer can optionally register the verifier for Adaptive Agent Runtime using a 0600 config and hashes all five transitive verifier modules. Installed Runtime `d1de19b773b09a247d41c225071a0d48d359c117` now implements the matching trusted external-verifier + submit-adapter protocol, revalidates the executable and full verifier bundle before each execution, and has been canonical-ACKed by the unique project Controller. Installation/ACK is still not final strong identity evidence: LAB-GOV-02 and LAB-WEX-02 remain blocked until canonical ownership reconciliation and final lifecycle Live-E2E complete.
 
+## 2026-09-17：迁移边界与混合 Computer Engine 目标合同
+
+该节记录用户已确认的后续方向，不升级现有 v1 的完成状态。
+
+### 迁移与身份分层
+
+`LAB Connect -> model-agnostic Tool Plane -> local backends` 与 `Runtime -> Host identity/re-entry adapter` 分开验证。当前会话工具清单、账号插件安装、生产 release/endpoint generation、Runtime ownership generation 分别取证。经 AI-Bridge 启动/诊断 LAB 属于迁移引导或显式救援，不属于 LAB Web 直连验收。
+
+身份恢复沿用 `discover_current_entry` 与 Runtime canonical handoff；禁止把用户邮箱、active tab、URL、截图或本地 shell 请求当成本次 Web 调用来源证明。现存 `RESULT_UNKNOWN` 必须进入正式 reconciliation，不用直接重发或人工写 receipt 解锁。
+
+### Computer Engine 接口演进边界
+
+- 保留 Rust `ComputerRuntime` 的 capability/session/observation/ownership fence 和 Swift native backend；模型选择、视觉模型调用与任务规划位于外部 Agent/provider adapter。
+- 结构化定位使用 AX locator；视觉定位返回目标框、语义描述、来源快照及可选置信度。两者都由本机执行层校验，不把模型输出当作可信授权。
+- 为后续坐标动作定义一份可校验观察合同：session_id、expected_session_generation、observation_id、window_id、pid、captured_at/expires_at、image_sha256、image dimensions、window bounds、display identity/scale、coordinate transform、target bbox。具体 schema 随独立实现计划冻结，不宣称当前 API 已具备。
+- 坐标变换必须处理窗口/桌面坐标、截图缩放、Retina 与多屏原点；动作前核对目标窗口和焦点、几何变化及遮挡。旧截图 hash 不等于新画面有效性；变化时要求新观察/重新定位。
+- 动作开始与完成分开记录；超时/断连/崩溃后无法确定是否注入事件则返回不确定状态，不自动重复点击或键入。返回事件已发出不等于业务结果已成功。
+- 支持用户抢占/紧急停止与有界执行；权限不足或目标不明确时 fail closed。不得触碰系统权限提示、复制登录凭据、模拟系统授权。
+
+### 独立验证轨道
+
+1. 身份/生产接入轨道：安装清单、状态、Connector、current-entry、正式 handoff、reconciliation、protected call、wake/CLOSED/acceptance 分门验收。
+2. 离线可靠性轨道：Host、Bridge、production launcher、WEX 工具暴露回归；不因身份门阻塞而暂停。
+3. Computer 轨道：现有原生动作补真实 fixture，再加入受约束坐标与可替换视觉定位；单独进行无旧 Helper / 无 Runtime 依赖测试。
+
+每个轨道只在真实 dispatch/receipt 存在时标记已派发；没有可靠派发能力时可以顺序执行或并行运行独立测试，不伪称多 Agent 已在工作。产品最终稳定性通过故障注入、长时间运行和独立 review 证明。
+
 ## 2026-09-19：官方 CLI 协作面（飞书先行）技术合同
 
 本条覆盖并取代 2026-09-18「v1 固定 10 个 feishu_* / 未知与 raw API fail-closed」技术合同。实现必须与 `SPEC.md` 同日产品条一致，不另开设计文档。
@@ -149,7 +176,7 @@ The Runtime-facing integration exposes challenge issuance, Host attestation requ
 ### 路径
 
 - **Web / 远程 Agent**：`ChatGPT -> OpenAI MCP tunnel / Connector -> Local Tool Bridge -> LarkCliProvider -> official lark-cli -> Feishu Open Platform`。
-- **Codex 桌面**：`Codex -> official lark-cli`（同一 `LARKSUITE_CLI_CONFIG_DIR` 与隔离 HOME）。桌面 MCP **不应**把 LAB Bridge HTTP 当作飞书网关；stdio/包装进程属于桌面宿主问题，不把「桌面经 LAB」写成架构。
+- **Codex 桌面**：`Codex -> official lark-cli`（同一 `LARKSUITE_CLI_CONFIG_DIR` 与隔离 HOME）。桌面 MCP **不应**把 LAB Bridge HTTP 当作飞书网关。stdio 包装源文件：`scripts/feishu-provider/mcp-stdio.py`；本机运行副本在 `~/.local-agent-bridge/feishu-provider` 与 `~/.codex/bin/lark-cli-mcp`。
 - 不经 CatDesk，不经 AI-Bridge 执行面。
 
 `crates/collaboration-adapter` 只做进程契约：绝对路径 CLI、隔离环境、禁止 shell interpolation、超时与输出上限、结果分类。**不**为每个官方子命令维护一份 MCP schema。Named 工具是 Thin Slice 糖衣，官方 CLI 才是兼容层。
@@ -181,3 +208,14 @@ CatDesk/Host `tools/list` 失败时，飞书工具仍须出现（fail-open 飞�
 ### 与规划层的关系
 
 `docs/product-planning-layer-design.md` 不承载飞书命令表。本协作面属于 LAB Tool Plane 的可插能力，普通调用不依赖 Adaptive Agent Runtime 在线。
+
+## 开发执行面债务 / 根治方向
+
+2026-09-18 实测暴露：现有 CatDesk-backed `start_command` 外层 sandbox 会阻断 `/dev/null`、部分 `/tmp`/用户目录 metadata，并把 PATH 压缩到系统目录；普通 Shell 同时按既定安全合同禁止 outbound network。结果是 Git/Cargo/npm 等开发工具无法作为可靠生产级开发执行面。
+
+根治方向不是给普通 Shell 粗暴开网，而是：
+
+1. 普通 Shell 继续保持无网络、workspace/环境隔离；
+2. Provider/runtime process 逐步进入 LAB 自己的 capability-controlled process seam，减少对 CatDesk migration backend 的依赖；
+3. 网络依赖安装独立成受控、manifest/allowlist 驱动的 Provider/Dependency Installer，明确 package/source/version/hash，不提供任意 URL/任意 shell；
+4. 最终门禁必须重新证明 Git/local tool compatibility，同时保持 workspace 外写、任意网络、敏感 HOME 和外部同 UID signal 等原安全负例 fail closed。
