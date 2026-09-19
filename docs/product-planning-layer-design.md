@@ -531,3 +531,78 @@ Only after real usage proves value:
 - milestone readiness.
 
 Do not build UI before the workflow proves itself.
+
+## 15. 2026-09-17 user-approved migration and own Computer Engine roadmap
+
+This addendum records explicit user decisions from the current conversation. It does not retroactively promote the whole research candidate, bind this conversation as Controller, or close any Runtime task. Canonical product and technical counterparts are the dated sections of `SPEC.md` and `TECHNICAL.md`.
+
+### Confirmed outcomes
+
+LAB is the default local execution path; AI-Bridge remains installed as explicit emergency fallback, never silent automatic failover. Prioritize current Controller identity verification/binding and current-account LAB onboarding. After LAB migration, evolve the existing Computer Runtime into an independently runnable replacement for external Computer Helper.
+
+The selected interaction strategy is Accessibility/structured UI first, visual grounding when structured UI is inadequate, then bounded coordinate actions and fresh outcome verification. An external multimodal Agent may provide vision; an embedded OCR/grounding model is not a first-release prerequisite. Model/provider selection must stay outside the local capability core.
+
+### Delivery slices and evidence
+
+| Slice | Deliverable | Acceptance evidence |
+| --- | --- | --- |
+| Identity priority | Reuse the unique project Controller; verify the current entry and rotate ownership only through supported mechanisms | Fresh Host evidence, exact current generation, canonical handoff; separate wake/CLOSED/accept-live-e2e gates |
+| LAB Connect | The logged-in account and conversation invoke the canonical production LAB tools | Account Connector, current-turn tool exposure, real read/write/edit/command/job success/cancel/timeout, execution-path provenance |
+| Native hands/eyes | Existing Computer Runtime operates a harmless native fixture | User-granted permissions, real observe/find/click/type/key/scroll, stale-target denial, independent review |
+| Hybrid interaction | Canvas/custom-drawn fixture can be operated without AX controls | Snapshot-bound bbox/coordinate action, scale/display/window binding, pre-action freshness checks, post-action observation |
+| Dependency retirement | Ordinary local execution no longer depends on AI-Bridge or external Helper | Controlled OFF tests after the replacement works; recovery remains explicit and auditable |
+
+### Safety and recovery invariants
+
+Account login is not Controller attestation. Emails, titles, URLs, foreground tabs and model statements cannot establish current execution ownership. Do not create a second Controller or hand-edit canonical receipts. Unknown post-dispatch outcomes are not retry permission.
+
+A visual target must carry session/generation, observation identity, window/PID, image hash, timestamp/TTL, image/window geometry, display/scale/coordinate transformation and bounding box. Confidence is advisory. Revalidate target/focus/geometry before action and re-observe after action. Frame drift, occlusion, stale observation, cross-session access, user input and uncertain outcomes require safe interruption rather than blind retries.
+
+System authorization remains a user operation. Vision is a compatibility fallback, not a permission bypass. Screenshots, logs and model-visible observations minimize sensitive content; login/security/permission targets are excluded by default.
+
+### Parallelism and product boundaries
+
+Identity/production changes stay on the critical path, but independent documentation, offline regression, Computer fixtures and isolated implementation can progress without Controller privileges. Actual executable ownership stays in Runtime; this roadmap is not another task ledger. Real agents are only described as dispatched when a genuine dispatch ID/receipt exists. Existing external repair owners are not duplicated.
+
+Ordinary LAB Connect use bypasses Planning/Runtime. The protected Controller profile may require a Runtime hook; its readiness must not be confused with the independent Tool Plane's readiness. Do not disable the last usable fallback connection before a real LAB connection has passed.
+
+### Success measurement
+
+Compare old and new paths on the same fixture/environment: completion rate, incorrect-target actions, safe refusals, median/tail latency, timeout rate, reconnect/restart recovery, credential leakage and dependency-OFF behavior. Architecture alone does not justify claiming LAB is already more stable.
+
+## 16. 2026-09-19 stack contract: AAR governance vs LAB tool plane
+
+This section freezes the user-confirmed root-cause scheme. It does not turn Adaptive Agent Runtime into a LAB product feature, and it does not put Feishu/Computer stories into AAR.
+
+### Three planes
+
+- **Adaptive Agent Runtime (AAR)** — governance runtime: unique Controller, one ledger per project, dispatch, identity, duty switch, Stop/Yield. User-level, across projects and AI hosts. Lives in the AAR skill, `install_skill`, host hooks, and the user-level controller registry.
+- **Local Agent Bridge (LAB)** — local capability plane: Connector/tunnel → Bridge → files/shell/Feishu/Computer. Any client may call it. LAB must run without AAR being online.
+- **Business repositories** — projects. They use AAR to manage work and LAB to touch the machine. They do not own either plane.
+
+Feishu and Computer belong in LAB SPEC/crates. Governance rules belong in AAR. A project `AGENTS.md` may record that project's Controller ID and that the product does not depend on AAR; it must not be the AAR rulebook.
+
+### Global AAR
+
+One installed skill revision (manifest hashes must match). Each AI host attaches the same lifecycle hooks (Codex already does). New tools get a host adapter, not a second AAR. Ledgers stay per-project; the engine is global.
+
+### Force Controller project management (hooks, not prose)
+
+Applies to the **Controller** session of a project:
+
+1. SessionStart injects that project's ledger working set (`READY/ACTIVE/VERIFY/BLOCKED`).
+2. Stop/Yield is refused while runnable work or unwritten ledger updates remain.
+3. Main-tree writes and local merge require a ledger row and file ownership.
+4. Controller spawn into the project main tree requires a ledger row and ownership.
+5. Recompute must fresh-read; stale `BLOCKED` labels are invalid.
+
+Ordinary sessions may spawn ephemeral sub-agents. Writing that project's main tree requires a ledger row or an assignment lease. Temporary owners use leases (same family as sub-agent lease/heartbeat). Standing Manager seats only get a principal ID. Executors never get one.
+
+Controller duties only: ledger, recompute, dispatch, accept, merge main, roll the **project** Goal. Controllers do not implement. Session Goals may cover one assigned package. Human confirmation: payment, product-direction change, authorization/data-security, hard-to-reverse risk. Local merge, ordinary install, disposable tenant writes do not wait on the user.
+
+### Identity and duty
+
+One logical Controller ID per project. Web and desktop are entries, not two Controllers. Appoint / `replace-*-session` of the current entry claims execution ownership in the same lock. `bind-*-session` is lineage only. Opening a window is not an appointment.
+
+Machine gates cover: wrong Controller, ledger CAS races, appoint without duty switch, dirty AAR install, Controller stopping with runnable work, Controller spawning project work with no row. They do not cover model chatter. Fix hooks; do not add project essays.
+
