@@ -591,7 +591,7 @@ One installed skill revision (manifest hashes must match). Each AI host attaches
 Applies to the **Controller** session of a project:
 
 1. SessionStart injects that project's ledger working set (`READY/ACTIVE/VERIFY/BLOCKED`).
-2. Stop/Yield is refused while runnable work or unwritten ledger updates remain.
+2. Stop/Yield is refused while this control event still has `READY`/`ACTIVE` work, unwritten ledger updates, or Continuation Debt. `BLOCKED` rows waiting on an external condition are not a reason to keep the turn open, and they are not a reason to treat the project as empty.
 3. Main-tree writes and local merge require a ledger row and file ownership.
 4. Controller spawn into the project main tree requires a ledger row and ownership.
 5. Recompute must fresh-read; stale `BLOCKED` labels are invalid.
