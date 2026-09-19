@@ -6611,6 +6611,83 @@ class ProductionConnectorContractTests(unittest.TestCase):
             )
         )
 
+    def test_start_local_parallel_generation_does_not_stop_or_steal_live_binds(self):
+        manifest = self._manifest(generation=16)
+        isolated_ports = {
+            "catdesk_port": 43331,
+            "host_mcp_port": 43321,
+            "process_runtime_port": 43442,
+        }
+        with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest,
+                runtime_root=root / "runtime",
+                bridge_socket=root / "bridge.sock",
+                **isolated_ports,
+            )
+            self.assertEqual(layout["catdesk_port"], 43331)
+            self.assertEqual(layout["host_mcp_port"], 43321)
+            self.assertEqual(layout["process_runtime_port"], 43442)
+            self.assertNotEqual(layout["bridge_socket"], pc.PRODUCTION_BRIDGE_SOCKET)
+            env = pc.production_component_env(
+                manifest, layout, catdesk_slug="private-slug"
+            )
+            self.assertEqual(env["host"]["LAB_HOST_MCP_PORT"], "43321")
+            self.assertEqual(
+                env["bridge"]["LAB_BRIDGE_BACKEND_URL"],
+                "http://127.0.0.1:43331/private-slug/mcp",
+            )
+            self.assertEqual(
+                env["bridge"]["LAB_HOST_BACKEND_URL"],
+                "http://127.0.0.1:43321/mcp",
+            )
+            self.assertEqual(
+                env["bridge"]["LAB_PROCESS_BACKEND_URL"],
+                "http://127.0.0.1:43442/mcp",
+            )
+            self.assertEqual(
+                env["process_runtime"]["PROCESS_RUNTIME_BIND"],
+                "127.0.0.1:43442",
+            )
+            self.assertIn("'PORT': '43331'", pc._catdesk_runner_source(manifest, layout))
+            prior = {
+                "release_revision": "b" * 40,
+                "endpoint_generation": 15,
+                "bridge_pid": 12057,
+                "host_pid": 60989,
+                "process_runtime_pid": 61002,
+                "catdesk_supervisor_pid": 60946,
+            }
+            layout["runtime_root"].mkdir(parents=True, exist_ok=True)
+            pc._write_json_private(layout["runtime_state"], prior)
+
+            def tcp_ready(_host, port):
+                return port in {
+                    pc.PRODUCTION_CATDESK_PORT,
+                    pc.PRODUCTION_HOST_MCP_PORT,
+                    pc.PRODUCTION_PROCESS_RUNTIME_PORT,
+                }
+
+            with patch.object(pc, "validate_installed_release", return_value=manifest), patch.object(
+                pc,
+                "production_status",
+                return_value={"local_runtime_ready": False, "tunnel_ready": False},
+            ), patch.object(pc, "_tcp_ready", side_effect=tcp_ready), patch.object(
+                pc, "_stop_prior_local_runtime_for_release_upgrade"
+            ) as stop_prior, patch.object(
+                pc, "_stop_verified_local_runtime"
+            ) as stop_verified, patch.object(
+                pc,
+                "_materialize_catdesk_runtime",
+                side_effect=RuntimeError("stop after isolated occupancy"),
+            ) as materialize:
+                with self.assertRaisesRegex(RuntimeError, "stop after isolated occupancy"):
+                    pc.start_local_runtime(manifest, layout)
+            stop_prior.assert_not_called()
+            stop_verified.assert_not_called()
+            materialize.assert_called_once_with(layout)
+
 
 if __name__ == "__main__":
     unittest.main()

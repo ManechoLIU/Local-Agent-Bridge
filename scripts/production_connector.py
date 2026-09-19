@@ -295,11 +295,17 @@ def production_layout(
     *,
     runtime_root: Path = PRODUCTION_RUNTIME_ROOT,
     bridge_socket: Path = PRODUCTION_BRIDGE_SOCKET,
+    catdesk_port: int = PRODUCTION_CATDESK_PORT,
+    host_mcp_port: int = PRODUCTION_HOST_MCP_PORT,
+    process_runtime_port: int = PRODUCTION_PROCESS_RUNTIME_PORT,
 ) -> dict[str, Path]:
     _validate_manifest_identity(manifest)
     root = Path(runtime_root).expanduser()
     revision = str(manifest["release_revision"])
     generation = int(manifest["endpoint_generation"])
+    catdesk_port = _production_tcp_port(catdesk_port, "CatDesk")
+    host_mcp_port = _production_tcp_port(host_mcp_port, "Host MCP")
+    process_runtime_port = _production_tcp_port(process_runtime_port, "Process Runtime")
     release_dir = root / "releases" / revision / f"generation-{generation}"
     secrets_dir = release_dir / "secrets"
     release_catdesk_home = release_dir / "catdesk-home"
@@ -355,6 +361,9 @@ def production_layout(
         "logs_dir": root / "logs",
         "catdesk_child_pid": runtime_generation_dir / "catdesk-child.pid",
         "process_runtime_state_dir": runtime_generation_dir / "process-runtime",
+        "catdesk_port": catdesk_port,
+        "host_mcp_port": host_mcp_port,
+        "process_runtime_port": process_runtime_port,
     }
 
 
@@ -386,12 +395,12 @@ def production_component_env(
         "LAB_HOST_VERIFIER_STATE_FILE": str(layout["host_verifier_state"]),
         "LAB_HOST_REENTRY_STATE_FILE": str(layout["host_reentry_state"]),
         "LAB_HOST_MCP_BIND": "127.0.0.1",
-        "LAB_HOST_MCP_PORT": str(PRODUCTION_HOST_MCP_PORT),
+        "LAB_HOST_MCP_PORT": str(_layout_host_mcp_port(layout)),
     }
     bridge = {
         **fence,
         "LAB_BRIDGE_SOCKET": str(layout["bridge_socket"]),
-        "LAB_BRIDGE_BACKEND_URL": f"http://127.0.0.1:{PRODUCTION_CATDESK_PORT}/{slug}/mcp",
+        "LAB_BRIDGE_BACKEND_URL": f"http://127.0.0.1:{_layout_catdesk_port(layout)}/{slug}/mcp",
         "LAB_BRIDGE_BACKEND_KEY_FILE": str(layout["catdesk_backend_key"]),
         "LAB_BRIDGE_STATE_DIR": str(layout["bridge_state_dir"]),
         "LAB_BRIDGE_WORKSPACE_ID": CONNECTOR_ID,
@@ -405,12 +414,12 @@ def production_component_env(
         "LAB_BRIDGE_CAPABILITY_RENEW_BEFORE_MS": str(
             manifest["bridge"]["capability_renew_before_ms"]
         ),
-        "LAB_HOST_BACKEND_URL": f"http://127.0.0.1:{PRODUCTION_HOST_MCP_PORT}/mcp",
+        "LAB_HOST_BACKEND_URL": f"http://127.0.0.1:{_layout_host_mcp_port(layout)}/mcp",
         "LAB_HOST_BACKEND_KEY_FILE": str(layout["host_backend_key"]),
         "LAB_HOST_ADAPTER_SOCKET": str(layout["host_socket"]),
         "LAB_RUNTIME_HOST_TOOL_HOOK_SOCKET": str(layout["runtime_hook_socket"]),
     }
-    process_bind = _numeric_loopback_bind(f"127.0.0.1:{PRODUCTION_PROCESS_RUNTIME_PORT}")
+    process_bind = _numeric_loopback_bind(f"127.0.0.1:{_layout_process_runtime_port(layout)}")
     process_backend_url = f"http://{process_bind}/mcp"
     process_runtime = {
         **fence,
@@ -4788,8 +4797,8 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
         and bridge_identity.get("pid") == bridge_pid
         and _process_identity_matches(bridge_identity)
     )
-    backend_ready = bool(catdesk_process and _tcp_ready("127.0.0.1", PRODUCTION_CATDESK_PORT))
-    host_ready = bool(host_process and _tcp_ready("127.0.0.1", PRODUCTION_HOST_MCP_PORT))
+    backend_ready = bool(catdesk_process and _tcp_ready("127.0.0.1", _layout_catdesk_port(layout)))
+    host_ready = bool(host_process and _tcp_ready("127.0.0.1", _layout_host_mcp_port(layout)))
     runtime_hook_ready = bool(
         runtime_hook_process
         and _runtime_hook_socket_is_live(
@@ -4798,7 +4807,7 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
     )
     process_runtime_ready = bool(
         process_runtime_process
-        and _tcp_ready("127.0.0.1", PRODUCTION_PROCESS_RUNTIME_PORT)
+        and _tcp_ready("127.0.0.1", _layout_process_runtime_port(layout))
     )
     tools: list[str] = []
     bridge_ready = False
@@ -5075,6 +5084,16 @@ def _start_local_runtime_unlocked(
             or prior.get("endpoint_generation") != manifest["endpoint_generation"]
         )
     )
+    catdesk_port = _layout_catdesk_port(layout)
+    host_mcp_port = _layout_host_mcp_port(layout)
+    process_runtime_port = _layout_process_runtime_port(layout)
+    if _path_is_same(layout["runtime_root"], PRODUCTION_RUNTIME_ROOT) and (
+        not _path_is_same(layout["bridge_socket"], PRODUCTION_BRIDGE_SOCKET)
+        or catdesk_port != PRODUCTION_CATDESK_PORT
+        or host_mcp_port != PRODUCTION_HOST_MCP_PORT
+        or process_runtime_port != PRODUCTION_PROCESS_RUNTIME_PORT
+    ):
+        raise RuntimeError("parallel generation binds require an isolated runtime-root")
     preserved_activation_state = _preserved_activation_state(
         manifest,
         layout,
@@ -5082,15 +5101,23 @@ def _start_local_runtime_unlocked(
         tunnel_ready=current.get("tunnel_ready") is True,
     )
     if prior:
-        if is_release_upgrade:
+        same_local_generation = (
+            prior.get("release_revision") == manifest["release_revision"]
+            and prior.get("endpoint_generation") == manifest["endpoint_generation"]
+        )
+        if same_local_generation:
+            _stop_verified_local_runtime(prior, layout)
+        elif _layout_is_parallel_generation(layout):
+            pass
+        elif is_release_upgrade:
             _stop_prior_local_runtime_for_release_upgrade(prior, layout)
         else:
             _stop_verified_local_runtime(prior, layout)
-    if _tcp_ready("127.0.0.1", PRODUCTION_CATDESK_PORT):
+    if _tcp_ready("127.0.0.1", catdesk_port):
         raise RuntimeError("production CatDesk port is occupied by an unverified process")
-    if _tcp_ready("127.0.0.1", PRODUCTION_HOST_MCP_PORT):
+    if _tcp_ready("127.0.0.1", host_mcp_port):
         raise RuntimeError("production Host MCP port is occupied by an unverified process")
-    if _tcp_ready("127.0.0.1", PRODUCTION_PROCESS_RUNTIME_PORT):
+    if _tcp_ready("127.0.0.1", process_runtime_port):
         raise RuntimeError("production Process Runtime port is occupied by an unverified process")
     if layout["bridge_socket"].exists():
         raise RuntimeError("production Bridge socket exists without a verified runtime owner")
@@ -5135,7 +5162,7 @@ def _start_local_runtime_unlocked(
             catdesk.pid, expected_executable=python, expected_argv=catdesk_command
         )
         started[-1] = (catdesk, catdesk_identity, True)
-        _wait_for_tcp(catdesk, PRODUCTION_CATDESK_PORT, "production CatDesk")
+        _wait_for_tcp(catdesk, catdesk_port, "production CatDesk")
 
         dependencies = _validate_runtime_dependencies(installed)
         node = Path(dependencies["node"]["path"])
@@ -5153,7 +5180,7 @@ def _start_local_runtime_unlocked(
             host.pid, expected_executable=node, expected_argv=host_command
         )
         started[-1] = (host, host_identity, False)
-        _wait_for_tcp(host, PRODUCTION_HOST_MCP_PORT, "production Host MCP")
+        _wait_for_tcp(host, host_mcp_port, "production Host MCP")
 
         runtime_python = Path(dependencies["python"]["path"])
         runtime_hook_command = [
@@ -5196,7 +5223,7 @@ def _start_local_runtime_unlocked(
         )
         started[-1] = (process_runtime, process_runtime_identity, False)
         _wait_for_tcp(
-            process_runtime, PRODUCTION_PROCESS_RUNTIME_PORT, "production Process Runtime"
+            process_runtime, process_runtime_port, "production Process Runtime"
         )
 
         session_id = f"bridge-session-production-{uuid.uuid4()}"
@@ -5944,6 +5971,41 @@ def _stop_verified_process_identity(
             return
         time.sleep(0.1)
     raise RuntimeError(f"verified process {pid} did not stop after SIGTERM")
+
+
+def _production_tcp_port(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1 or value > 65535:
+        raise RuntimeError(f"production {label} port must be an integer 1-65535")
+    return value
+
+
+def _layout_catdesk_port(layout: dict[str, Any]) -> int:
+    return _production_tcp_port(layout.get("catdesk_port", PRODUCTION_CATDESK_PORT), "CatDesk")
+
+
+def _layout_host_mcp_port(layout: dict[str, Any]) -> int:
+    return _production_tcp_port(layout.get("host_mcp_port", PRODUCTION_HOST_MCP_PORT), "Host MCP")
+
+
+def _layout_process_runtime_port(layout: dict[str, Any]) -> int:
+    return _production_tcp_port(
+        layout.get("process_runtime_port", PRODUCTION_PROCESS_RUNTIME_PORT),
+        "Process Runtime",
+    )
+
+
+def _path_is_same(left: Path, right: Path) -> bool:
+    return Path(left).expanduser().resolve() == Path(right).expanduser().resolve()
+
+
+def _layout_is_parallel_generation(layout: dict[str, Any]) -> bool:
+    return (
+        not _path_is_same(layout["runtime_root"], PRODUCTION_RUNTIME_ROOT)
+        and not _path_is_same(layout["bridge_socket"], PRODUCTION_BRIDGE_SOCKET)
+        and _layout_catdesk_port(layout) != PRODUCTION_CATDESK_PORT
+        and _layout_host_mcp_port(layout) != PRODUCTION_HOST_MCP_PORT
+        and _layout_process_runtime_port(layout) != PRODUCTION_PROCESS_RUNTIME_PORT
+    )
 
 
 def _tcp_ready(host: str, port: int) -> bool:
@@ -6952,7 +7014,7 @@ log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 master, slave = pty.openpty()
 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 120, 0, 0))
 env = os.environ.copy()
-env.update({{'HOME': str(home), 'WORKSPACE_ROOT': str(workspace), 'PORT': {str(PRODUCTION_CATDESK_PORT)!r}, 'CATDESK_SKIP_MACOS_TERMINAL_PROFILE': '1', 'TERM': 'xterm-256color', 'CATDESK_LOCAL_BACKEND_KEY_FILE': str(home / '.catdesk/backend.key'), 'CATDESK_REQUIRE_LOCAL_BACKEND_AUTH': '1'}})
+env.update({{'HOME': str(home), 'WORKSPACE_ROOT': str(workspace), 'PORT': {str(_layout_catdesk_port(layout))!r}, 'CATDESK_SKIP_MACOS_TERMINAL_PROFILE': '1', 'TERM': 'xterm-256color', 'CATDESK_LOCAL_BACKEND_KEY_FILE': str(home / '.catdesk/backend.key'), 'CATDESK_REQUIRE_LOCAL_BACKEND_AUTH': '1'}})
 with log_path.open('ab', buffering=0) as log:
     proc = subprocess.Popen([str(binary)], stdin=slave, stdout=slave, stderr=slave, cwd=str(workspace), env=env)
     pid_path.write_text(str(proc.pid), encoding='utf-8')
@@ -7292,6 +7354,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--observed", type=Path)
     parser.add_argument("--runtime-root", type=Path, default=PRODUCTION_RUNTIME_ROOT)
     parser.add_argument("--bridge-socket", type=Path, default=PRODUCTION_BRIDGE_SOCKET)
+    parser.add_argument("--catdesk-port", type=int, default=PRODUCTION_CATDESK_PORT)
+    parser.add_argument("--host-mcp-port", type=int, default=PRODUCTION_HOST_MCP_PORT)
+    parser.add_argument("--process-runtime-port", type=int, default=PRODUCTION_PROCESS_RUNTIME_PORT)
     parser.add_argument("--build-repo", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--historical-profile-dir", type=Path)
     parser.add_argument("--historical-profile-name")
@@ -7346,7 +7411,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     layout = production_layout(
-        manifest, runtime_root=args.runtime_root.expanduser(), bridge_socket=args.bridge_socket.expanduser()
+        manifest,
+        runtime_root=args.runtime_root.expanduser(),
+        bridge_socket=args.bridge_socket.expanduser(),
+        catdesk_port=args.catdesk_port,
+        host_mcp_port=args.host_mcp_port,
+        process_runtime_port=args.process_runtime_port,
     )
     if args.action == "install":
         result: dict[str, Any] = {str(key): str(value) for key, value in install_production_release(
