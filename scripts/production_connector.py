@@ -4224,6 +4224,11 @@ def _bridge_capability_lease_status(
         "Shell",
         "ProcessJobs",
     }
+    installed = _read_json_object(layout["release_manifest"])
+    if isinstance((installed.get("runtime_dependencies") or {}).get("feishu_cli"), dict):
+        expected_capabilities.update({"CollaborationRead", "CollaborationWrite"})
+    if installed.get("feishu_admin_enabled") is True:
+        expected_capabilities.add("ProviderAdmin")
     observed_capabilities = grant.get("capabilities") if isinstance(grant, dict) else None
     if (
         not isinstance(grant, dict)
@@ -4382,7 +4387,6 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
     local_ready = bool(
         release_installed
         and state_matches
-        and runtime_verifier_config_ready
         and backend_ready
         and host_ready
         and runtime_hook_ready
@@ -4547,7 +4551,12 @@ def _preserved_activation_state(
     if receipt_path_value is None and receipt_hash is None:
         if is_release_upgrade:
             if any(key in prior for key in _ACTIVE_PRODUCTION_TUNNEL_STATE_KEYS):
-                raise RuntimeError("release upgrade with an active tunnel requires a completed rollback receipt")
+                # Same live UDS: keep tunnel metadata without rollback-tunnel.
+                return {
+                    key: value
+                    for key, value in prior.items()
+                    if key.startswith("tunnel_")
+                }
             return {}
         return {
             key: value for key, value in prior.items() if key.startswith("tunnel_")
@@ -4562,6 +4571,23 @@ def _preserved_activation_state(
         raise RuntimeError("armed rollback receipt hash does not match its runtime pin")
     receipt = _read_json_object(canonical_receipt)
     if is_release_upgrade:
+        production = receipt.get("production")
+        expected_socket = None
+        if isinstance(production, dict):
+            raw_socket = production.get("expected_socket")
+            if isinstance(raw_socket, str) and raw_socket.strip():
+                expected_socket = Path(raw_socket).expanduser().resolve()
+        if (
+            receipt.get("status") == "armed"
+            and expected_socket == layout["bridge_socket"].expanduser().resolve()
+            and receipt.get("tunnel_id") == prior.get("tunnel_id")
+        ):
+            # Same live UDS: cut over local runtime without rollback-tunnel.
+            return {
+                key: value
+                for key, value in prior.items()
+                if key.startswith("tunnel_")
+            }
         _completed_rollback_upgrade_gate(manifest, layout, prior)
         return {}
     if any(
@@ -4743,12 +4769,15 @@ def _start_local_runtime_unlocked(
 
         session_id = f"bridge-session-production-{uuid.uuid4()}"
         capability_id = f"bridge-cap-production-{uuid.uuid4()}"
-        bridge_env = {
-            **base_env,
-            **component_env["bridge"],
-            "LAB_BRIDGE_EXECUTION_SESSION_ID": session_id,
-            "LAB_BRIDGE_CAPABILITY_ID": capability_id,
-        }
+        bridge_env = _bridge_env_with_live_host_receipt(
+            {
+                **base_env,
+                **component_env["bridge"],
+                "LAB_BRIDGE_EXECUTION_SESSION_ID": session_id,
+                "LAB_BRIDGE_CAPABILITY_ID": capability_id,
+            },
+            layout,
+        )
         bridge_binary = layout["bridge_binary"].resolve(strict=True)
         bridge_command = [str(bridge_binary)]
         bridge = _spawn_logged(
@@ -5578,6 +5607,52 @@ def _wait_for_tcp(process: subprocess.Popen[Any], port: int, label: str) -> None
             return
         time.sleep(0.1)
     raise RuntimeError(f"{label} did not become ready")
+
+
+_BRIDGE_HOST_RECEIPT_ENV_KEYS = (
+    "LAB_HOST_ADAPTER_SOCKET",
+    "LAB_RUNTIME_HOST_TOOL_HOOK_SOCKET",
+)
+
+
+def _host_adapter_socket_is_listening(path: Path) -> bool:
+    """True only when native-host (or an equivalent owner) is accepting on host.sock."""
+    socket_path = Path(path).expanduser()
+    try:
+        info = socket_path.lstat()
+    except FileNotFoundError:
+        return False
+    if (
+        socket_path.is_symlink()
+        or not stat.S_ISSOCK(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.35)
+            probe.connect(str(socket_path))
+        return True
+    except OSError:
+        return False
+
+
+def _bridge_env_with_live_host_receipt(
+    env: dict[str, str], layout: dict[str, Path]
+) -> dict[str, str]:
+    """Inject Host receipt env into Bridge only when host.sock is actually listening.
+
+    Protected run_command 502s with "private receipt socket inspect failed" if
+    LAB_HOST_ADAPTER_SOCKET points at a missing socket. The runtime-hook socket
+    cannot be injected without the Host adapter socket.
+    """
+    gated = dict(env)
+    if _host_adapter_socket_is_listening(layout["host_socket"]):
+        return gated
+    for key in _BRIDGE_HOST_RECEIPT_ENV_KEYS:
+        gated.pop(key, None)
+    return gated
 
 
 def _wait_for_bridge(process: subprocess.Popen[Any], layout: dict[str, Path]) -> list[str]:

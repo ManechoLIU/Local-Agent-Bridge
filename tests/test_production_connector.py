@@ -5833,6 +5833,182 @@ class ProductionConnectorContractTests(unittest.TestCase):
                     pc.start_local_runtime(manifest, layout)
             spawn.assert_not_called()
 
+    def _start_local_bridge_spawn_env(self, layout, manifest, installed, *, host_socket=None):
+        layout["bridge_binary"].parent.mkdir(parents=True, exist_ok=True)
+        layout["bridge_binary"].write_text("bridge", encoding="utf-8")
+        layout["bridge_binary"].chmod(0o700)
+        layout["process_runtime_binary"].parent.mkdir(parents=True, exist_ok=True)
+        layout["process_runtime_binary"].write_text("process-runtime", encoding="utf-8")
+        layout["process_runtime_binary"].chmod(0o700)
+        for key, value in (
+            ("release_catdesk_config", "mcpSlug = 'private'\n"),
+            ("release_catdesk_backend_key", "k" * 64),
+        ):
+            layout[key].parent.mkdir(parents=True, exist_ok=True)
+            layout[key].write_text(value, encoding="utf-8")
+            layout[key].chmod(0o600)
+        kernel_python = layout["runtime_root"] / "kernel-python"
+        kernel_python.write_text("python", encoding="utf-8")
+        kernel_python.chmod(0o700)
+        release_node = layout["node_binary"]
+        release_node.parent.mkdir(parents=True, exist_ok=True)
+        release_node.write_text("release-node", encoding="utf-8")
+        release_node.chmod(0o700)
+        processes = [MagicMock(pid=901 + index) for index in range(5)]
+        identities = [
+            self._identity(process.pid, [f"/private/process-{process.pid}"])
+            for process in processes
+        ]
+        receipt_env = {
+            "LAB_HOST_ADAPTER_SOCKET": str(layout["host_socket"]),
+            "LAB_RUNTIME_HOST_TOOL_HOOK_SOCKET": str(layout["runtime_hook_socket"]),
+            "LAB_PROCESS_BACKEND_URL": "http://127.0.0.1:33442/mcp",
+            "LAB_PROCESS_BACKEND_KEY_FILE": str(layout["process_runtime_backend_key"]),
+        }
+        listener = None
+        if host_socket == "listening":
+            layout["host_socket"].parent.mkdir(parents=True, exist_ok=True)
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(layout["host_socket"]))
+            listener.listen(1)
+            os.chmod(layout["host_socket"], 0o600)
+        elif host_socket == "stale":
+            layout["host_socket"].parent.mkdir(parents=True, exist_ok=True)
+            stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            stale.bind(str(layout["host_socket"]))
+            os.chmod(layout["host_socket"], 0o600)
+            stale.close()
+        try:
+            with patch.object(
+                pc, "validate_installed_release", return_value=installed
+            ), patch.object(
+                pc,
+                "production_status",
+                side_effect=[
+                    {"local_runtime_ready": False, "tunnel_ready": False},
+                    {"local_runtime_ready": False, "tunnel_ready": False},
+                ],
+            ), patch.object(pc, "_tcp_ready", return_value=False), patch.object(
+                pc, "_catdesk_slug", return_value="private"
+            ), patch.object(
+                pc,
+                "production_component_env",
+                return_value={
+                    "host": {"LAB_HOST_ADAPTER_SOCKET": str(layout["host_socket"])},
+                    "bridge": dict(receipt_env),
+                    "process_runtime": {"PROCESS_RUNTIME_BIND": "127.0.0.1:33442"},
+                },
+            ), patch.object(
+                pc, "_kernel_python_executable", return_value=kernel_python
+            ), patch.object(pc, "_spawn_logged", side_effect=processes) as spawn, patch.object(
+                pc, "_capture_process_identity", side_effect=identities
+            ), patch.object(pc, "_wait_for_tcp"), patch.object(
+                pc,
+                "_wait_for_runtime_hook",
+                return_value={
+                    "path": str(layout["runtime_hook_socket"]),
+                    "uid": os.geteuid(),
+                    "mode": 0o600,
+                    "device": 1,
+                    "inode": 2,
+                },
+            ), patch.object(
+                pc, "_wait_for_bridge", return_value=sorted(pc.REQUIRED_TOOLS)
+            ), patch.object(
+                pc,
+                "_validate_runtime_dependencies",
+                return_value={
+                    "node": {"path": str(release_node)},
+                    "python": {"path": str(kernel_python)},
+                },
+            ), patch.object(pc, "_stop_verified_process_identity"):
+                with self.assertRaisesRegex(RuntimeError, "post-start status"):
+                    pc.start_local_runtime(manifest, layout)
+            self.assertEqual(spawn.call_count, 5)
+            return spawn.call_args_list[4].kwargs["env"]
+        finally:
+            if listener is not None:
+                listener.close()
+
+    def test_host_adapter_socket_listening_requires_owned_live_unix_socket(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
+            path = Path(raw_root) / "host.sock"
+            self.assertFalse(pc._host_adapter_socket_is_listening(path))
+            path.write_text("not-a-socket\n", encoding="utf-8")
+            self.assertFalse(pc._host_adapter_socket_is_listening(path))
+            path.unlink()
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                listener.bind(str(path))
+                listener.listen(1)
+                os.chmod(path, 0o600)
+                self.assertTrue(pc._host_adapter_socket_is_listening(path))
+                os.chmod(path, 0o666)
+                self.assertFalse(pc._host_adapter_socket_is_listening(path))
+                os.chmod(path, 0o600)
+            finally:
+                listener.close()
+            self.assertFalse(pc._host_adapter_socket_is_listening(path))
+
+    def test_start_local_omits_host_receipt_env_when_host_socket_is_not_listening(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest, runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
+            )
+            installed = json.loads(json.dumps(manifest))
+            installed["artifacts_sha256"] = {"bin/process-runtime": "a" * 64}
+            missing = self._start_local_bridge_spawn_env(
+                layout, manifest, installed, host_socket=None
+            )
+            self.assertNotIn("LAB_HOST_ADAPTER_SOCKET", missing)
+            self.assertNotIn("LAB_RUNTIME_HOST_TOOL_HOOK_SOCKET", missing)
+            self.assertEqual(
+                missing["LAB_PROCESS_BACKEND_URL"], "http://127.0.0.1:33442/mcp"
+            )
+            self.assertEqual(
+                missing["LAB_PROCESS_BACKEND_KEY_FILE"],
+                str(layout["process_runtime_backend_key"]),
+            )
+            self.assertFalse(layout["host_socket"].exists())
+
+            stale_root = root / "stale"
+            stale_layout = pc.production_layout(
+                manifest,
+                runtime_root=stale_root / "runtime",
+                bridge_socket=stale_root / "bridge.sock",
+            )
+            stale = self._start_local_bridge_spawn_env(
+                stale_layout, manifest, installed, host_socket="stale"
+            )
+            self.assertNotIn("LAB_HOST_ADAPTER_SOCKET", stale)
+            self.assertNotIn("LAB_RUNTIME_HOST_TOOL_HOOK_SOCKET", stale)
+            self.assertEqual(
+                stale["LAB_PROCESS_BACKEND_URL"], "http://127.0.0.1:33442/mcp"
+            )
+
+    def test_start_local_injects_host_receipt_env_only_when_host_socket_is_listening(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest, runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
+            )
+            installed = json.loads(json.dumps(manifest))
+            installed["artifacts_sha256"] = {"bin/process-runtime": "a" * 64}
+            env = self._start_local_bridge_spawn_env(
+                layout, manifest, installed, host_socket="listening"
+            )
+            self.assertEqual(env["LAB_HOST_ADAPTER_SOCKET"], str(layout["host_socket"]))
+            self.assertEqual(
+                env["LAB_RUNTIME_HOST_TOOL_HOOK_SOCKET"],
+                str(layout["runtime_hook_socket"]),
+            )
+            self.assertEqual(
+                env["LAB_PROCESS_BACKEND_URL"], "http://127.0.0.1:33442/mcp"
+            )
+
     def test_status_exit_is_nonzero_until_tunnel_is_ready(self):
         manifest = self._manifest()
         argv = ["status", "--release-revision", REVISION, "--endpoint-generation", "7"]
