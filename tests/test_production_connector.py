@@ -170,7 +170,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
             if not path.exists():
                 path.write_text(f"// {relative}\n", encoding="utf-8")
             path.chmod(0o700 if relative == "chrome-host/runtime-verifier-cli.mjs" else 0o600)
-        for name in ("bridge", "catdesk", "process-runtime"):
+        for name in ("bridge", "catdesk", "process-runtime", "computer-runtime"):
             path = sources_root / name
             path.write_bytes(name.encode() * 32)
             path.chmod(0o700)
@@ -199,6 +199,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
         return {
             "bridge_binary": sources_root / "bridge",
             "process_runtime_binary": sources_root / "process-runtime",
+            "computer_runtime_binary": sources_root / "computer-runtime",
             "catdesk_binary": sources_root / "catdesk",
             "catdesk_config": sources_root / "catdesk-config",
             "catdesk_backend_key": sources_root / "catdesk-key",
@@ -421,7 +422,9 @@ class ProductionConnectorContractTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(RuntimeError, "discover_current_entry|stale"):
             pc.validate_tool_surface(old)
-        pc.validate_tool_surface(old | {"discover_current_entry"})
+        with self.assertRaisesRegex(RuntimeError, "computer_session_open|stale"):
+            pc.validate_tool_surface(old | {"discover_current_entry"})
+        pc.validate_tool_surface(old | {"discover_current_entry"} | set(pc.COMPUTER_REQUIRED_TOOLS))
 
     def test_workspace_validation_rejects_candidate_tmp_and_nonexistent_legacy_path(self):
         with self.assertRaisesRegex(RuntimeError, "candidate"):
@@ -5615,6 +5618,8 @@ class ProductionConnectorContractTests(unittest.TestCase):
             layout["bridge_binary"].chmod(0o700)
             layout["process_runtime_binary"].write_text("process-runtime", encoding="utf-8")
             layout["process_runtime_binary"].chmod(0o700)
+            layout["computer_runtime_binary"].write_text("computer-runtime", encoding="utf-8")
+            layout["computer_runtime_binary"].chmod(0o700)
             for key, value in (
                 ("release_catdesk_config", "mcpSlug = 'private'\n"),
                 ("release_catdesk_backend_key", "k" * 64),
@@ -5641,6 +5646,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 MagicMock(pid=803),
                 MagicMock(pid=804),
                 MagicMock(pid=805),
+                MagicMock(pid=806),
             ]
             identities = [
                 self._identity(process.pid, [f"/private/process-{process.pid}"])
@@ -5681,9 +5687,16 @@ class ProductionConnectorContractTests(unittest.TestCase):
                             "LAB_PROCESS_BACKEND_KEY_FILE": str(
                                 layout["process_runtime_backend_key"]
                             ),
+                            "LAB_COMPUTER_BACKEND_URL": "http://127.0.0.1:33443/mcp",
+                            "LAB_COMPUTER_BACKEND_KEY_FILE": str(
+                                layout["computer_runtime_backend_key"]
+                            ),
                         },
                         "process_runtime": {
                             "PROCESS_RUNTIME_BIND": "127.0.0.1:33442",
+                        },
+                        "computer_runtime": {
+                            "COMPUTER_RUNTIME_BIND": "127.0.0.1:33443",
                         },
                     },
                 ), patch.object(
@@ -5713,7 +5726,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
                         pc.start_local_runtime(manifest, layout)
             finally:
                 bridge_listener.close()
-            self.assertEqual(stop.call_count, 5)
+            self.assertEqual(stop.call_count, 6)
             stop_prior.assert_called_once_with(prior, layout)
             self.assertEqual(spawn.call_args_list[0].args[0][0], str(kernel_python))
             self.assertEqual(spawn.call_args_list[1].args[0][0], str(release_node))
@@ -5727,14 +5740,18 @@ class ProductionConnectorContractTests(unittest.TestCase):
             )
             self.assertEqual(
                 spawn.call_args_list[4].args[0][0],
+                str(layout["computer_runtime_binary"].resolve()),
+            )
+            self.assertEqual(
+                spawn.call_args_list[5].args[0][0],
                 str(layout["bridge_binary"].resolve()),
             )
             self.assertEqual(
-                spawn.call_args_list[4].kwargs["env"]["LAB_PROCESS_BACKEND_URL"],
+                spawn.call_args_list[5].kwargs["env"]["LAB_PROCESS_BACKEND_URL"],
                 "http://127.0.0.1:33442/mcp",
             )
             self.assertEqual(
-                spawn.call_args_list[4].kwargs["env"]["LAB_PROCESS_BACKEND_KEY_FILE"],
+                spawn.call_args_list[5].kwargs["env"]["LAB_PROCESS_BACKEND_KEY_FILE"],
                 str(layout["process_runtime_backend_key"]),
             )
             self.assertEqual(
@@ -6344,6 +6361,8 @@ class ProductionConnectorContractTests(unittest.TestCase):
         layout["process_runtime_binary"].parent.mkdir(parents=True, exist_ok=True)
         layout["process_runtime_binary"].write_text("process-runtime", encoding="utf-8")
         layout["process_runtime_binary"].chmod(0o700)
+        layout["computer_runtime_binary"].write_text("computer-runtime", encoding="utf-8")
+        layout["computer_runtime_binary"].chmod(0o700)
         for key, value in (
             ("release_catdesk_config", "mcpSlug = 'private'\n"),
             ("release_catdesk_backend_key", "k" * 64),
@@ -6358,7 +6377,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
         release_node.parent.mkdir(parents=True, exist_ok=True)
         release_node.write_text("release-node", encoding="utf-8")
         release_node.chmod(0o700)
-        processes = [MagicMock(pid=901 + index) for index in range(5)]
+        processes = [MagicMock(pid=901 + index) for index in range(6)]
         identities = [
             self._identity(process.pid, [f"/private/process-{process.pid}"])
             for process in processes
@@ -6368,6 +6387,8 @@ class ProductionConnectorContractTests(unittest.TestCase):
             "LAB_RUNTIME_HOST_TOOL_HOOK_SOCKET": str(layout["runtime_hook_socket"]),
             "LAB_PROCESS_BACKEND_URL": "http://127.0.0.1:33442/mcp",
             "LAB_PROCESS_BACKEND_KEY_FILE": str(layout["process_runtime_backend_key"]),
+            "LAB_COMPUTER_BACKEND_URL": "http://127.0.0.1:33443/mcp",
+            "LAB_COMPUTER_BACKEND_KEY_FILE": str(layout["computer_runtime_backend_key"]),
         }
         listener = None
         if host_socket == "listening":
@@ -6401,6 +6422,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
                     "host": {"LAB_HOST_ADAPTER_SOCKET": str(layout["host_socket"])},
                     "bridge": dict(receipt_env),
                     "process_runtime": {"PROCESS_RUNTIME_BIND": "127.0.0.1:33442"},
+                    "computer_runtime": {"COMPUTER_RUNTIME_BIND": "127.0.0.1:33443"},
                 },
             ), patch.object(
                 pc, "_kernel_python_executable", return_value=kernel_python
@@ -6428,8 +6450,8 @@ class ProductionConnectorContractTests(unittest.TestCase):
             ), patch.object(pc, "_stop_verified_process_identity"):
                 with self.assertRaisesRegex(RuntimeError, "post-start status"):
                     pc.start_local_runtime(manifest, layout)
-            self.assertEqual(spawn.call_count, 5)
-            return spawn.call_args_list[4].kwargs["env"]
+            self.assertEqual(spawn.call_count, 6)
+            return spawn.call_args_list[5].kwargs["env"]
         finally:
             if listener is not None:
                 listener.close()
@@ -6617,6 +6639,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
             "catdesk_port": 43331,
             "host_mcp_port": 43321,
             "process_runtime_port": 43442,
+            "computer_runtime_port": 43443,
         }
         with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
             root = Path(raw_root)
@@ -6629,6 +6652,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
             self.assertEqual(layout["catdesk_port"], 43331)
             self.assertEqual(layout["host_mcp_port"], 43321)
             self.assertEqual(layout["process_runtime_port"], 43442)
+            self.assertEqual(layout["computer_runtime_port"], 43443)
             self.assertNotEqual(layout["bridge_socket"], pc.PRODUCTION_BRIDGE_SOCKET)
             env = pc.production_component_env(
                 manifest, layout, catdesk_slug="private-slug"
@@ -6649,6 +6673,14 @@ class ProductionConnectorContractTests(unittest.TestCase):
             self.assertEqual(
                 env["process_runtime"]["PROCESS_RUNTIME_BIND"],
                 "127.0.0.1:43442",
+            )
+            self.assertEqual(
+                env["bridge"]["LAB_COMPUTER_BACKEND_URL"],
+                "http://127.0.0.1:43443/mcp",
+            )
+            self.assertEqual(
+                env["computer_runtime"]["COMPUTER_RUNTIME_BIND"],
+                "127.0.0.1:43443",
             )
             self.assertIn("'PORT': '43331'", pc._catdesk_runner_source(manifest, layout))
             prior = {
@@ -6710,9 +6742,13 @@ class ProductionConnectorContractTests(unittest.TestCase):
         layout["bridge_binary"].chmod(0o700)
         layout["process_runtime_binary"].write_text("process-runtime", encoding="utf-8")
         layout["process_runtime_binary"].chmod(0o700)
+        layout["computer_runtime_binary"].write_text("computer-runtime", encoding="utf-8")
+        layout["computer_runtime_binary"].chmod(0o700)
         layout["process_runtime_backend_key"].parent.mkdir(parents=True, exist_ok=True)
         layout["process_runtime_backend_key"].write_text("n" * 64, encoding="utf-8")
         layout["process_runtime_backend_key"].chmod(0o600)
+        layout["computer_runtime_backend_key"].write_text("c" * 64, encoding="utf-8")
+        layout["computer_runtime_backend_key"].chmod(0o600)
         prior_layout["catdesk_config"].parent.mkdir(parents=True, exist_ok=True)
         prior_layout["catdesk_config"].write_text("mcpSlug = 'private'\n", encoding="utf-8")
         prior_layout["catdesk_config"].chmod(0o600)
@@ -6753,7 +6789,10 @@ class ProductionConnectorContractTests(unittest.TestCase):
         }
         pc._write_json_private(layout["runtime_state"], prior)
         installed = json.loads(json.dumps(upgraded))
-        installed["artifacts_sha256"] = {"bin/process-runtime": "a" * 64}
+        installed["artifacts_sha256"] = {
+            "bin/process-runtime": "a" * 64,
+            "bin/computer-runtime": "b" * 64,
+        }
         return upgraded, layout, prior_layout, prior, installed, hook_identity
 
     def test_canonical_release_upgrade_reuses_live_catdesk_host_and_only_replaces_jobs_runtime(self):
@@ -6761,9 +6800,10 @@ class ProductionConnectorContractTests(unittest.TestCase):
             upgraded, layout, prior_layout, prior, installed, hook_identity = (
                 self._canonical_jobs_upgrade_fixture(raw_root)
             )
-            processes = [MagicMock(pid=9101), MagicMock(pid=9102)]
+            processes = [MagicMock(pid=9101), MagicMock(pid=9103), MagicMock(pid=9102)]
             identities = [
                 self._identity(9101, [str(layout["process_runtime_binary"].resolve())]),
+                self._identity(9103, [str(layout["computer_runtime_binary"].resolve())]),
                 self._identity(9102, [str(layout["bridge_binary"].resolve())]),
             ]
             stopped = []
@@ -6821,16 +6861,20 @@ class ProductionConnectorContractTests(unittest.TestCase):
             materialize.assert_not_called()
             wait_hook.assert_not_called()
             self.assertEqual(stopped, [12057, 61002])
-            self.assertEqual(spawn.call_count, 2)
+            self.assertEqual(spawn.call_count, 3)
             self.assertEqual(
                 spawn.call_args_list[0].args[0][0],
                 str(layout["process_runtime_binary"].resolve()),
             )
             self.assertEqual(
                 spawn.call_args_list[1].args[0][0],
+                str(layout["computer_runtime_binary"].resolve()),
+            )
+            self.assertEqual(
+                spawn.call_args_list[2].args[0][0],
                 str(layout["bridge_binary"].resolve()),
             )
-            bridge_env = spawn.call_args_list[1].kwargs["env"]
+            bridge_env = spawn.call_args_list[2].kwargs["env"]
             self.assertEqual(
                 bridge_env["LAB_BRIDGE_BACKEND_KEY_FILE"],
                 str(prior_layout["catdesk_backend_key"]),
@@ -6868,6 +6912,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
             self.assertEqual(state["host_pid"], 60989)
             self.assertEqual(state["runtime_hook_pid"], 60995)
             self.assertEqual(state["process_runtime_pid"], 9101)
+            self.assertEqual(state["computer_runtime_pid"], 9103)
             self.assertEqual(state["bridge_pid"], 9102)
             self.assertEqual(state["runtime_hook_socket_identity"], hook_identity)
             self.assertEqual(
@@ -6916,6 +6961,283 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 json.loads(layout["runtime_state"].read_text(encoding="utf-8")),
                 prior,
             )
+
+    def test_release_manifest_requires_computer_runtime_tools(self):
+        manifest = self._manifest()
+        for tool in (
+            "computer_session_open",
+            "computer_session_close",
+            "computer_permissions",
+            "computer_list_windows",
+            "computer_screenshot",
+            "computer_find",
+            "computer_click",
+            "computer_click_at",
+            "computer_type",
+            "computer_key",
+            "computer_scroll",
+        ):
+            self.assertIn(tool, pc.REQUIRED_TOOLS)
+            self.assertIn(tool, manifest["required_tools"])
+            self.assertIn(tool, pc.COMPUTER_REQUIRED_TOOLS)
+        self.assertTrue(pc.COMPUTER_REQUIRED_TOOLS.issubset(pc.REQUIRED_TOOLS))
+        self.assertIn("start_command", manifest["required_tools"])
+        self.assertEqual(pc.PRODUCTION_COMPUTER_RUNTIME_PORT, 33443)
+        self.assertNotEqual(pc.PRODUCTION_COMPUTER_RUNTIME_PORT, pc.PRODUCTION_PROCESS_RUNTIME_PORT)
+        self.assertNotEqual(pc.PRODUCTION_COMPUTER_RUNTIME_PORT, pc.PRODUCTION_CATDESK_PORT)
+        self.assertNotEqual(pc.PRODUCTION_COMPUTER_RUNTIME_PORT, pc.PRODUCTION_HOST_MCP_PORT)
+
+    def test_production_computer_backend_env_is_paired_and_fail_closed(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest, runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
+            )
+            self.assertEqual(
+                layout["computer_runtime_binary"],
+                layout["release_dir"] / "bin" / "computer-runtime",
+            )
+            self.assertEqual(
+                layout["computer_runtime_backend_key"],
+                layout["release_dir"] / "secrets" / "computer-runtime-backend.key",
+            )
+            self.assertEqual(layout["computer_runtime_port"], pc.PRODUCTION_COMPUTER_RUNTIME_PORT)
+            env = pc.production_component_env(
+                manifest, layout, catdesk_slug="private-slug"
+            )
+            self.assertIn("computer", env["bridge"]["LAB_BRIDGE_CAPABILITIES"])
+            self.assertIn("process_jobs", env["bridge"]["LAB_BRIDGE_CAPABILITIES"])
+            self.assertEqual(
+                env["bridge"]["LAB_COMPUTER_BACKEND_URL"],
+                f"http://127.0.0.1:{pc.PRODUCTION_COMPUTER_RUNTIME_PORT}/mcp",
+            )
+            self.assertEqual(
+                env["bridge"]["LAB_COMPUTER_BACKEND_KEY_FILE"],
+                str(layout["computer_runtime_backend_key"]),
+            )
+            self.assertEqual(
+                env["computer_runtime"]["COMPUTER_RUNTIME_BIND"],
+                f"127.0.0.1:{pc.PRODUCTION_COMPUTER_RUNTIME_PORT}",
+            )
+            self.assertEqual(
+                env["computer_runtime"]["COMPUTER_RUNTIME_BACKEND_KEY_FILE"],
+                str(layout["computer_runtime_backend_key"]),
+            )
+            pc._require_paired_backend_env(
+                env["bridge"],
+                url_key="LAB_COMPUTER_BACKEND_URL",
+                key_file_key="LAB_COMPUTER_BACKEND_KEY_FILE",
+                label="computer",
+            )
+            with self.assertRaisesRegex(RuntimeError, "together"):
+                pc._require_paired_backend_env(
+                    {"LAB_COMPUTER_BACKEND_URL": env["bridge"]["LAB_COMPUTER_BACKEND_URL"]},
+                    url_key="LAB_COMPUTER_BACKEND_URL",
+                    key_file_key="LAB_COMPUTER_BACKEND_KEY_FILE",
+                    label="computer",
+                )
+            isolated = pc.production_layout(
+                manifest,
+                runtime_root=root / "isolated",
+                bridge_socket=root / "isolated.sock",
+                catdesk_port=43331,
+                host_mcp_port=43321,
+                process_runtime_port=43442,
+                computer_runtime_port=43443,
+            )
+            self.assertEqual(isolated["computer_runtime_port"], 43443)
+            isolated_env = pc.production_component_env(
+                manifest, isolated, catdesk_slug="private-slug"
+            )
+            self.assertEqual(
+                isolated_env["bridge"]["LAB_COMPUTER_BACKEND_URL"],
+                "http://127.0.0.1:43443/mcp",
+            )
+            self.assertEqual(
+                isolated_env["computer_runtime"]["COMPUTER_RUNTIME_BIND"],
+                "127.0.0.1:43443",
+            )
+            self.assertTrue(pc._layout_is_parallel_generation(isolated))
+            canonical = pc.production_layout(
+                manifest,
+                runtime_root=pc.PRODUCTION_RUNTIME_ROOT,
+                bridge_socket=pc.PRODUCTION_BRIDGE_SOCKET,
+            )
+            self.assertTrue(pc._layout_is_canonical_production(canonical))
+
+    def test_default_release_sources_include_computer_runtime(self):
+        sources = pc.default_release_sources()
+        self.assertEqual(
+            sources["computer_runtime_binary"],
+            pc.CANONICAL_PROJECT_ROOT
+            / "crates"
+            / "computer-runtime"
+            / "target"
+            / "release"
+            / "computer-runtime",
+        )
+
+    def test_install_release_bundle_copies_computer_runtime_binary(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
+            root = Path(raw_root)
+            sources = self._release_sources(root)
+            layout = pc.production_layout(
+                manifest,
+                runtime_root=root / "runtime",
+                bridge_socket=root / "socket" / "bridge.sock",
+            )
+            pc.install_release_bundle(manifest, layout, sources)
+            self.assertTrue(layout["computer_runtime_binary"].is_file())
+            self.assertEqual(stat.S_IMODE(layout["computer_runtime_binary"].stat().st_mode), 0o700)
+            self.assertEqual(
+                layout["computer_runtime_binary"].read_bytes(),
+                sources["computer_runtime_binary"].read_bytes(),
+            )
+            self.assertEqual(stat.S_IMODE(layout["computer_runtime_backend_key"].stat().st_mode), 0o600)
+            self.assertGreaterEqual(layout["computer_runtime_backend_key"].stat().st_size, 64)
+            installed = json.loads(layout["release_manifest"].read_text(encoding="utf-8"))
+            self.assertIn("bin/computer-runtime", installed["artifacts_sha256"])
+            self.assertIn("secrets/computer-runtime-backend.key", installed["artifacts_sha256"])
+
+    def test_start_local_fail_closes_when_computer_backend_env_is_unpaired(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest, runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
+            )
+            for key, value in (
+                ("release_catdesk_config", "mcpSlug = 'private'\n"),
+                ("release_catdesk_backend_key", "k" * 64),
+            ):
+                layout[key].parent.mkdir(parents=True, exist_ok=True)
+                layout[key].write_text(value, encoding="utf-8")
+                layout[key].chmod(0o600)
+            installed = json.loads(json.dumps(manifest))
+            installed["artifacts_sha256"] = {
+                "bin/process-runtime": "a" * 64,
+                "bin/computer-runtime": "b" * 64,
+            }
+            with patch.object(
+                pc, "validate_installed_release", return_value=installed
+            ), patch.object(
+                pc, "production_status", return_value={"local_runtime_ready": False, "tunnel_ready": False}
+            ), patch.object(pc, "_tcp_ready", return_value=False), patch.object(
+                pc, "_catdesk_slug", return_value="private"
+            ), patch.object(
+                pc,
+                "production_component_env",
+                return_value={
+                    "host": {},
+                    "bridge": {
+                        "LAB_PROCESS_BACKEND_URL": "http://127.0.0.1:33442/mcp",
+                        "LAB_PROCESS_BACKEND_KEY_FILE": str(layout["process_runtime_backend_key"]),
+                        "LAB_COMPUTER_BACKEND_URL": "http://127.0.0.1:33443/mcp",
+                    },
+                    "process_runtime": {"PROCESS_RUNTIME_BIND": "127.0.0.1:33442"},
+                    "computer_runtime": {"COMPUTER_RUNTIME_BIND": "127.0.0.1:33443"},
+                },
+            ), patch.object(pc, "_spawn_logged") as spawn:
+                with self.assertRaisesRegex(RuntimeError, "together"):
+                    pc.start_local_runtime(manifest, layout)
+            spawn.assert_not_called()
+
+    def test_canonical_jobs_upgrade_spawns_computer_runtime_after_process_runtime(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
+            upgraded, layout, prior_layout, prior, installed, hook_identity = (
+                self._canonical_jobs_upgrade_fixture(raw_root)
+            )
+            layout["computer_runtime_binary"].write_text("computer-runtime", encoding="utf-8")
+            layout["computer_runtime_binary"].chmod(0o700)
+            layout["computer_runtime_backend_key"].parent.mkdir(parents=True, exist_ok=True)
+            layout["computer_runtime_backend_key"].write_text("c" * 64, encoding="utf-8")
+            layout["computer_runtime_backend_key"].chmod(0o600)
+            processes = [MagicMock(pid=9101), MagicMock(pid=9103), MagicMock(pid=9102)]
+            identities = [
+                self._identity(9101, [str(layout["process_runtime_binary"].resolve())]),
+                self._identity(9103, [str(layout["computer_runtime_binary"].resolve())]),
+                self._identity(9102, [str(layout["bridge_binary"].resolve())]),
+            ]
+            stopped = []
+
+            def tcp_ready(_host, port):
+                return port in {pc.PRODUCTION_CATDESK_PORT, pc.PRODUCTION_HOST_MCP_PORT}
+
+            with patch.object(pc, "PRODUCTION_RUNTIME_ROOT", layout["runtime_root"]), patch.object(
+                pc, "PRODUCTION_BRIDGE_SOCKET", layout["bridge_socket"]
+            ), patch.object(
+                pc, "validate_installed_release", return_value=installed
+            ), patch.object(
+                pc,
+                "production_status",
+                side_effect=[
+                    {"local_runtime_ready": False, "tunnel_ready": True},
+                    {
+                        "local_runtime_ready": True,
+                        "tunnel_ready": True,
+                        "catdesk_supervisor_pid": 60946,
+                        "host_pid": 60989,
+                    },
+                ],
+            ), patch.object(pc, "_tcp_ready", side_effect=tcp_ready), patch.object(
+                pc, "_process_identity_matches", return_value=True
+            ), patch.object(
+                pc, "_runtime_hook_socket_is_live", return_value=True
+            ), patch.object(
+                pc, "_host_adapter_socket_is_listening", return_value=True
+            ), patch.object(
+                pc, "_stop_prior_local_runtime_for_release_upgrade"
+            ) as stop_prior, patch.object(
+                pc, "_stop_verified_local_runtime"
+            ) as stop_verified, patch.object(
+                pc, "_materialize_catdesk_runtime"
+            ) as materialize, patch.object(
+                pc,
+                "_stop_verified_process_identity",
+                side_effect=lambda identity, process_group=False, process=None: stopped.append(
+                    identity["pid"]
+                ),
+            ), patch.object(
+                pc, "_spawn_logged", side_effect=processes
+            ) as spawn, patch.object(
+                pc, "_capture_process_identity", side_effect=identities
+            ), patch.object(pc, "_wait_for_tcp"), patch.object(
+                pc, "_wait_for_bridge", return_value=sorted(pc.REQUIRED_TOOLS)
+            ), patch.object(pc, "_wait_for_runtime_hook") as wait_hook:
+                result = pc.start_local_runtime(upgraded, layout)
+
+            stop_prior.assert_not_called()
+            stop_verified.assert_not_called()
+            materialize.assert_not_called()
+            wait_hook.assert_not_called()
+            self.assertEqual(stopped, [12057, 61002])
+            self.assertEqual(spawn.call_count, 3)
+            self.assertEqual(
+                spawn.call_args_list[0].args[0][0],
+                str(layout["process_runtime_binary"].resolve()),
+            )
+            self.assertEqual(
+                spawn.call_args_list[1].args[0][0],
+                str(layout["computer_runtime_binary"].resolve()),
+            )
+            self.assertEqual(
+                spawn.call_args_list[2].args[0][0],
+                str(layout["bridge_binary"].resolve()),
+            )
+            bridge_env = spawn.call_args_list[2].kwargs["env"]
+            self.assertEqual(
+                bridge_env["LAB_COMPUTER_BACKEND_KEY_FILE"],
+                str(layout["computer_runtime_backend_key"]),
+            )
+            self.assertIn("computer", bridge_env["LAB_BRIDGE_CAPABILITIES"])
+            state = json.loads(layout["runtime_state"].read_text(encoding="utf-8"))
+            self.assertEqual(state["process_runtime_pid"], 9101)
+            self.assertEqual(state["computer_runtime_pid"], 9103)
+            self.assertEqual(state["bridge_pid"], 9102)
+            self.assertEqual(result["catdesk_supervisor_pid"], 60946)
+            self.assertEqual(result["host_pid"], 60989)
 
 
 if __name__ == "__main__":
