@@ -137,21 +137,23 @@ If a platform safety layer explicitly blocks an operation:
 
 Agents must not infer that `smaller command = allowed` or `larger command = blocked`. The goal is clear intent, least necessary side effect, easier review, and reliable failure localization.
 
-## 2. Current Controller identity (host-attested)
+## 2. Current Controller identity
 
-Fresh registry fact for this repository's unique logical Controller `a697051d-402b-4062-a883-a29ba8b395e9`:
+Unique logical Controller: `a697051d-402b-4062-a883-a29ba8b395e9`. Not two Controllers.
 
-- Web execution target `6aacbb08-5204-83ec-8a8e-ddcfdb6f8edb`
-- target/ownership generation **11 / 11**
-- `provenance = host_attested_same_controller_recovery`
-- `identity_proof = host_attested_origin`
-- execution ownership `active_host = web`
+**On duty now (desktop):**
 
-This is **strong identity binding**, not bootstrap. Do not describe current Controller identity as `manual_user_authorized` or `host_attested=false`.
+- host `desktop_codex`
+- session `01a0b48e-76a7-7a60-9448-a4ba1deabdf2`
+- desktop target generation **1**
+- execution ownership generation **12**, `provenance = desktop_entry`
+- identity projection: `VERIFIED` / `CURRENT_EXECUTION_TARGET` / `controller_actions_allowed=true`
 
-Historical bootstrap Web IDs (`6a9e41a2-…`, `6a9e4158-…`, `6a9e4037-…` and other `manual_user_authorized` aliases) are audit lineage only. They must not be used as current ownership, attested as the live target, or revived as a second Controller.
+**Web lineage (not on duty):** session `6aacbb08-5204-83ec-8a8e-ddcfdb6f8edb`, generation 11, `identity_proof=host_attested_origin`. Kept as attested lineage. LAB-GOV-02 accept-live-e2e still requires that Web host path; do not treat missing E2E stamp as missing binding.
 
-Controller-gated actions (rule ACK, accept-live-e2e, defer-live-e2e, project Goal rollover, ledger CAS) require the caller to be this Controller's **canonical current target** at the current generation. This desktop Codex thread is an executor/entry unless the registry says otherwise.
+Historical bootstrap Web IDs (`6a9e41a2-…`, `6a9e4158-…`, `6a9e4037-…` and `manual_user_authorized` aliases) are audit only.
+
+**Enforcement (not prose):** `replace-desktop-session` claims ownership in the same lock when this window is appointed current. `bind-desktop-session` does not take duty. Codex `~/.codex/hooks.json` already runs `lifecycle_hook.py` from the Adaptive Agent Runtime skill. Markdown in this file is the contract; the hook/registry is the gate.
 
 ## 3. Remaining identity gate (LAB-GOV-02)
 
