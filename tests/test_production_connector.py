@@ -2328,6 +2328,81 @@ class ProductionConnectorContractTests(unittest.TestCase):
             self.assertFalse(status["ready"])
             self.assertEqual(status["reason"], "multiple_active_tunnels")
 
+    def test_production_tunnel_status_names_runtime_json_pid_and_generation_on_mismatch(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest, runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
+            )
+            layout["tunnel_dir"].mkdir(parents=True)
+            profile = {
+                "control_plane": {
+                    "tunnel_id": "tunnel-production",
+                    "base_url": "https://api.openai.com",
+                    "api_key": "file:/private/key",
+                },
+                "mcp": {"server_urls": [{"unix_socket": str(layout["bridge_socket"])}]},
+            }
+            layout["tunnel_profile"].write_text(json.dumps(profile), encoding="utf-8")
+            layout["tunnel_profile"].chmod(0o600)
+            live_identity = {
+                "pid": 717,
+                "uid": os.geteuid(),
+                "lstart": "Sat Sep 19 00:22:44 2026",
+                "start_timestamp": 1789748564.0,
+                "pgid": 717,
+                "exe_realpath": "/opt/tunnel-client",
+                "exe_inode": 123,
+                "exe_sha256": "a" * 64,
+                "argv": [
+                    "/opt/tunnel-client", "run", "--profile-dir", str(layout["tunnel_dir"]),
+                    "--profile", pc.TUNNEL_PROFILE_NAME,
+                ],
+            }
+            recorded_identity = {
+                **live_identity,
+                "pid": 716,
+                "pgid": 716,
+                "lstart": "Fri Sep 18 22:48:11 2026",
+                "start_timestamp": 1789742891.0,
+            }
+            layout["runtime_state"].parent.mkdir(parents=True, exist_ok=True)
+            layout["runtime_state"].write_text(json.dumps({
+                "release_revision": REVISION,
+                "endpoint_generation": 7,
+                "tunnel_profile_name": pc.TUNNEL_PROFILE_NAME,
+                "tunnel_pid": 716,
+                "tunnel_id": "tunnel-production",
+                "tunnel_profile_sha256": pc._sha256_file(layout["tunnel_profile"]),
+                "tunnel_started_at": 1000.0,
+                "tunnel_process_identity": recorded_identity,
+            }), encoding="utf-8")
+            layout["runtime_state"].chmod(0o600)
+            discovered = [{
+                "pid": 717,
+                "command": f"/opt/tunnel-client run --profile-dir {layout['tunnel_dir']} --profile {pc.TUNNEL_PROFILE_NAME}",
+                "profile_dir": str(layout["tunnel_dir"]),
+                "profile_path": str(layout["tunnel_profile"]),
+                "profile_sha256": pc._sha256_file(layout["tunnel_profile"]),
+                "tunnel_id": "tunnel-production",
+                "process_identity": live_identity,
+            }]
+            with patch.object(pc, "_discover_tunnel_processes", return_value=discovered), patch.object(
+                pc, "_discover_tunnels_by_id", return_value=list(discovered)
+            ), patch.object(pc, "_pid_alive", return_value=False), patch.object(
+                pc, "_verify_tunnel_operational", return_value={"ok": True}
+            ):
+                status = pc.production_tunnel_status(manifest, layout)
+            self.assertFalse(status["ready"])
+            reason = status["reason"]
+            self.assertTrue(reason.startswith("runtime_state_mismatch:"))
+            self.assertIn(f"state={layout['runtime_state']}", reason)
+            self.assertIn("endpoint_generation recorded=7 expected=7", reason)
+            self.assertIn("tunnel_pid recorded=716 recorded_alive=false live=717", reason)
+            self.assertIn("tunnel_process_identity keys=lstart,pgid,pid,start_timestamp", reason)
+            self.assertNotIn("release_revision recorded=", reason)
+
     def test_tunnel_operational_gate_requires_loopback_exact_status_and_fresh_structured_event_chain(self):
         manifest = self._manifest()
         with tempfile.TemporaryDirectory() as raw_root:

@@ -2839,6 +2839,78 @@ def _require_exact_tunnel_id_owners(
         raise RuntimeError("same tunnel-id owner does not match the exact expected MCP endpoint")
 
 
+def _runtime_state_mismatch_reason(
+    *,
+    runtime_state: Path,
+    state: dict[str, Any],
+    manifest: dict[str, Any],
+    expected: dict[str, Any],
+    item: dict[str, Any],
+) -> str:
+    """Fail-closed reason naming the runtime.json, pid, and generation that drifted."""
+    mismatches: list[str] = [
+        f"state={Path(runtime_state)}",
+        (
+            "endpoint_generation"
+            f" recorded={state.get('endpoint_generation')!s}"
+            f" expected={manifest['endpoint_generation']!s}"
+        ),
+    ]
+    if state.get("release_revision") != manifest["release_revision"]:
+        mismatches.append(
+            "release_revision"
+            f" recorded={state.get('release_revision')!s}"
+            f" expected={manifest['release_revision']!s}"
+        )
+    if state.get("tunnel_profile_name") != TUNNEL_PROFILE_NAME:
+        mismatches.append(
+            "tunnel_profile_name"
+            f" recorded={state.get('tunnel_profile_name')!s}"
+            f" expected={TUNNEL_PROFILE_NAME}"
+        )
+    recorded_pid = state.get("tunnel_pid")
+    live_pid = item.get("pid")
+    if recorded_pid != live_pid:
+        recorded_alive = isinstance(recorded_pid, int) and _pid_alive(recorded_pid)
+        mismatches.append(
+            "tunnel_pid"
+            f" recorded={recorded_pid!s}"
+            f" recorded_alive={str(recorded_alive).lower()}"
+            f" live={live_pid!s}"
+        )
+    if state.get("tunnel_id") != item.get("tunnel_id"):
+        mismatches.append(
+            "tunnel_id"
+            f" recorded={state.get('tunnel_id')!s}"
+            f" expected={item.get('tunnel_id')!s}"
+        )
+    if state.get("tunnel_profile_sha256") != expected.get("profile_sha256"):
+        mismatches.append(
+            "tunnel_profile_sha256"
+            f" recorded={state.get('tunnel_profile_sha256')!s}"
+            f" expected={expected.get('profile_sha256')!s}"
+        )
+    started_at = state.get("tunnel_started_at")
+    if not isinstance(started_at, (int, float)) or isinstance(started_at, bool):
+        mismatches.append(f"tunnel_started_at recorded={started_at!r} expected=finite_number")
+    recorded_identity = state.get("tunnel_process_identity")
+    live_identity = item.get("process_identity")
+    if not isinstance(recorded_identity, dict):
+        mismatches.append("tunnel_process_identity recorded=missing_or_not_object")
+    elif recorded_identity != live_identity:
+        keys = []
+        if isinstance(live_identity, dict):
+            keys = sorted(
+                key
+                for key in set(recorded_identity) | set(live_identity)
+                if recorded_identity.get(key) != live_identity.get(key)
+            )
+        mismatches.append(
+            "tunnel_process_identity keys=" + (",".join(keys) if keys else "object")
+        )
+    return "runtime_state_mismatch:" + ";".join(mismatches)
+
+
 def production_tunnel_status(
     manifest: dict[str, Any],
     layout: dict[str, Path],
@@ -2905,7 +2977,13 @@ def production_tunnel_status(
         and item.get("process_identity") == recorded_identity
     )
     operational: dict[str, Any] | None = None
-    reason = None if canonical else "runtime_state_mismatch"
+    reason = None if canonical else _runtime_state_mismatch_reason(
+        runtime_state=layout["runtime_state"],
+        state=state,
+        manifest=manifest,
+        expected=expected,
+        item=item,
+    )
     if canonical:
         try:
             operational = _verify_tunnel_operational(
