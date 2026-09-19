@@ -3327,6 +3327,170 @@ def _record_production_tunnel(
     _write_json_private(layout["runtime_state"], state)
 
 
+def reconcile_dead_recorded_tunnel_pid_to_live_exclusive(
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+) -> dict[str, Any]:
+    """Atomically rebind a dead recorded tunnel_pid onto the live exclusive.
+
+    Only rewrites tunnel_pid and tunnel_process_identity. Never claims tunnel_ready.
+    """
+    with _production_install_lock(layout["runtime_root"]):
+        return _reconcile_dead_recorded_tunnel_pid_to_live_exclusive_unlocked(
+            manifest, layout
+        )
+
+
+def _reconcile_dead_recorded_tunnel_pid_to_live_exclusive_unlocked(
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+) -> dict[str, Any]:
+    _validate_manifest_contract(manifest)
+    expected = _validate_tunnel_profile(
+        layout["tunnel_profile"],
+        profile_name=TUNNEL_PROFILE_NAME,
+        expected_socket=layout["bridge_socket"],
+    )
+    discovered = _discover_tunnel_processes(
+        profile_dir=layout["tunnel_dir"],
+        profile_name=TUNNEL_PROFILE_NAME,
+        expected_socket=layout["bridge_socket"],
+    )
+    if len(discovered) != 1:
+        raise RuntimeError(
+            "cannot reconcile tunnel pid without a unique live exclusive tunnel"
+        )
+    item = discovered[0]
+    try:
+        owners = _discover_tunnels_by_id(
+            item["tunnel_id"], expected_socket=layout["bridge_socket"]
+        )
+    except RuntimeError as error:
+        raise RuntimeError(
+            f"cannot reconcile tunnel pid because tunnel-id exclusivity is unproven: {error}"
+        ) from error
+    if {owner.get("pid") for owner in owners} != {item["pid"]}:
+        raise RuntimeError(
+            "cannot reconcile tunnel pid because same tunnel-id ownership is not globally exclusive"
+        )
+
+    snapshot = _private_file_snapshot(layout["runtime_state"], "production runtime state")
+    state = _decode_private_json_snapshot(snapshot, "production runtime state")
+    live_pid = item.get("pid")
+    live_identity = item.get("process_identity")
+    if not isinstance(live_pid, int) or live_pid < 1:
+        raise RuntimeError("cannot reconcile tunnel pid because live exclusive pid is invalid")
+    _validate_process_identity_record(live_identity)
+    if live_identity.get("pid") != live_pid:
+        raise RuntimeError("cannot reconcile tunnel pid because live identity pid mismatches the exclusive process")
+
+    expected_dir = Path(layout["tunnel_dir"]).expanduser().resolve()
+    live_dir = Path(str(item.get("profile_dir") or "")).expanduser().resolve()
+    if live_dir != expected_dir:
+        raise RuntimeError(
+            "cannot reconcile tunnel pid because live exclusive profile dir does not match production"
+        )
+    if item.get("tunnel_id") != expected.get("tunnel_id"):
+        raise RuntimeError(
+            "cannot reconcile tunnel pid because live exclusive tunnel_id does not match the profile"
+        )
+    if item.get("profile_sha256") != expected.get("profile_sha256"):
+        raise RuntimeError(
+            "cannot reconcile tunnel pid because live exclusive profile hash does not match the profile"
+        )
+    if state.get("endpoint_generation") != manifest["endpoint_generation"]:
+        raise RuntimeError(
+            "cannot reconcile tunnel pid because endpoint generation does not match live exclusive"
+        )
+    if state.get("release_revision") != manifest["release_revision"]:
+        raise RuntimeError(
+            "cannot reconcile tunnel pid because release revision does not match live exclusive"
+        )
+    if state.get("tunnel_profile_name") != TUNNEL_PROFILE_NAME:
+        raise RuntimeError(
+            "cannot reconcile tunnel pid because recorded profile name does not match live exclusive"
+        )
+    if state.get("tunnel_id") != item.get("tunnel_id"):
+        raise RuntimeError(
+            "cannot reconcile tunnel pid because recorded tunnel_id does not match live exclusive"
+        )
+    if state.get("tunnel_profile_sha256") != expected.get("profile_sha256"):
+        raise RuntimeError(
+            "cannot reconcile tunnel pid because recorded profile hash does not match live exclusive"
+        )
+
+    recorded_pid = state.get("tunnel_pid")
+    if not isinstance(recorded_pid, int) or recorded_pid < 1:
+        raise RuntimeError("cannot reconcile tunnel pid because recorded pid is invalid")
+
+    result = {
+        "reconciled": False,
+        "recorded_pid_before": recorded_pid,
+        "live_pid": live_pid,
+        "tunnel_id": item["tunnel_id"],
+        "endpoint_generation": manifest["endpoint_generation"],
+        "tunnel_ready": False,
+    }
+    if recorded_pid == live_pid:
+        if state.get("tunnel_process_identity") != live_identity:
+            raise RuntimeError(
+                "cannot reconcile tunnel pid because recorded pid is already live but process identity drifted"
+            )
+        result["already_current"] = True
+        return result
+    if _pid_alive(recorded_pid):
+        raise RuntimeError(
+            f"cannot reconcile tunnel pid because recorded pid {recorded_pid} is still alive"
+        )
+
+    current = _read_private_bytes_if_present(
+        layout["runtime_state"], "production runtime state tunnel pid reconcile CAS"
+    )
+    if current != snapshot[0]:
+        raise RuntimeError("production runtime state changed before tunnel pid reconcile")
+
+    updated = dict(state)
+    updated["tunnel_pid"] = live_pid
+    updated["tunnel_process_identity"] = live_identity
+    expected_bytes = (
+        json.dumps(updated, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    write_started = False
+    try:
+        write_started = True
+        _write_json_private(layout["runtime_state"], updated)
+        readback = _read_private_bytes_if_present(
+            layout["runtime_state"], "production runtime state tunnel pid reconcile readback"
+        )
+        if readback != expected_bytes:
+            raise RuntimeError("tunnel pid reconcile readback mismatch")
+        rediscovered = _discover_tunnel_processes(
+            profile_dir=layout["tunnel_dir"],
+            profile_name=TUNNEL_PROFILE_NAME,
+            expected_socket=layout["bridge_socket"],
+        )
+        if (
+            len(rediscovered) != 1
+            or rediscovered[0].get("pid") != live_pid
+            or rediscovered[0].get("process_identity") != live_identity
+            or rediscovered[0].get("tunnel_id") != item.get("tunnel_id")
+        ):
+            raise RuntimeError("live exclusive tunnel drifted after tunnel pid reconcile")
+    except Exception as error:
+        if write_started:
+            try:
+                _restore_private_file_snapshot(
+                    layout["runtime_state"], snapshot, private_parent=True
+                )
+            except Exception as restore_error:
+                raise RuntimeError(
+                    f"{error}; tunnel pid reconcile restore failed: {restore_error}"
+                ) from error
+        raise
+    result["reconciled"] = True
+    return result
+
+
 def _write_activation_rollback_receipt(
     manifest: dict[str, Any],
     layout: dict[str, Path],

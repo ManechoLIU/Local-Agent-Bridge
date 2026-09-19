@@ -2403,6 +2403,159 @@ class ProductionConnectorContractTests(unittest.TestCase):
             self.assertIn("tunnel_process_identity keys=lstart,pgid,pid,start_timestamp", reason)
             self.assertNotIn("release_revision recorded=", reason)
 
+    def _dead_pid_live_exclusive_fixture(self, root, *, recorded_pid=716, live_pid=717, generation=7, tunnel_id="tunnel-production", recorded_tunnel_id=None, recorded_generation=None, recorded_profile_name=None, recorded_profile_sha256=None):
+        manifest = self._manifest(generation)
+        layout = pc.production_layout(
+            manifest, runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
+        )
+        layout["tunnel_dir"].mkdir(parents=True)
+        profile = {
+            "control_plane": {
+                "tunnel_id": tunnel_id,
+                "base_url": "https://api.openai.com",
+                "api_key": "file:/private/key",
+            },
+            "mcp": {"server_urls": [{"unix_socket": str(layout["bridge_socket"])}]},
+        }
+        layout["tunnel_profile"].write_text(json.dumps(profile), encoding="utf-8")
+        layout["tunnel_profile"].chmod(0o600)
+        profile_sha256 = pc._sha256_file(layout["tunnel_profile"])
+        live_identity = {
+            "pid": live_pid,
+            "uid": os.geteuid(),
+            "lstart": "Sat Sep 19 00:22:44 2026",
+            "start_timestamp": 1789748564.0,
+            "pgid": live_pid,
+            "exe_realpath": "/opt/tunnel-client",
+            "exe_inode": 123,
+            "exe_sha256": "a" * 64,
+            "argv": [
+                "/opt/tunnel-client", "run", "--profile-dir", str(layout["tunnel_dir"]),
+                "--profile", pc.TUNNEL_PROFILE_NAME,
+            ],
+        }
+        recorded_identity = {
+            **live_identity,
+            "pid": recorded_pid,
+            "pgid": recorded_pid,
+            "lstart": "Fri Sep 18 22:48:11 2026",
+            "start_timestamp": 1789742891.0,
+        }
+        layout["runtime_state"].parent.mkdir(parents=True, exist_ok=True)
+        state = {
+            "release_revision": REVISION,
+            "endpoint_generation": generation if recorded_generation is None else recorded_generation,
+            "workspace": str(pc.canonical_workspace()),
+            "tunnel_profile_name": pc.TUNNEL_PROFILE_NAME if recorded_profile_name is None else recorded_profile_name,
+            "tunnel_pid": recorded_pid,
+            "tunnel_id": tunnel_id if recorded_tunnel_id is None else recorded_tunnel_id,
+            "tunnel_profile_sha256": profile_sha256 if recorded_profile_sha256 is None else recorded_profile_sha256,
+            "tunnel_started_at": 1000.0,
+            "tunnel_process_identity": recorded_identity,
+            "bridge_pid": 62454,
+        }
+        layout["runtime_state"].write_text(json.dumps(state), encoding="utf-8")
+        layout["runtime_state"].chmod(0o600)
+        discovered = [{
+            "pid": live_pid,
+            "command": f"/opt/tunnel-client run --profile-dir {layout['tunnel_dir']} --profile {pc.TUNNEL_PROFILE_NAME}",
+            "profile_dir": str(layout["tunnel_dir"].resolve()),
+            "profile_path": str(layout["tunnel_profile"]),
+            "profile_sha256": profile_sha256,
+            "tunnel_id": tunnel_id,
+            "process_identity": live_identity,
+        }]
+        return manifest, layout, state, discovered, live_identity
+
+    def test_reconcile_dead_recorded_tunnel_pid_to_live_exclusive_rewrites_only_pid_and_identity(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            manifest, layout, before, discovered, live_identity = self._dead_pid_live_exclusive_fixture(root)
+            before_bytes = layout["runtime_state"].read_bytes()
+            with patch.object(pc, "_discover_tunnel_processes", return_value=discovered), patch.object(
+                pc, "_discover_tunnels_by_id", return_value=list(discovered)
+            ), patch.object(pc, "_pid_alive", return_value=False), patch.object(
+                pc, "_verify_tunnel_operational", return_value={"ok": True}
+            ):
+                result = pc.reconcile_dead_recorded_tunnel_pid_to_live_exclusive(manifest, layout)
+                status = pc.production_tunnel_status(manifest, layout)
+            self.assertTrue(result["reconciled"])
+            self.assertFalse(result["tunnel_ready"])
+            self.assertEqual(result["recorded_pid_before"], 716)
+            self.assertEqual(result["live_pid"], 717)
+            state = json.loads(layout["runtime_state"].read_text(encoding="utf-8"))
+            self.assertEqual(state["tunnel_pid"], 717)
+            self.assertEqual(state["tunnel_process_identity"], live_identity)
+            self.assertEqual(state["tunnel_started_at"], 1000.0)
+            self.assertEqual(state["tunnel_id"], before["tunnel_id"])
+            self.assertEqual(state["endpoint_generation"], before["endpoint_generation"])
+            self.assertEqual(state["bridge_pid"], 62454)
+            self.assertNotEqual(layout["runtime_state"].read_bytes(), before_bytes)
+            self.assertTrue(status["ready"])
+            self.assertEqual(status["pid"], 717)
+            self.assertIsNone(status["reason"])
+            self.assertNotIn("716", json.dumps(status))
+
+    def test_reconcile_dead_recorded_tunnel_pid_fail_closed_when_recorded_pid_alive(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            manifest, layout, _, discovered, _ = self._dead_pid_live_exclusive_fixture(root)
+            before = layout["runtime_state"].read_bytes()
+            with patch.object(pc, "_discover_tunnel_processes", return_value=discovered), patch.object(
+                pc, "_discover_tunnels_by_id", return_value=list(discovered)
+            ), patch.object(pc, "_pid_alive", return_value=True):
+                with self.assertRaisesRegex(RuntimeError, "recorded pid 716 is still alive"):
+                    pc.reconcile_dead_recorded_tunnel_pid_to_live_exclusive(manifest, layout)
+            self.assertEqual(layout["runtime_state"].read_bytes(), before)
+
+    def test_reconcile_dead_recorded_tunnel_pid_fail_closed_on_tunnel_id_or_generation_mismatch(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            manifest, layout, _, discovered, _ = self._dead_pid_live_exclusive_fixture(
+                root, recorded_tunnel_id="tunnel-other"
+            )
+            before = layout["runtime_state"].read_bytes()
+            with patch.object(pc, "_discover_tunnel_processes", return_value=discovered), patch.object(
+                pc, "_discover_tunnels_by_id", return_value=list(discovered)
+            ), patch.object(pc, "_pid_alive", return_value=False):
+                with self.assertRaisesRegex(RuntimeError, "recorded tunnel_id does not match live exclusive"):
+                    pc.reconcile_dead_recorded_tunnel_pid_to_live_exclusive(manifest, layout)
+            self.assertEqual(layout["runtime_state"].read_bytes(), before)
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            manifest, layout, _, discovered, _ = self._dead_pid_live_exclusive_fixture(
+                root, recorded_generation=6
+            )
+            before = layout["runtime_state"].read_bytes()
+            with patch.object(pc, "_discover_tunnel_processes", return_value=discovered), patch.object(
+                pc, "_discover_tunnels_by_id", return_value=list(discovered)
+            ), patch.object(pc, "_pid_alive", return_value=False):
+                with self.assertRaisesRegex(RuntimeError, "endpoint generation does not match live exclusive"):
+                    pc.reconcile_dead_recorded_tunnel_pid_to_live_exclusive(manifest, layout)
+            self.assertEqual(layout["runtime_state"].read_bytes(), before)
+
+    def test_reconcile_dead_recorded_tunnel_pid_fail_closed_without_exclusive_live_tunnel(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            manifest, layout, _, discovered, _ = self._dead_pid_live_exclusive_fixture(root)
+            before = layout["runtime_state"].read_bytes()
+            extra = {**discovered[0], "pid": 718}
+            with patch.object(pc, "_discover_tunnel_processes", return_value=[*discovered, extra]), patch.object(
+                pc, "_discover_tunnels_by_id", return_value=[*discovered, extra]
+            ), patch.object(pc, "_pid_alive", return_value=False):
+                with self.assertRaisesRegex(RuntimeError, "unique live exclusive tunnel"):
+                    pc.reconcile_dead_recorded_tunnel_pid_to_live_exclusive(manifest, layout)
+            self.assertEqual(layout["runtime_state"].read_bytes(), before)
+
+            owners = [{**discovered[0], "pid": 719}]
+            with patch.object(pc, "_discover_tunnel_processes", return_value=discovered), patch.object(
+                pc, "_discover_tunnels_by_id", return_value=owners
+            ), patch.object(pc, "_pid_alive", return_value=False):
+                with self.assertRaisesRegex(RuntimeError, "not globally exclusive"):
+                    pc.reconcile_dead_recorded_tunnel_pid_to_live_exclusive(manifest, layout)
+            self.assertEqual(layout["runtime_state"].read_bytes(), before)
+
     def test_tunnel_operational_gate_requires_loopback_exact_status_and_fresh_structured_event_chain(self):
         manifest = self._manifest()
         with tempfile.TemporaryDirectory() as raw_root:
