@@ -319,11 +319,19 @@ async fn discovery_reconnects_with_reused_json_rpc_ids_without_request_id_header
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK);
         let (first_headers, first_body) = capture.0.lock().await.clone().unwrap();
-        assert_eq!(first_body, Bytes::from(body.to_string()));
-        assert_eq!(
-            first_headers.get("mcp-protocol-version").unwrap(),
-            "2025-06-18"
-        );
+        let forwarded = String::from_utf8(first_body.to_vec()).unwrap();
+        if body.contains("initialize") {
+            assert!(forwarded.contains("2025-06-18"), "{forwarded}");
+            assert_eq!(
+                first_headers.get("mcp-protocol-version").unwrap(),
+                "2025-06-18"
+            );
+        } else {
+            assert_eq!(
+                first_headers.get("mcp-protocol-version").unwrap(),
+                "2026-07-28"
+            );
+        }
         let first_proof_request_id = first_headers
             .get("x-lab-request-id")
             .unwrap()
@@ -339,7 +347,19 @@ async fn discovery_reconnects_with_reused_json_rpc_ids_without_request_id_header
             .unwrap();
         assert_eq!(second.status(), StatusCode::OK);
         let (second_headers, second_body) = capture.0.lock().await.clone().unwrap();
-        assert_eq!(second_body, Bytes::from(body.to_string()));
+        let second_forwarded = String::from_utf8(second_body.to_vec()).unwrap();
+        if body.contains("initialize") {
+            assert!(second_forwarded.contains("2025-06-18"), "{second_forwarded}");
+            assert_eq!(
+                second_headers.get("mcp-protocol-version").unwrap(),
+                "2025-06-18"
+            );
+        } else {
+            assert_eq!(
+                second_headers.get("mcp-protocol-version").unwrap(),
+                "2026-07-28"
+            );
+        }
         let second_proof_request_id = second_headers
             .get("x-lab-request-id")
             .unwrap()

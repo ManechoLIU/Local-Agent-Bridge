@@ -95,6 +95,7 @@ fn bridge(default_url: &str, process_url: &str) -> Router {
         workspace_id: context.workspace_id.clone(),
         capabilities: vec![
             Capability::Discovery,
+            Capability::FileRead,
             Capability::Shell,
             Capability::ProcessJobs,
         ],
@@ -136,6 +137,35 @@ fn request(id: &str, name: &str, arguments: Value) -> Request<Body> {
         .header("content-type", "application/json")
         .header("mcp-method", "tools/call")
         .header("mcp-name", name)
+        .header("x-lab-ingress-key", INGRESS_KEY)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+fn protocol_run_command_request(id: &str, protocol_version: &str, arguments: Value) -> Request<Body> {
+    let body = json!({
+        "jsonrpc":"2.0",
+        "id":id,
+        "method":"tools/call",
+        "params":{
+            "name":"run_command",
+            "arguments":arguments,
+            "protocolVersion":protocol_version,
+            "_meta":{
+                "io.modelcontextprotocol/protocolVersion":protocol_version,
+                "io.modelcontextprotocol/clientCapabilities":{},
+                "io.modelcontextprotocol/clientInfo":{"name":"chatgpt","version":"1"}
+            }
+        }
+    })
+    .to_string();
+    Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header("mcp-method", "tools/call")
+        .header("mcp-name", "run_command")
+        .header("mcp-protocol-version", protocol_version)
         .header("x-lab-ingress-key", INGRESS_KEY)
         .body(Body::from(body))
         .unwrap()
@@ -331,5 +361,104 @@ async fn run_command_routes_through_process_runtime_provenance_and_fail_closes_o
             body.pointer("/params/name").and_then(Value::as_str) == Some("start_command")
         }),
         "start_command may remain on the default backend this slice"
+    );
+}
+
+#[tokio::test]
+async fn run_command_chatgpt_2026_07_28_body_keeps_process_runtime_hash_and_provenance() {
+    let (policy, _workspace) = process_policy("chatgpt-2026-07-28-hash");
+    let process_app = ProcessRuntime::new(PROCESS_KEY.as_bytes(), policy, WORKSPACE_ID)
+        .unwrap()
+        .router();
+    let process_url = serve(process_app).await;
+    let default_capture = Capture::default();
+    let default_url = serve(
+        Router::new()
+            .route("/mcp", post(default_backend))
+            .with_state(default_capture.clone()),
+    )
+    .await;
+    let app = bridge(&default_url, &process_url);
+
+    let ok_response = app
+        .clone()
+        .oneshot(protocol_run_command_request(
+            "chatgpt-2026",
+            "2026-07-28",
+            json!({"command":"printf 'LAB-PROC-01-2026\n'","timeout_ms":10000}),
+        ))
+        .await
+        .unwrap();
+    let ok_status = ok_response.status();
+    let ok = response_json(ok_response).await;
+    if ok_status != StatusCode::OK {
+        panic!("ChatGPT 2026-07-28 body failed HTTP {ok_status}: {ok}");
+    }
+    let structured = &ok["result"]["structuredContent"];
+    assert_eq!(
+        structured["provenance"], "lab_process_runtime_v1",
+        "2026-07-28 run_command provenance: {ok}"
+    );
+    assert_eq!(structured["success"], true, "2026-07-28 run_command failed: {ok}");
+    assert!(
+        structured["stdout"]
+            .as_str()
+            .unwrap_or("")
+            .contains("LAB-PROC-01-2026"),
+        "stdout missing 2026 marker: {ok}"
+    );
+
+    let rewritten_response = app
+        .clone()
+        .oneshot(protocol_run_command_request(
+            "legacy-2025",
+            "2025-06-18",
+            json!({"command":"printf 'LAB-PROC-01-REWRITTEN\n'","timeout_ms":10000}),
+        ))
+        .await
+        .unwrap();
+    let rewritten_status = rewritten_response.status();
+    let rewritten = response_json(rewritten_response).await;
+    assert_eq!(
+        rewritten_status,
+        StatusCode::OK,
+        "rewritten 2025-06-18 body must be signed after translation: {rewritten}"
+    );
+    assert_eq!(
+        rewritten["result"]["structuredContent"]["provenance"],
+        "lab_process_runtime_v1",
+        "rewritten body provenance: {rewritten}"
+    );
+    assert_eq!(
+        rewritten["result"]["structuredContent"]["success"],
+        true,
+        "rewritten body failed: {rewritten}"
+    );
+
+    let read = app
+        .clone()
+        .oneshot(request("read", "read", json!({"path":"lab-proc01.txt"})))
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+    let read = response_json(read).await;
+    assert_eq!(read["result"]["backend"], "catdesk");
+    assert_ne!(
+        read["result"]["structuredContent"]["provenance"],
+        "lab_process_runtime_v1"
+    );
+
+    let default_calls = default_capture.0.lock().await;
+    assert!(
+        default_calls.iter().all(|(_, body)| {
+            body.pointer("/params/name").and_then(Value::as_str) != Some("run_command")
+        }),
+        "protocol-version run_command must stay on Process Runtime: {default_calls:?}"
+    );
+    assert!(
+        default_calls.iter().any(|(_, body)| {
+            body.pointer("/params/name").and_then(Value::as_str) == Some("read")
+        }),
+        "file read must remain on the default backend: {default_calls:?}"
     );
 }

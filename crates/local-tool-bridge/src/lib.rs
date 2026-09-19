@@ -963,6 +963,18 @@ async fn handle_mcp(
         LocalIngressAuth::SharedKey(_) | LocalIngressAuth::TrustedUnixSocket => {}
     }
 
+    // Sign the bytes that backends actually receive. Protocol translation
+    // must happen before x-lab-body-sha256 is computed; Process Runtime
+    // rejects a rewritten body that no longer matches the signed hash.
+    let method_hint = jsonrpc_method(&body).or_else(|| {
+        headers
+            .get("mcp-method")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    });
+    let backend_protocol = backend_protocol_for_method(method_hint.as_deref());
+    let (body, _) = rewrite_protocol_for_backend(body, backend_protocol);
+
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => return text_response(StatusCode::BAD_REQUEST, "invalid JSON-RPC body"),
@@ -976,7 +988,8 @@ async fn handle_mcp(
         .and_then(|value| value.get("name"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let protected = if state.inner.tool_receipts.is_some()
+    let protected = if state.inner.process_backend.is_none()
+        && state.inner.tool_receipts.is_some()
         && (tool_name == "run_command" || header_text(&headers, "mcp-name") == Some("run_command"))
     {
         match parse_protected_run_command(&body) {
@@ -1097,10 +1110,12 @@ async fn handle_mcp(
     };
 
     if let (Some(protected), Some(chain)) = (protected, state.inner.tool_receipts.as_ref()) {
-        return match handle_protected_run_command(&state, &headers, protected, body, chain).await {
-            Ok(response) => response,
-            Err(error) => text_response(error.status, &error.message),
-        };
+        if state.inner.process_backend.is_none() {
+            return match handle_protected_run_command(&state, &headers, protected, body, chain).await {
+                Ok(response) => response,
+                Err(error) => text_response(error.status, &error.message),
+            };
+        }
     }
 
     if method == "tools/call" && collaboration_tools::is_feishu_admin_tool(tool_name) {
@@ -3077,14 +3092,34 @@ fn rebuild_response(
 }
 
 const TUNNEL_MCP_PROTOCOL_VERSION: &str = "2026-07-28";
-const BACKEND_MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+const GROK_MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+const MODERN_BACKEND_MCP_PROTOCOL_VERSION: &str = "2026-07-28";
+const INITIALIZE_BACKEND_MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
-fn backend_mcp_protocol_version(value: &str) -> &str {
-    if value == TUNNEL_MCP_PROTOCOL_VERSION {
-        BACKEND_MCP_PROTOCOL_VERSION
-    } else {
-        value
+fn jsonrpc_method(body: &Bytes) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn backend_protocol_for_method(method: Option<&str>) -> &'static str {
+    match method {
+        Some("initialize") | Some("notifications/initialized") => {
+            INITIALIZE_BACKEND_MCP_PROTOCOL_VERSION
+        }
+        _ => MODERN_BACKEND_MCP_PROTOCOL_VERSION,
     }
+}
+
+fn incoming_client_protocol(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("mcp-protocol-version")
+        .and_then(|value| value.to_str().ok())
 }
 
 fn rewrite_protocol_versions(value: &mut serde_json::Value, from: &str, to: &str) -> bool {
@@ -3117,15 +3152,22 @@ fn rewrite_protocol_versions(value: &mut serde_json::Value, from: &str, to: &str
     changed
 }
 
-fn rewrite_protocol_for_backend(body: Bytes) -> (Bytes, bool) {
+fn rewrite_protocol_for_backend(body: Bytes, backend_protocol: &str) -> (Bytes, bool) {
     let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return (body, false);
     };
-    if !rewrite_protocol_versions(
-        &mut parsed,
+    let mut changed = false;
+    for from in [
+        GROK_MCP_PROTOCOL_VERSION,
         TUNNEL_MCP_PROTOCOL_VERSION,
-        BACKEND_MCP_PROTOCOL_VERSION,
-    ) {
+        INITIALIZE_BACKEND_MCP_PROTOCOL_VERSION,
+        MODERN_BACKEND_MCP_PROTOCOL_VERSION,
+    ] {
+        if from != backend_protocol {
+            changed |= rewrite_protocol_versions(&mut parsed, from, backend_protocol);
+        }
+    }
+    if !changed {
         return (body, false);
     }
     match serde_json::to_vec(&parsed) {
@@ -3134,15 +3176,17 @@ fn rewrite_protocol_for_backend(body: Bytes) -> (Bytes, bool) {
     }
 }
 
-fn restore_tunnel_protocol_version(bytes: Bytes) -> Bytes {
+fn restore_client_protocol_version(bytes: Bytes, client_version: &str) -> Bytes {
     let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return bytes;
     };
-    if !rewrite_protocol_versions(
-        &mut parsed,
-        BACKEND_MCP_PROTOCOL_VERSION,
-        TUNNEL_MCP_PROTOCOL_VERSION,
-    ) {
+    let Some(result) = parsed.get_mut("result") else {
+        return bytes;
+    };
+    let modern = rewrite_protocol_versions(result, MODERN_BACKEND_MCP_PROTOCOL_VERSION, client_version);
+    let initialize =
+        rewrite_protocol_versions(result, INITIALIZE_BACKEND_MCP_PROTOCOL_VERSION, client_version);
+    if !modern && !initialize {
         return bytes;
     }
     serde_json::to_vec(&parsed)
@@ -3157,26 +3201,42 @@ async fn forward_to_backend(
     proof_headers: &HashMap<String, String>,
     body: Bytes,
 ) -> Result<Response<Body>, String> {
-    let incoming_tunnel_protocol = incoming
-        .get("mcp-protocol-version")
-        .and_then(|value| value.to_str().ok())
-        == Some(TUNNEL_MCP_PROTOCOL_VERSION);
-    let (body, body_translated) = rewrite_protocol_for_backend(body);
-    let restore_to_tunnel = incoming_tunnel_protocol || body_translated;
+    let incoming_version = incoming_client_protocol(incoming);
+    let method = jsonrpc_method(&body).or_else(|| {
+        incoming
+            .get("mcp-method")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    });
+    let backend_protocol = backend_protocol_for_method(method.as_deref());
+    let incoming_tunnel_protocol = matches!(
+        incoming_version,
+        Some(TUNNEL_MCP_PROTOCOL_VERSION | GROK_MCP_PROTOCOL_VERSION)
+    );
+    let grok_client = incoming_version == Some(GROK_MCP_PROTOCOL_VERSION);
+    // Body translation already happened before the request was signed.
+    // Do not rewrite again: Process Runtime checks x-lab-body-sha256
+    // against the exact bytes received.
+    let restore_to_grok = grok_client;
     let mut request = state
         .inner
         .client
         .post(target.url.clone())
         .body(body.to_vec());
+    let mut forwarded_protocol_header = false;
     for name in FORWARDED_HEADERS {
         if let Some(value) = incoming.get(*name).and_then(|value| value.to_str().ok()) {
             let value = if *name == "mcp-protocol-version" {
-                backend_mcp_protocol_version(value)
+                forwarded_protocol_header = true;
+                backend_protocol
             } else {
                 value
             };
             request = request.header(*name, value);
         }
+    }
+    if !forwarded_protocol_header {
+        request = request.header("mcp-protocol-version", backend_protocol);
     }
     for (name, value) in proof_headers {
         request = request.header(name, value);
@@ -3197,14 +3257,16 @@ async fn forward_to_backend(
         .bytes()
         .await
         .map_err(|error| format!("backend response read failed: {error}"))?;
-    if restore_to_tunnel && status == StatusCode::OK {
-        bytes = restore_tunnel_protocol_version(bytes);
+    if restore_to_grok && status == StatusCode::OK {
+        bytes = restore_client_protocol_version(bytes, GROK_MCP_PROTOCOL_VERSION);
     }
     let mut response = Response::builder().status(status);
     if let Some(content_type) = content_type {
         response = response.header(header::CONTENT_TYPE, content_type);
     }
-    if restore_to_tunnel {
+    if grok_client {
+        response = response.header("mcp-protocol-version", GROK_MCP_PROTOCOL_VERSION);
+    } else if incoming_tunnel_protocol {
         response = response.header("mcp-protocol-version", TUNNEL_MCP_PROTOCOL_VERSION);
     }
     response
