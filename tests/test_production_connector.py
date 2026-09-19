@@ -6688,6 +6688,235 @@ class ProductionConnectorContractTests(unittest.TestCase):
             stop_verified.assert_not_called()
             materialize.assert_called_once_with(layout)
 
+    def _canonical_jobs_upgrade_fixture(self, raw_root):
+        prior_manifest = self._manifest(generation=15)
+        upgraded = {
+            **prior_manifest,
+            "release_revision": "b" * 40,
+            "endpoint_generation": 16,
+        }
+        root = Path(raw_root)
+        runtime_root = root / "runtime"
+        bridge_socket = root / "bridge.sock"
+        layout = pc.production_layout(
+            upgraded, runtime_root=runtime_root, bridge_socket=bridge_socket
+        )
+        prior_layout = pc.production_layout(
+            prior_manifest, runtime_root=runtime_root, bridge_socket=bridge_socket
+        )
+        layout["runtime_root"].mkdir(parents=True, exist_ok=True)
+        layout["bridge_binary"].parent.mkdir(parents=True, exist_ok=True)
+        layout["bridge_binary"].write_text("bridge", encoding="utf-8")
+        layout["bridge_binary"].chmod(0o700)
+        layout["process_runtime_binary"].write_text("process-runtime", encoding="utf-8")
+        layout["process_runtime_binary"].chmod(0o700)
+        layout["process_runtime_backend_key"].parent.mkdir(parents=True, exist_ok=True)
+        layout["process_runtime_backend_key"].write_text("n" * 64, encoding="utf-8")
+        layout["process_runtime_backend_key"].chmod(0o600)
+        prior_layout["catdesk_config"].parent.mkdir(parents=True, exist_ok=True)
+        prior_layout["catdesk_config"].write_text("mcpSlug = 'private'\n", encoding="utf-8")
+        prior_layout["catdesk_config"].chmod(0o600)
+        prior_layout["catdesk_backend_key"].write_text("c" * 64, encoding="utf-8")
+        prior_layout["catdesk_backend_key"].chmod(0o600)
+        prior_layout["host_backend_key"].parent.mkdir(parents=True, exist_ok=True)
+        prior_layout["host_backend_key"].write_text("h" * 64, encoding="utf-8")
+        prior_layout["host_backend_key"].chmod(0o600)
+        prior_layout["release_manifest"].parent.mkdir(parents=True, exist_ok=True)
+        pc._write_json_private(prior_layout["release_manifest"], prior_manifest)
+        hook_identity = {
+            "path": str(prior_layout["runtime_hook_socket"]),
+            "uid": os.geteuid(),
+            "mode": 0o600,
+            "device": 1,
+            "inode": 2,
+        }
+        prior = {
+            "release_revision": prior_manifest["release_revision"],
+            "endpoint_generation": prior_manifest["endpoint_generation"],
+            "workspace": prior_manifest["workspace"],
+            "tunnel_profile_name": pc.TUNNEL_PROFILE_NAME,
+            "catdesk_supervisor_pid": 60946,
+            "host_pid": 60989,
+            "runtime_hook_pid": 60995,
+            "process_runtime_pid": 61002,
+            "bridge_pid": 12057,
+            "catdesk_supervisor_process_identity": self._identity(
+                60946, ["/private/catdesk-supervisor"]
+            ),
+            "host_process_identity": self._identity(60989, ["/private/host"]),
+            "runtime_hook_process_identity": self._identity(60995, ["/private/runtime-hook"]),
+            "process_runtime_process_identity": self._identity(
+                61002, ["/private/process-runtime"]
+            ),
+            "bridge_process_identity": self._identity(12057, ["/private/bridge"]),
+            "runtime_hook_socket_identity": hook_identity,
+        }
+        pc._write_json_private(layout["runtime_state"], prior)
+        installed = json.loads(json.dumps(upgraded))
+        installed["artifacts_sha256"] = {"bin/process-runtime": "a" * 64}
+        return upgraded, layout, prior_layout, prior, installed, hook_identity
+
+    def test_canonical_release_upgrade_reuses_live_catdesk_host_and_only_replaces_jobs_runtime(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
+            upgraded, layout, prior_layout, prior, installed, hook_identity = (
+                self._canonical_jobs_upgrade_fixture(raw_root)
+            )
+            processes = [MagicMock(pid=9101), MagicMock(pid=9102)]
+            identities = [
+                self._identity(9101, [str(layout["process_runtime_binary"].resolve())]),
+                self._identity(9102, [str(layout["bridge_binary"].resolve())]),
+            ]
+            stopped = []
+
+            def tcp_ready(_host, port):
+                return port in {pc.PRODUCTION_CATDESK_PORT, pc.PRODUCTION_HOST_MCP_PORT}
+
+            with patch.object(pc, "PRODUCTION_RUNTIME_ROOT", layout["runtime_root"]), patch.object(
+                pc, "PRODUCTION_BRIDGE_SOCKET", layout["bridge_socket"]
+            ), patch.object(
+                pc, "validate_installed_release", return_value=installed
+            ), patch.object(
+                pc,
+                "production_status",
+                side_effect=[
+                    {"local_runtime_ready": False, "tunnel_ready": True},
+                    {
+                        "local_runtime_ready": True,
+                        "tunnel_ready": True,
+                        "catdesk_supervisor_pid": 60946,
+                        "host_pid": 60989,
+                        "process_runtime_pid": 9101,
+                        "bridge_pid": 9102,
+                    },
+                ],
+            ), patch.object(pc, "_tcp_ready", side_effect=tcp_ready), patch.object(
+                pc, "_process_identity_matches", return_value=True
+            ), patch.object(
+                pc, "_runtime_hook_socket_is_live", return_value=True
+            ), patch.object(
+                pc, "_host_adapter_socket_is_listening", return_value=True
+            ), patch.object(
+                pc, "_stop_prior_local_runtime_for_release_upgrade"
+            ) as stop_prior, patch.object(
+                pc, "_stop_verified_local_runtime"
+            ) as stop_verified, patch.object(
+                pc, "_materialize_catdesk_runtime"
+            ) as materialize, patch.object(
+                pc,
+                "_stop_verified_process_identity",
+                side_effect=lambda identity, process_group=False, process=None: stopped.append(
+                    identity["pid"]
+                ),
+            ), patch.object(
+                pc, "_spawn_logged", side_effect=processes
+            ) as spawn, patch.object(
+                pc, "_capture_process_identity", side_effect=identities
+            ), patch.object(pc, "_wait_for_tcp"), patch.object(
+                pc, "_wait_for_bridge", return_value=sorted(pc.REQUIRED_TOOLS)
+            ), patch.object(pc, "_wait_for_runtime_hook") as wait_hook:
+                result = pc.start_local_runtime(upgraded, layout)
+
+            stop_prior.assert_not_called()
+            stop_verified.assert_not_called()
+            materialize.assert_not_called()
+            wait_hook.assert_not_called()
+            self.assertEqual(stopped, [12057, 61002])
+            self.assertEqual(spawn.call_count, 2)
+            self.assertEqual(
+                spawn.call_args_list[0].args[0][0],
+                str(layout["process_runtime_binary"].resolve()),
+            )
+            self.assertEqual(
+                spawn.call_args_list[1].args[0][0],
+                str(layout["bridge_binary"].resolve()),
+            )
+            bridge_env = spawn.call_args_list[1].kwargs["env"]
+            self.assertEqual(
+                bridge_env["LAB_BRIDGE_BACKEND_KEY_FILE"],
+                str(prior_layout["catdesk_backend_key"]),
+            )
+            self.assertEqual(
+                bridge_env["LAB_HOST_BACKEND_KEY_FILE"],
+                str(prior_layout["host_backend_key"]),
+            )
+            self.assertEqual(
+                bridge_env["LAB_HOST_ADAPTER_SOCKET"],
+                str(prior_layout["host_socket"]),
+            )
+            self.assertEqual(
+                bridge_env["LAB_RUNTIME_HOST_TOOL_HOOK_SOCKET"],
+                str(prior_layout["runtime_hook_socket"]),
+            )
+            self.assertEqual(
+                bridge_env["LAB_PROCESS_BACKEND_KEY_FILE"],
+                str(layout["process_runtime_backend_key"]),
+            )
+            self.assertEqual(
+                bridge_env["LAB_PRODUCTION_RELEASE_REVISION"],
+                prior["release_revision"],
+            )
+            self.assertEqual(
+                bridge_env["LAB_PRODUCTION_ENDPOINT_GENERATION"],
+                str(prior["endpoint_generation"]),
+            )
+            self.assertEqual(
+                bridge_env["LAB_PRODUCTION_RELEASE_MANIFEST_FILE"],
+                str(prior_layout["release_manifest"]),
+            )
+            state = json.loads(layout["runtime_state"].read_text(encoding="utf-8"))
+            self.assertEqual(state["catdesk_supervisor_pid"], 60946)
+            self.assertEqual(state["host_pid"], 60989)
+            self.assertEqual(state["runtime_hook_pid"], 60995)
+            self.assertEqual(state["process_runtime_pid"], 9101)
+            self.assertEqual(state["bridge_pid"], 9102)
+            self.assertEqual(state["runtime_hook_socket_identity"], hook_identity)
+            self.assertEqual(
+                state["reused_live_backends"]["source_release_revision"],
+                prior["release_revision"],
+            )
+            self.assertEqual(state["reused_live_backends"]["source_endpoint_generation"], 15)
+            self.assertEqual(result["catdesk_supervisor_pid"], 60946)
+            self.assertEqual(result["host_pid"], 60989)
+
+    def test_canonical_release_upgrade_fail_closes_without_stopping_live_catdesk_host(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
+            upgraded, layout, _prior_layout, prior, installed, _hook = (
+                self._canonical_jobs_upgrade_fixture(raw_root)
+            )
+
+            def identity_matches(identity):
+                return identity.get("pid") != prior["catdesk_supervisor_pid"]
+
+            with patch.object(pc, "PRODUCTION_RUNTIME_ROOT", layout["runtime_root"]), patch.object(
+                pc, "PRODUCTION_BRIDGE_SOCKET", layout["bridge_socket"]
+            ), patch.object(
+                pc, "validate_installed_release", return_value=installed
+            ), patch.object(
+                pc,
+                "production_status",
+                return_value={"local_runtime_ready": False, "tunnel_ready": True},
+            ), patch.object(pc, "_tcp_ready", return_value=True), patch.object(
+                pc, "_process_identity_matches", side_effect=identity_matches
+            ), patch.object(
+                pc, "_stop_prior_local_runtime_for_release_upgrade"
+            ) as stop_prior, patch.object(
+                pc, "_stop_verified_local_runtime"
+            ) as stop_verified, patch.object(
+                pc, "_stop_verified_process_identity"
+            ) as stop_identity, patch.object(pc, "_spawn_logged") as spawn:
+                with self.assertRaisesRegex(
+                    RuntimeError, "cannot reuse live CatDesk|CatDesk.*changed"
+                ):
+                    pc.start_local_runtime(upgraded, layout)
+            stop_prior.assert_not_called()
+            stop_verified.assert_not_called()
+            stop_identity.assert_not_called()
+            spawn.assert_not_called()
+            self.assertEqual(
+                json.loads(layout["runtime_state"].read_text(encoding="utf-8")),
+                prior,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

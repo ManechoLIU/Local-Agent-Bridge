@@ -4748,26 +4748,36 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
         state.get("process_runtime_process_identity") if state_matches else None
     )
     bridge_identity = state.get("bridge_process_identity") if state_matches else None
+    reused_live_backends = state.get("reused_live_backends") if state_matches else None
+    reused_live_backends = reused_live_backends if isinstance(reused_live_backends, dict) else None
     catdesk_process = bool(
         isinstance(catdesk_pid, int)
         and isinstance(catdesk_identity, dict)
         and catdesk_identity.get("pid") == catdesk_pid
         and _process_identity_matches(catdesk_identity)
     )
-    host_process = bool(
-        node
-        and isinstance(host_pid, int)
-        and isinstance(host_identity, dict)
-        and host_identity.get("pid") == host_pid
-        and host_identity.get("exe_realpath")
-        == str(Path(node).resolve(strict=True))
-        and host_identity.get("argv")
-        == [
-            str(Path(node).resolve(strict=True)),
-            str(_resolved_command_path(layout["host_mcp_adapter"])),
-        ]
-        and _process_identity_matches(host_identity)
-    )
+    if reused_live_backends is not None:
+        host_process = bool(
+            isinstance(host_pid, int)
+            and isinstance(host_identity, dict)
+            and host_identity.get("pid") == host_pid
+            and _process_identity_matches(host_identity)
+        )
+    else:
+        host_process = bool(
+            node
+            and isinstance(host_pid, int)
+            and isinstance(host_identity, dict)
+            and host_identity.get("pid") == host_pid
+            and host_identity.get("exe_realpath")
+            == str(Path(node).resolve(strict=True))
+            and host_identity.get("argv")
+            == [
+                str(Path(node).resolve(strict=True)),
+                str(_resolved_command_path(layout["host_mcp_adapter"])),
+            ]
+            and _process_identity_matches(host_identity)
+        )
     runtime_hook_process = bool(
         isinstance(runtime_hook_pid, int)
         and isinstance(runtime_hook_identity, dict)
@@ -4799,10 +4809,15 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
     )
     backend_ready = bool(catdesk_process and _tcp_ready("127.0.0.1", _layout_catdesk_port(layout)))
     host_ready = bool(host_process and _tcp_ready("127.0.0.1", _layout_host_mcp_port(layout)))
+    runtime_hook_socket = layout["runtime_hook_socket"]
+    if reused_live_backends is not None:
+        reused_hook_socket = reused_live_backends.get("runtime_hook_socket")
+        if isinstance(reused_hook_socket, str) and reused_hook_socket.strip():
+            runtime_hook_socket = Path(reused_hook_socket)
     runtime_hook_ready = bool(
         runtime_hook_process
         and _runtime_hook_socket_is_live(
-            layout["runtime_hook_socket"], state.get("runtime_hook_socket_identity")
+            runtime_hook_socket, state.get("runtime_hook_socket_identity")
         )
     )
     process_runtime_ready = bool(
@@ -5100,6 +5115,7 @@ def _start_local_runtime_unlocked(
         prior,
         tunnel_ready=current.get("tunnel_ready") is True,
     )
+    reused_live_backends: dict[str, Any] | None = None
     if prior:
         same_local_generation = (
             prior.get("release_revision") == manifest["release_revision"]
@@ -5109,30 +5125,49 @@ def _start_local_runtime_unlocked(
             _stop_verified_local_runtime(prior, layout)
         elif _layout_is_parallel_generation(layout):
             pass
+        elif is_release_upgrade and _layout_is_canonical_production(layout):
+            reused_live_backends = _reuse_live_catdesk_host_for_jobs_upgrade(
+                prior, layout, manifest
+            )
+            _stop_verified_jobs_runtime(prior, layout)
         elif is_release_upgrade:
             _stop_prior_local_runtime_for_release_upgrade(prior, layout)
         else:
             _stop_verified_local_runtime(prior, layout)
-    if _tcp_ready("127.0.0.1", catdesk_port):
-        raise RuntimeError("production CatDesk port is occupied by an unverified process")
-    if _tcp_ready("127.0.0.1", host_mcp_port):
-        raise RuntimeError("production Host MCP port is occupied by an unverified process")
+    if reused_live_backends is None:
+        if _tcp_ready("127.0.0.1", catdesk_port):
+            raise RuntimeError("production CatDesk port is occupied by an unverified process")
+        if _tcp_ready("127.0.0.1", host_mcp_port):
+            raise RuntimeError("production Host MCP port is occupied by an unverified process")
+        if layout["runtime_hook_socket"].exists() or layout["runtime_hook_socket"].is_symlink():
+            raise RuntimeError("production Runtime Host tool hook socket exists without a verified runtime owner")
+    else:
+        if not _tcp_ready("127.0.0.1", catdesk_port):
+            raise RuntimeError("live CatDesk stopped during production jobs replace")
+        if not _tcp_ready("127.0.0.1", host_mcp_port):
+            raise RuntimeError("live Host stopped during production jobs replace")
     if _tcp_ready("127.0.0.1", process_runtime_port):
         raise RuntimeError("production Process Runtime port is occupied by an unverified process")
     if layout["bridge_socket"].exists():
         raise RuntimeError("production Bridge socket exists without a verified runtime owner")
-    if layout["runtime_hook_socket"].exists() or layout["runtime_hook_socket"].is_symlink():
-        raise RuntimeError("production Runtime Host tool hook socket exists without a verified runtime owner")
 
     catdesk_child_pid_was_absent = not layout["catdesk_child_pid"].exists()
     _private_dir(layout["logs_dir"])
-    _materialize_catdesk_runtime(layout)
-    _prepare_private_unix_socket_path(layout["host_socket"])
-    _prepare_private_unix_socket_path(layout["runtime_hook_socket"])
-    _private_dir(layout["host_verifier_state"].parent)
-    _private_dir(layout["bridge_state_dir"])
-    slug = _catdesk_slug(layout["catdesk_config"])
-    component_env = production_component_env(manifest, layout, catdesk_slug=slug)
+    env_layout = layout
+    if reused_live_backends is None:
+        _materialize_catdesk_runtime(layout)
+        _prepare_private_unix_socket_path(layout["host_socket"])
+        _prepare_private_unix_socket_path(layout["runtime_hook_socket"])
+        _private_dir(layout["host_verifier_state"].parent)
+        _private_dir(layout["bridge_state_dir"])
+        slug = _catdesk_slug(layout["catdesk_config"])
+    else:
+        _private_dir(layout["bridge_state_dir"])
+        env_layout = _jobs_upgrade_reuse_layout(layout, reused_live_backends["prior_layout"])
+        slug = reused_live_backends["slug"]
+    component_env = production_component_env(manifest, env_layout, catdesk_slug=slug)
+    if reused_live_backends is not None:
+        _overlay_reused_production_fence(component_env, reused_live_backends)
     _require_paired_backend_env(
         component_env["bridge"],
         url_key="LAB_PROCESS_BACKEND_URL",
@@ -5148,62 +5183,74 @@ def _start_local_runtime_unlocked(
     }
     started: list[tuple[subprocess.Popen[Any], dict[str, Any] | None, bool]] = []
     try:
-        python = _kernel_python_executable()
-        catdesk_command = [str(python), str(layout["catdesk_runner"])]
-        catdesk = _spawn_logged(
-            catdesk_command,
-            layout["logs_dir"] / "catdesk-supervisor.out",
-            layout["logs_dir"] / "catdesk-supervisor.err",
-            cwd=layout["release_dir"],
-            env=base_env,
-        )
-        started.append((catdesk, None, True))
-        catdesk_identity = _capture_process_identity(
-            catdesk.pid, expected_executable=python, expected_argv=catdesk_command
-        )
-        started[-1] = (catdesk, catdesk_identity, True)
-        _wait_for_tcp(catdesk, catdesk_port, "production CatDesk")
+        if reused_live_backends is None:
+            python = _kernel_python_executable()
+            catdesk_command = [str(python), str(layout["catdesk_runner"])]
+            catdesk = _spawn_logged(
+                catdesk_command,
+                layout["logs_dir"] / "catdesk-supervisor.out",
+                layout["logs_dir"] / "catdesk-supervisor.err",
+                cwd=layout["release_dir"],
+                env=base_env,
+            )
+            started.append((catdesk, None, True))
+            catdesk_identity = _capture_process_identity(
+                catdesk.pid, expected_executable=python, expected_argv=catdesk_command
+            )
+            started[-1] = (catdesk, catdesk_identity, True)
+            _wait_for_tcp(catdesk, catdesk_port, "production CatDesk")
 
-        dependencies = _validate_runtime_dependencies(installed)
-        node = Path(dependencies["node"]["path"])
-        host_adapter = _resolved_command_path(layout["host_mcp_adapter"])
-        host_command = [str(node), str(host_adapter)]
-        host = _spawn_logged(
-            host_command,
-            layout["logs_dir"] / "host.out",
-            layout["logs_dir"] / "host.err",
-            cwd=layout["host_dir"],
-            env={**base_env, **component_env["host"]},
-        )
-        started.append((host, None, False))
-        host_identity = _capture_process_identity(
-            host.pid, expected_executable=node, expected_argv=host_command
-        )
-        started[-1] = (host, host_identity, False)
-        _wait_for_tcp(host, host_mcp_port, "production Host MCP")
+            dependencies = _validate_runtime_dependencies(installed)
+            node = Path(dependencies["node"]["path"])
+            host_adapter = _resolved_command_path(layout["host_mcp_adapter"])
+            host_command = [str(node), str(host_adapter)]
+            host = _spawn_logged(
+                host_command,
+                layout["logs_dir"] / "host.out",
+                layout["logs_dir"] / "host.err",
+                cwd=layout["host_dir"],
+                env={**base_env, **component_env["host"]},
+            )
+            started.append((host, None, False))
+            host_identity = _capture_process_identity(
+                host.pid, expected_executable=node, expected_argv=host_command
+            )
+            started[-1] = (host, host_identity, False)
+            _wait_for_tcp(host, host_mcp_port, "production Host MCP")
 
-        runtime_python = Path(dependencies["python"]["path"])
-        runtime_hook_command = [
-            str(runtime_python),
-            str(layout["runtime_hook_entrypoint"]),
-            "--serve-unix-socket",
-            str(layout["runtime_hook_socket"]),
-        ]
-        runtime_hook = _spawn_logged(
-            runtime_hook_command,
-            layout["logs_dir"] / "runtime-host-tool-hook.out",
-            layout["logs_dir"] / "runtime-host-tool-hook.err",
-            cwd=layout["runtime_hook_dir"],
-            env=base_env,
-        )
-        started.append((runtime_hook, None, False))
-        runtime_hook_identity = _capture_process_identity(
-            runtime_hook.pid,
-            expected_executable=runtime_python,
-            expected_argv=runtime_hook_command,
-        )
-        started[-1] = (runtime_hook, runtime_hook_identity, False)
-        runtime_hook_socket_identity = _wait_for_runtime_hook(runtime_hook, layout)
+            runtime_python = Path(dependencies["python"]["path"])
+            runtime_hook_command = [
+                str(runtime_python),
+                str(layout["runtime_hook_entrypoint"]),
+                "--serve-unix-socket",
+                str(layout["runtime_hook_socket"]),
+            ]
+            runtime_hook = _spawn_logged(
+                runtime_hook_command,
+                layout["logs_dir"] / "runtime-host-tool-hook.out",
+                layout["logs_dir"] / "runtime-host-tool-hook.err",
+                cwd=layout["runtime_hook_dir"],
+                env=base_env,
+            )
+            started.append((runtime_hook, None, False))
+            runtime_hook_identity = _capture_process_identity(
+                runtime_hook.pid,
+                expected_executable=runtime_python,
+                expected_argv=runtime_hook_command,
+            )
+            started[-1] = (runtime_hook, runtime_hook_identity, False)
+            runtime_hook_socket_identity = _wait_for_runtime_hook(runtime_hook, layout)
+            catdesk_pid = catdesk.pid
+            host_pid = host.pid
+            runtime_hook_pid = runtime_hook.pid
+        else:
+            catdesk_identity = reused_live_backends["catdesk_identity"]
+            host_identity = reused_live_backends["host_identity"]
+            runtime_hook_identity = reused_live_backends["runtime_hook_identity"]
+            runtime_hook_socket_identity = reused_live_backends["runtime_hook_socket_identity"]
+            catdesk_pid = catdesk_identity["pid"]
+            host_pid = host_identity["pid"]
+            runtime_hook_pid = runtime_hook_identity["pid"]
 
         _private_dir(layout["process_runtime_state_dir"])
         process_runtime_binary = layout["process_runtime_binary"].resolve(strict=True)
@@ -5235,7 +5282,7 @@ def _start_local_runtime_unlocked(
                 "LAB_BRIDGE_EXECUTION_SESSION_ID": session_id,
                 "LAB_BRIDGE_CAPABILITY_ID": capability_id,
             },
-            layout,
+            env_layout,
         )
         bridge_binary = layout["bridge_binary"].resolve(strict=True)
         bridge_command = [str(bridge_binary)]
@@ -5263,9 +5310,9 @@ def _start_local_runtime_unlocked(
             "workspace": manifest["workspace"],
             "tunnel_profile_name": TUNNEL_PROFILE_NAME,
             "release_manifest": str(layout["release_manifest"]),
-            "catdesk_supervisor_pid": catdesk.pid,
-            "host_pid": host.pid,
-            "runtime_hook_pid": runtime_hook.pid,
+            "catdesk_supervisor_pid": catdesk_pid,
+            "host_pid": host_pid,
+            "runtime_hook_pid": runtime_hook_pid,
             "process_runtime_pid": process_runtime.pid,
             "bridge_pid": bridge.pid,
             "catdesk_supervisor_process_identity": catdesk_identity,
@@ -5283,6 +5330,8 @@ def _start_local_runtime_unlocked(
             "tools": tools,
             **preserved_activation_state,
         }
+        if reused_live_backends is not None:
+            state["reused_live_backends"] = reused_live_backends["record"]
         _write_json_private(layout["runtime_state"], state)
         result = production_status(manifest, layout)
         if not result["local_runtime_ready"]:
@@ -5310,10 +5359,11 @@ def _start_local_runtime_unlocked(
             except Exception:
                 pass
             try:
-                _unlink_runtime_hook_socket(
-                    layout["runtime_hook_socket"],
-                    locals().get("runtime_hook_socket_identity"),
-                )
+                if reused_live_backends is None:
+                    _unlink_runtime_hook_socket(
+                        layout["runtime_hook_socket"],
+                        locals().get("runtime_hook_socket_identity"),
+                    )
             except Exception:
                 pass
             if catdesk_child_pid_was_absent:
@@ -6006,6 +6056,177 @@ def _layout_is_parallel_generation(layout: dict[str, Any]) -> bool:
         and _layout_host_mcp_port(layout) != PRODUCTION_HOST_MCP_PORT
         and _layout_process_runtime_port(layout) != PRODUCTION_PROCESS_RUNTIME_PORT
     )
+
+
+def _layout_is_canonical_production(layout: dict[str, Any]) -> bool:
+    return (
+        _path_is_same(layout["runtime_root"], PRODUCTION_RUNTIME_ROOT)
+        and _path_is_same(layout["bridge_socket"], PRODUCTION_BRIDGE_SOCKET)
+        and _layout_catdesk_port(layout) == PRODUCTION_CATDESK_PORT
+        and _layout_host_mcp_port(layout) == PRODUCTION_HOST_MCP_PORT
+        and _layout_process_runtime_port(layout) == PRODUCTION_PROCESS_RUNTIME_PORT
+    )
+
+
+def _prior_identity_manifest(prior: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "connector_id": CONNECTOR_ID,
+        "contract_version": CONTRACT_VERSION,
+        "fail_closed": True,
+        "release_revision": _release_revision(str(prior.get("release_revision") or "")),
+        "endpoint_generation": _endpoint_generation(prior.get("endpoint_generation")),
+        "workspace": current["workspace"],
+        "tunnel": {"profile_name": TUNNEL_PROFILE_NAME},
+    }
+
+
+def _require_live_reused_backend_identity(
+    state: dict[str, Any], pid_key: str, identity_key: str, label: str
+) -> dict[str, Any]:
+    pid = state.get(pid_key)
+    identity = state.get(identity_key)
+    if not isinstance(pid, int) or not isinstance(identity, dict) or identity.get("pid") != pid:
+        raise RuntimeError(f"cannot reuse live {label} without exact {identity_key}")
+    _validate_process_identity_record(identity)
+    if not _process_identity_matches(identity):
+        raise RuntimeError(f"cannot reuse live {label} because {identity_key} changed")
+    return identity
+
+
+def _reuse_live_catdesk_host_for_jobs_upgrade(
+    prior: dict[str, Any],
+    layout: dict[str, Path],
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep live CatDesk/Host/runtime-hook; caller may replace only jobs runtime."""
+    catdesk_identity = _require_live_reused_backend_identity(
+        prior,
+        "catdesk_supervisor_pid",
+        "catdesk_supervisor_process_identity",
+        "CatDesk",
+    )
+    host_identity = _require_live_reused_backend_identity(
+        prior, "host_pid", "host_process_identity", "Host"
+    )
+    runtime_hook_identity = _require_live_reused_backend_identity(
+        prior,
+        "runtime_hook_pid",
+        "runtime_hook_process_identity",
+        "Runtime Host tool hook",
+    )
+    hook_socket_identity = prior.get("runtime_hook_socket_identity")
+    if not isinstance(hook_socket_identity, dict):
+        raise RuntimeError("cannot reuse live Runtime Host tool hook without exact socket identity")
+    prior_manifest = _prior_identity_manifest(prior, manifest)
+    prior_layout = production_layout(
+        prior_manifest,
+        runtime_root=layout["runtime_root"],
+        bridge_socket=layout["bridge_socket"],
+        catdesk_port=_layout_catdesk_port(layout),
+        host_mcp_port=_layout_host_mcp_port(layout),
+        process_runtime_port=_layout_process_runtime_port(layout),
+    )
+    if not _tcp_ready("127.0.0.1", _layout_catdesk_port(layout)):
+        raise RuntimeError("cannot reuse live CatDesk because production CatDesk port is not listening")
+    if not _tcp_ready("127.0.0.1", _layout_host_mcp_port(layout)):
+        raise RuntimeError("cannot reuse live Host because production Host MCP port is not listening")
+    if not _runtime_hook_socket_is_live(prior_layout["runtime_hook_socket"], hook_socket_identity):
+        raise RuntimeError("cannot reuse live Runtime Host tool hook because its socket is not live")
+    return {
+        "prior_layout": prior_layout,
+        "slug": _catdesk_slug(prior_layout["catdesk_config"]),
+        "catdesk_identity": catdesk_identity,
+        "host_identity": host_identity,
+        "runtime_hook_identity": runtime_hook_identity,
+        "runtime_hook_socket_identity": hook_socket_identity,
+        "record": {
+            "source_release_revision": prior_manifest["release_revision"],
+            "source_endpoint_generation": prior_manifest["endpoint_generation"],
+            "catdesk_backend_key": str(prior_layout["catdesk_backend_key"]),
+            "host_backend_key": str(prior_layout["host_backend_key"]),
+            "host_socket": str(prior_layout["host_socket"]),
+            "runtime_hook_socket": str(prior_layout["runtime_hook_socket"]),
+            "release_manifest": str(prior_layout["release_manifest"]),
+        },
+    }
+
+
+def _jobs_upgrade_reuse_layout(
+    layout: dict[str, Path], prior_layout: dict[str, Path]
+) -> dict[str, Path]:
+    reused = dict(layout)
+    for key in (
+        "catdesk_home",
+        "catdesk_config",
+        "catdesk_backend_key",
+        "host_backend_key",
+        "host_socket",
+        "runtime_hook_socket",
+        "release_manifest",
+    ):
+        reused[key] = prior_layout[key]
+    return reused
+
+
+def _overlay_reused_production_fence(
+    component_env: dict[str, dict[str, str]], reused: dict[str, Any]
+) -> None:
+    record = reused["record"]
+    fence = {
+        "LAB_PRODUCTION_RELEASE_MANIFEST_FILE": record["release_manifest"],
+        "LAB_PRODUCTION_RELEASE_REVISION": str(record["source_release_revision"]),
+        "LAB_PRODUCTION_ENDPOINT_GENERATION": str(record["source_endpoint_generation"]),
+    }
+    for env in component_env.values():
+        env.update(fence)
+
+
+def _stop_verified_jobs_runtime(state: dict[str, Any], layout: dict[str, Path]) -> None:
+    """Stop only Bridge and Process Runtime. Never CatDesk, Host, or runtime-hook."""
+    live_state = dict(state)
+    for pid_key, identity_key in (
+        ("bridge_pid", "bridge_process_identity"),
+        ("process_runtime_pid", "process_runtime_process_identity"),
+    ):
+        pid = state.get(pid_key)
+        if not isinstance(pid, int):
+            continue
+        identity = state.get(identity_key)
+        if not isinstance(identity, dict) or identity.get("pid") != pid:
+            raise RuntimeError(f"cannot stop production jobs runtime without exact {identity_key}")
+        _validate_process_identity_record(identity)
+        if _process_identity_matches(identity):
+            continue
+        if _process_is_running(pid):
+            raise RuntimeError(
+                f"cannot stop production jobs runtime because {identity_key} changed"
+            )
+        live_state.pop(pid_key, None)
+        live_state.pop(identity_key, None)
+    targets: list[dict[str, Any]] = []
+    for pid_key, identity_key in (
+        ("bridge_pid", "bridge_process_identity"),
+        ("process_runtime_pid", "process_runtime_process_identity"),
+    ):
+        pid = live_state.get(pid_key)
+        if not isinstance(pid, int):
+            continue
+        identity = live_state.get(identity_key)
+        if not isinstance(identity, dict) or identity.get("pid") != pid:
+            raise RuntimeError(f"cannot stop production jobs runtime without exact {identity_key}")
+        _validate_process_identity_record(identity)
+        if not _process_identity_matches(identity):
+            raise RuntimeError(
+                f"cannot stop production jobs runtime because {identity_key} changed"
+            )
+        targets.append(identity)
+    for identity in targets:
+        _stop_verified_process_identity(identity, process_group=False)
+    if layout["bridge_socket"].exists():
+        info = layout["bridge_socket"].lstat()
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid():
+            raise RuntimeError("refusing to remove unsafe production Bridge socket")
+        layout["bridge_socket"].unlink()
 
 
 def _tcp_ready(host: str, port: int) -> bool:
