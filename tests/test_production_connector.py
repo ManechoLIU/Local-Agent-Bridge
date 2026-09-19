@@ -2556,6 +2556,171 @@ class ProductionConnectorContractTests(unittest.TestCase):
                     pc.reconcile_dead_recorded_tunnel_pid_to_live_exclusive(manifest, layout)
             self.assertEqual(layout["runtime_state"].read_bytes(), before)
 
+    def _dead_bridge_pid_live_exclusive_fixture(
+        self,
+        root,
+        *,
+        recorded_pid=62454,
+        live_pid=1130,
+        generation=7,
+        recorded_generation=None,
+        recorded_revision=None,
+    ):
+        manifest = self._manifest(generation)
+        layout = pc.production_layout(
+            manifest, runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
+        )
+        layout["bridge_binary"].parent.mkdir(parents=True, exist_ok=True)
+        layout["bridge_binary"].write_bytes(b"production-bridge")
+        layout["bridge_binary"].chmod(0o700)
+        expected_binary = str(layout["bridge_binary"].resolve(strict=True))
+        live_identity = {
+            **self._identity(live_pid, [expected_binary]),
+            "lstart": "Sat Sep 19 18:10:49 2026",
+            "start_timestamp": 1789812649.0,
+        }
+        recorded_identity = {
+            **self._identity(recorded_pid, [expected_binary]),
+            "lstart": "Sat Sep 19 17:23:10 2026",
+            "start_timestamp": 1789809790.0,
+        }
+        layout["runtime_state"].parent.mkdir(parents=True, exist_ok=True)
+        state = {
+            "release_revision": REVISION if recorded_revision is None else recorded_revision,
+            "endpoint_generation": generation if recorded_generation is None else recorded_generation,
+            "workspace": str(pc.canonical_workspace()),
+            "tunnel_profile_name": pc.TUNNEL_PROFILE_NAME,
+            "tunnel_pid": 47423,
+            "tunnel_id": "tunnel-production",
+            "process_runtime_pid": 61002,
+            "bridge_pid": recorded_pid,
+            "bridge_process_identity": recorded_identity,
+            "bridge_capability_id": "bridge-cap-production-keep",
+            "bridge_execution_session_id": "bridge-session-production-keep",
+        }
+        layout["runtime_state"].write_text(json.dumps(state), encoding="utf-8")
+        layout["runtime_state"].chmod(0o600)
+        return manifest, layout, state, live_identity
+
+    def test_reconcile_dead_recorded_bridge_pid_to_live_exclusive_rewrites_only_pid_and_identity(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            manifest, layout, before, live_identity = self._dead_bridge_pid_live_exclusive_fixture(root)
+            before_bytes = layout["runtime_state"].read_bytes()
+            with patch.object(
+                pc, "_unique_process_identity_for_executable", return_value=live_identity
+            ), patch.object(
+                pc, "_verify_process_owned_unix_socket"
+            ) as verify_socket, patch.object(
+                pc, "_pid_alive", return_value=False
+            ):
+                result = pc.reconcile_dead_recorded_bridge_pid_to_live_exclusive(manifest, layout)
+            self.assertTrue(result["reconciled"])
+            self.assertFalse(result["bridge_ready"])
+            self.assertEqual(result["recorded_pid_before"], 62454)
+            self.assertEqual(result["live_pid"], 1130)
+            verify_socket.assert_called()
+            state = json.loads(layout["runtime_state"].read_text(encoding="utf-8"))
+            self.assertEqual(state["bridge_pid"], 1130)
+            self.assertEqual(state["bridge_process_identity"], live_identity)
+            self.assertEqual(state["tunnel_pid"], 47423)
+            self.assertEqual(state["process_runtime_pid"], 61002)
+            self.assertEqual(state["bridge_capability_id"], before["bridge_capability_id"])
+            self.assertEqual(
+                state["bridge_execution_session_id"], before["bridge_execution_session_id"]
+            )
+            self.assertEqual(state["endpoint_generation"], before["endpoint_generation"])
+            self.assertNotEqual(layout["runtime_state"].read_bytes(), before_bytes)
+
+    def test_reconcile_dead_recorded_bridge_pid_fail_closed_when_recorded_pid_alive(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            manifest, layout, _, live_identity = self._dead_bridge_pid_live_exclusive_fixture(root)
+            before = layout["runtime_state"].read_bytes()
+            with patch.object(
+                pc, "_unique_process_identity_for_executable", return_value=live_identity
+            ), patch.object(
+                pc, "_verify_process_owned_unix_socket"
+            ), patch.object(
+                pc, "_pid_alive", return_value=True
+            ):
+                with self.assertRaisesRegex(RuntimeError, "recorded pid 62454 is still alive"):
+                    pc.reconcile_dead_recorded_bridge_pid_to_live_exclusive(manifest, layout)
+            self.assertEqual(layout["runtime_state"].read_bytes(), before)
+            self.assertFalse(
+                json.loads(layout["runtime_state"].read_text(encoding="utf-8")).get("bridge_ready")
+            )
+
+    def test_reconcile_dead_recorded_bridge_pid_fail_closed_on_generation_or_revision_mismatch(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            manifest, layout, _, live_identity = self._dead_bridge_pid_live_exclusive_fixture(
+                root, recorded_generation=6
+            )
+            before = layout["runtime_state"].read_bytes()
+            with patch.object(
+                pc, "_unique_process_identity_for_executable", return_value=live_identity
+            ), patch.object(
+                pc, "_verify_process_owned_unix_socket"
+            ), patch.object(
+                pc, "_pid_alive", return_value=False
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "endpoint generation does not match live exclusive"
+                ):
+                    pc.reconcile_dead_recorded_bridge_pid_to_live_exclusive(manifest, layout)
+            self.assertEqual(layout["runtime_state"].read_bytes(), before)
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            manifest, layout, _, live_identity = self._dead_bridge_pid_live_exclusive_fixture(
+                root, recorded_revision="b" * 40
+            )
+            before = layout["runtime_state"].read_bytes()
+            with patch.object(
+                pc, "_unique_process_identity_for_executable", return_value=live_identity
+            ), patch.object(
+                pc, "_verify_process_owned_unix_socket"
+            ), patch.object(
+                pc, "_pid_alive", return_value=False
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "release revision does not match live exclusive"
+                ):
+                    pc.reconcile_dead_recorded_bridge_pid_to_live_exclusive(manifest, layout)
+            self.assertEqual(layout["runtime_state"].read_bytes(), before)
+
+    def test_reconcile_dead_recorded_bridge_pid_fail_closed_without_exclusive_live_bridge(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            manifest, layout, _, live_identity = self._dead_bridge_pid_live_exclusive_fixture(root)
+            before = layout["runtime_state"].read_bytes()
+            with patch.object(
+                pc,
+                "_unique_process_identity_for_executable",
+                side_effect=RuntimeError("production Bridge executable must have exactly one live process"),
+            ), patch.object(
+                pc, "_pid_alive", return_value=False
+            ):
+                with self.assertRaisesRegex(RuntimeError, "unique live exclusive Bridge"):
+                    pc.reconcile_dead_recorded_bridge_pid_to_live_exclusive(manifest, layout)
+            self.assertEqual(layout["runtime_state"].read_bytes(), before)
+
+            with patch.object(
+                pc, "_unique_process_identity_for_executable", return_value=live_identity
+            ), patch.object(
+                pc,
+                "_verify_process_owned_unix_socket",
+                side_effect=RuntimeError("production Bridge Unix socket owner identity mismatch"),
+            ), patch.object(
+                pc, "_pid_alive", return_value=False
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "does not own the production Bridge socket"
+                ):
+                    pc.reconcile_dead_recorded_bridge_pid_to_live_exclusive(manifest, layout)
+            self.assertEqual(layout["runtime_state"].read_bytes(), before)
+
     def test_tunnel_operational_gate_requires_loopback_exact_status_and_fresh_structured_event_chain(self):
         manifest = self._manifest()
         with tempfile.TemporaryDirectory() as raw_root:

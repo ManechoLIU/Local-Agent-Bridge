@@ -3491,6 +3491,173 @@ def _reconcile_dead_recorded_tunnel_pid_to_live_exclusive_unlocked(
     return result
 
 
+def _live_exclusive_production_bridge(
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+) -> dict[str, Any]:
+    """Prove one live process of this generation's Bridge binary owns the socket."""
+    _validate_manifest_contract(manifest)
+    try:
+        expected_binary = Path(layout["bridge_binary"]).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError(
+            "cannot reconcile bridge pid because production Bridge binary is missing"
+        ) from error
+    if expected_binary.name != "local-tool-bridge":
+        raise RuntimeError(
+            "cannot reconcile bridge pid because production Bridge binary is not canonical"
+        )
+    expected_layout_binary = (
+        Path(layout["release_dir"]).expanduser() / "bin" / "local-tool-bridge"
+    )
+    try:
+        if expected_binary != expected_layout_binary.resolve(strict=True):
+            raise RuntimeError(
+                "cannot reconcile bridge pid because live exclusive binary is not this generation"
+            )
+    except OSError as error:
+        raise RuntimeError(
+            "cannot reconcile bridge pid because production Bridge binary is missing"
+        ) from error
+    try:
+        live_identity = _unique_process_identity_for_executable(
+            expected_binary, "production Bridge"
+        )
+    except RuntimeError as error:
+        raise RuntimeError(
+            f"cannot reconcile bridge pid without a unique live exclusive Bridge: {error}"
+        ) from error
+    live_pid = live_identity.get("pid")
+    if not isinstance(live_pid, int) or live_pid < 1:
+        raise RuntimeError("cannot reconcile bridge pid because live exclusive pid is invalid")
+    _validate_process_identity_record(live_identity)
+    if live_identity.get("pid") != live_pid:
+        raise RuntimeError(
+            "cannot reconcile bridge pid because live identity pid mismatches the exclusive process"
+        )
+    if live_identity.get("exe_realpath") != str(expected_binary):
+        raise RuntimeError(
+            "cannot reconcile bridge pid because live exclusive binary does not match this generation"
+        )
+    if live_identity.get("argv") != [str(expected_binary)]:
+        raise RuntimeError(
+            "cannot reconcile bridge pid because live exclusive argv is not canonical"
+        )
+    try:
+        _verify_process_owned_unix_socket(
+            live_identity, layout["bridge_socket"], "production Bridge"
+        )
+    except RuntimeError as error:
+        raise RuntimeError(
+            "cannot reconcile bridge pid because live exclusive does not own the production Bridge socket: "
+            f"{error}"
+        ) from error
+    return {
+        "pid": live_pid,
+        "process_identity": live_identity,
+        "exe_realpath": str(expected_binary),
+        "socket": str(layout["bridge_socket"]),
+    }
+
+
+def reconcile_dead_recorded_bridge_pid_to_live_exclusive(
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+) -> dict[str, Any]:
+    """Atomically rebind a dead recorded bridge_pid onto the live exclusive.
+
+    Only rewrites bridge_pid and bridge_process_identity. Never claims bridge_ready.
+    """
+    with _production_install_lock(layout["runtime_root"]):
+        return _reconcile_dead_recorded_bridge_pid_to_live_exclusive_unlocked(
+            manifest, layout
+        )
+
+
+def _reconcile_dead_recorded_bridge_pid_to_live_exclusive_unlocked(
+    manifest: dict[str, Any],
+    layout: dict[str, Path],
+) -> dict[str, Any]:
+    item = _live_exclusive_production_bridge(manifest, layout)
+    snapshot = _private_file_snapshot(layout["runtime_state"], "production runtime state")
+    state = _decode_private_json_snapshot(snapshot, "production runtime state")
+    live_pid = item["pid"]
+    live_identity = item["process_identity"]
+
+    if state.get("endpoint_generation") != manifest["endpoint_generation"]:
+        raise RuntimeError(
+            "cannot reconcile bridge pid because endpoint generation does not match live exclusive"
+        )
+    if state.get("release_revision") != manifest["release_revision"]:
+        raise RuntimeError(
+            "cannot reconcile bridge pid because release revision does not match live exclusive"
+        )
+
+    recorded_pid = state.get("bridge_pid")
+    if not isinstance(recorded_pid, int) or recorded_pid < 1:
+        raise RuntimeError("cannot reconcile bridge pid because recorded pid is invalid")
+
+    result = {
+        "reconciled": False,
+        "recorded_pid_before": recorded_pid,
+        "live_pid": live_pid,
+        "endpoint_generation": manifest["endpoint_generation"],
+        "bridge_ready": False,
+    }
+    if recorded_pid == live_pid:
+        if state.get("bridge_process_identity") != live_identity:
+            raise RuntimeError(
+                "cannot reconcile bridge pid because recorded pid is already live but process identity drifted"
+            )
+        result["already_current"] = True
+        return result
+    if _pid_alive(recorded_pid):
+        raise RuntimeError(
+            f"cannot reconcile bridge pid because recorded pid {recorded_pid} is still alive"
+        )
+
+    current = _read_private_bytes_if_present(
+        layout["runtime_state"], "production runtime state bridge pid reconcile CAS"
+    )
+    if current != snapshot[0]:
+        raise RuntimeError("production runtime state changed before bridge pid reconcile")
+
+    updated = dict(state)
+    updated["bridge_pid"] = live_pid
+    updated["bridge_process_identity"] = live_identity
+    expected_bytes = (
+        json.dumps(updated, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    write_started = False
+    try:
+        write_started = True
+        _write_json_private(layout["runtime_state"], updated)
+        readback = _read_private_bytes_if_present(
+            layout["runtime_state"], "production runtime state bridge pid reconcile readback"
+        )
+        if readback != expected_bytes:
+            raise RuntimeError("bridge pid reconcile readback mismatch")
+        rediscovered = _live_exclusive_production_bridge(manifest, layout)
+        if (
+            rediscovered.get("pid") != live_pid
+            or rediscovered.get("process_identity") != live_identity
+        ):
+            raise RuntimeError("live exclusive bridge drifted after bridge pid reconcile")
+    except Exception as error:
+        if write_started:
+            try:
+                _restore_private_file_snapshot(
+                    layout["runtime_state"], snapshot, private_parent=True
+                )
+            except Exception as restore_error:
+                raise RuntimeError(
+                    f"{error}; bridge pid reconcile restore failed: {restore_error}"
+                ) from error
+        raise
+    result["reconciled"] = True
+    return result
+
+
 def _write_activation_rollback_receipt(
     manifest: dict[str, Any],
     layout: dict[str, Path],
