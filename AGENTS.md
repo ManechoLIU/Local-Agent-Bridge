@@ -12,10 +12,12 @@ Always distinguish the following identities:
 
 1. **Web conversation / execution target ID** — the ChatGPT Web conversation or execution entry currently interacting with the project.
 2. **Bridge execution session ID** — the local Bridge session/capability identity used for a concrete local execution channel.
-3. **logical Controller ID** — the stable project-level Controller identity owned by orchestration/governance.
+3. **logical Controller ID** — the stable project-level Controller identity owned by orchestration/governance. Exactly one per project.
 4. **Adaptive Agent Runtime controller registration** — the machine registry record binding a logical Controller to this repository and its current execution ownership/generation.
+5. **Role principal ID** — durable, revocable identity issued **by role** (Controller is the singleton principal; Managers are 0..N principals bound to ledger seats). Not a conversation ID, not a second Controller, not an executor/sub-agent ID.
+6. **Assignment lease** — temporary occupancy of a ledger row (and optional child dispatch inside that row). Liveness may use heartbeat. Expiry/revoke returns the seat. Executors and short-lived package owners use leases, not principal IDs.
 
-These values are not interchangeable. A Web execution target ID is **not** a logical Controller ID. A Bridge execution session is **not** proof of Controller ownership. A prompt-provided identifier is **not** machine-verifiable host/session attestation.
+These values are not interchangeable. A Web execution target ID is **not** a logical Controller ID. A Bridge execution session is **not** proof of Controller ownership. A prompt-provided identifier is **not** machine-verifiable host/session attestation. A Manager principal is **not** Controller authority. An assignment lease is **not** a digital-employee ID.
 
 Never reuse SelfAlone's logical Controller ID for this project.
 
@@ -135,101 +137,52 @@ If a platform safety layer explicitly blocks an operation:
 
 Agents must not infer that `smaller command = allowed` or `larger command = blocked`. The goal is clear intent, least necessary side effect, easier review, and reliable failure localization.
 
-## 2. Bootstrap / Temporary Controller Binding
+## 2. Current Controller identity (host-attested)
 
-> **TEMPORARY / BOOTSTRAP ONLY — NOT FINAL ARCHITECTURE**
->
-> This section exists only until the new Local Agent Bridge can provide sufficiently reliable execution-session authentication and host/session attestation. Future agents must not reinterpret this bootstrap state as the permanent Controller identity model.
+Fresh registry fact for this repository's unique logical Controller `a697051d-402b-4062-a883-a29ba8b395e9`:
 
-### 2.1 Current manual authorization
+- Web execution target `6aacbb08-5204-83ec-8a8e-ddcfdb6f8edb`
+- target/ownership generation **11 / 11**
+- `provenance = host_attested_same_controller_recovery`
+- `identity_proof = host_attested_origin`
+- execution ownership `active_host = web`
 
-The user has explicitly authorized the following current Web execution target to act as the **only project-level Controller execution entry during bootstrap development**:
+This is **strong identity binding**, not bootstrap. Do not describe current Controller identity as `manual_user_authorized` or `host_attested=false`.
 
-- `web_execution_target_id = 6a9e41a2-266c-83ea-9104-e768ed4ad3f2`
-- `provenance = manual_user_authorized`
-- `binding = temporary`
-- `host_attested = false`
+Historical bootstrap Web IDs (`6a9e41a2-…`, `6a9e4158-…`, `6a9e4037-…` and other `manual_user_authorized` aliases) are audit lineage only. They must not be used as current ownership, attested as the live target, or revived as a second Controller.
 
-This authorization permits the Web session to perform project-level planning, dispatch, acceptance, review orchestration, and development governance during the bootstrap phase.
+Controller-gated actions (rule ACK, accept-live-e2e, defer-live-e2e, project Goal rollover, ledger CAS) require the caller to be this Controller's **canonical current target** at the current generation. This desktop Codex thread is an executor/entry unless the registry says otherwise.
 
-It does **not** mean the host has cryptographically or machine-verifiably authenticated that conversation. The presence of the ID in a user prompt or in this file must never be described as `host_attested=true`, machine-verifiable identity binding, or proof that the caller currently operating the Bridge is that Web conversation.
+## 3. Remaining identity gate (LAB-GOV-02)
 
-### 2.2 Current Runtime registration fact
+Binding is implemented. What remains is Live-E2E **acceptance freeze**, not inventing attestation:
 
-The canonical Adaptive Agent Runtime registry now contains one project-specific logical Controller registration for this repository:
+`host-attested current target → machine CONFIRMED SAME-Controller wake → clean CLOSED controller cycle → accept-live-e2e`
 
-- `project_identity = /Users/echoman/Documents/ChatGPT/Local-Agent-Bridge/.git` (Git common-dir; this is the Runtime project identity boundary)
-- `logical_controller_id = a697051d-402b-4062-a883-a29ba8b395e9`
-- `web_execution_target_id = 6a9e41a2-266c-83ea-9104-e768ed4ad3f2`
-- `provenance = manual_user_authorized`
-- `binding = temporary`
-- `host_attested = false`
-- Runtime registry/session projection currently reports `BOUND_REGISTERED_WEB_SESSION` for the Web alias. This means the registry association is present; it **does not** upgrade the binding to host-attested origin identity.
+Until `accept-live-e2e` is written, `live_e2e_required` stays true. Do not treat missing acceptance as missing binding. Do not replay old wakes, forge current-entry, or relabel `RESULT_UNKNOWN` as success.
 
-Therefore:
+## 4. Adaptive Agent Runtime on development sessions
 
-- the logical Controller ID above is the only logical Controller for this project;
-- no SelfAlone Controller ID may be reused;
-- the Web execution target remains a separate execution/session identity and must never be promoted into the logical Controller ID;
-- `manual_user_authorized` remains bootstrap-only authorization until the Local Agent Bridge supplies machine-verifiable host/session attestation;
-- Runtime machine facts override this file if ownership/generation later changes through a supported canonical operation.
+Use the name **Adaptive Agent Runtime (AAR)**. `adaptive-delivery` is a leftover directory/registry filename, not the system name.
 
-### 2.3 Bootstrap governance behavior
+AAR governs **development/orchestration** sessions on this repo (Controller, Codex tasks, future Manager seats). Ordinary product use of LAB Connect (for example ChatGPT calling Feishu) does **not** require AAR.
 
-During this temporary phase:
+Intensity by complexity, one ledger:
 
-- the authorized Web execution target above is the single project-level Controller execution entry;
-- all desktop Codex/Codex sub-agent/Kimi/Grok/Web/reviewer workers remain non-Controller executors;
-- the Controller may choose executors by task type and real availability;
-- no model family is privileged merely because the Controller is running in Web;
-- the Controller must inspect actual dispatch/execution capabilities before claiming delegation;
-- development may use Adaptive Agent Runtime as orchestration infrastructure, while the Bridge/Computer Runtime product remains independently runnable.
+- **Quick**: Q&A or single-file low risk. Still AAR: no false completion, no scope creep, no second ledger.
+- **Standard**: writes to main-tree code/docs. Evidence, file ownership, one writer per file. Work must map to a ledger row (Controller attaches on dispatch; user need not remember IDs).
+- **Strict**: Controller control plane — project-wide runnable recompute, dispatch, acceptance, integration, Stop receipts.
 
-If the active Web conversation changes before strong binding exists, the new execution target must receive fresh explicit user authorization; agents must not silently inherit this Web ID as current ownership.
+Rules:
 
-
-Bootstrap machine-binding note (2026-09-07): Runtime canonical ownership currently selects Web execution target `6a9e41a2-266c-83ea-9104-e768ed4ad3f2` at generation 1 with provenance `manual_user_authorized` and `host_attested=false`. The earlier `6a9e4158-cc8c-83ea-9763-05a7fd51f597` entry remains lineage/history only. Adaptive Agent Runtime has recorded it in this Controller's Web lineage, but currently projects it as `historical_alias / STALE / EXPLICIT_CURRENT_TARGET_REQUIRED`; `host_attested=false` and Controller actions are not machine-authorized by this alias alone. The prior alias `6a9e4037-0a00-83ea-bb8e-1301c5f6b979` is historical only and must not be treated as the current project Controller execution entry.
-
-
-Bootstrap drift note (2026-09-08): a fresh read of `~/.codex/adaptive-delivery-controllers.json` still shows the same unique logical Controller `a697051d-402b-4062-a883-a29ba8b395e9`, but Runtime currently projects Web ownership to historical alias `6a9e4037-0a00-83ea-bb8e-1301c5f6b979` at generation 2 with `provenance=manual_user_authorized` and `host_attested=false`. This conflicts with the explicit user-authorized bootstrap target above. Treat this as Runtime ownership/target drift, not as fresh user authorization and not as strong host identity. Do not rewrite the user authorization source, create a second Controller, or perform Controller-only strong-binding actions from the drifted alias. Product development that does not depend on Controller identity may continue; LAB-GOV-02 remains fail-closed until Host attestation/re-entry is machine verified.
-
-## 3. Automatic retirement conditions for bootstrap binding
-
-The Bootstrap / Temporary Controller Binding must be retired once the new Local Agent Bridge can provide sufficiently reliable machine facts for all of the following:
-
-- execution-session authentication;
-- host/session attestation;
-- challenge/capability verification;
-- execution-target identity.
-
-And Adaptive Agent Runtime can consume those machine facts to verify the chain:
-
-`verified execution target -> unique logical Controller -> generation / ownership validation`
-
-Once that chain is operational and verified, `manual_user_authorized` must stop being accepted as the normal basis for Controller identity.
-
-The migration must then:
-
-1. establish this project's formal unique logical Controller ID through the supported Runtime mechanism;
-2. bind the current Web execution target using the new machine-verifiable identity/attestation mechanism;
-3. gate Controller actions on the verified binding, current ownership, and generation;
-4. update this `AGENTS.md` to describe the permanent mechanism;
-5. delete or archive Bootstrap manual-binding runtime configuration;
-6. stop requiring the user to provide a Web conversation ID in a prompt as identity proof.
-
-Historical bootstrap records may be retained only as audit history and must not remain an active authorization source.
-
-## 4. Product acceptance gate: eliminate manual Web Controller binding
-
-The ability to retire the current manual Web Controller binding is itself a required acceptance criterion for the Local Agent Bridge PoC and final design.
-
-A successful final identity E2E must demonstrate with machine-verifiable evidence:
-
-`ChatGPT Web -> new Local Agent Bridge identity/attestation -> Adaptive Agent Runtime -> verified unique logical Controller`
-
-Passing this gate requires more than a prompt assertion, copied conversation ID, secret URL, process existence, browser DOM observation, or manually trusted metadata. The evidence must show what identity the Bridge verified, how the execution target was attested, which unique logical Controller Runtime resolved, and which current generation/ownership check authorized the Controller action.
-
-Until this gate passes, Controller identity remains bootstrap/degraded and must be labeled accordingly.
+- One `TASK_LEDGER.md`. Executors do not CAS it. Controller updates it from evidence.
+- Duplicate/conflict checks happen at **dispatch = that ledger write**, not after the fact and not by each manager scanning a stale copy.
+- `BLOCKED` freezes that row only. Unfinished parent/child rows require recompute and dispatch. Do not idle because one Goal or one row is blocked.
+- Session Goal is allowed for the assigned package. Only the Controller rolls the **project** milestone Goal.
+- Human confirmation is only: payment, product-direction change, authorization gates, data security, and hard-to-reverse high risk (including public push/release). Local main commits, ordinary engineering, and authorized disposable tenant writes do not wait on the user.
+- Do not use the user as an acceptance clicker. Controller performs H3/H4 at the real entry.
+- Executors / sub-agents: assignment lease, no principal ID. Temporary package owners: the same lease family, optional in-package spawn, no principal ID even if the task is long or crosses windows. **Standing Manager seats only** get a principal ID; issue on demand, revoke when the seat is idle.
+- Manager principals reuse the same issuance/binding model as Controller (role principal + session bind + revoke). They do not copy Controller gates (ACK / accept-live-e2e / whole-ledger CAS / project Goal rollover). Web attestation strength follows Host facts; a principal ID is not a login session.
 
 ## 5. Development continuity
 
