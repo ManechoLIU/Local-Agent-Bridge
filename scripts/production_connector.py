@@ -6248,7 +6248,21 @@ def _reuse_live_catdesk_host_for_jobs_upgrade(
     hook_socket_identity = prior.get("runtime_hook_socket_identity")
     if not isinstance(hook_socket_identity, dict):
         raise RuntimeError("cannot reuse live Runtime Host tool hook without exact socket identity")
-    prior_manifest = _prior_identity_manifest(prior, manifest)
+    prior_state_for_layout = dict(prior)
+    reused_record = prior.get("reused_live_backends")
+    if reused_record is not None:
+        if not isinstance(reused_record, dict):
+            raise RuntimeError("cannot reuse live backends because reused_live_backends is invalid")
+        try:
+            source_revision = _release_revision(str(reused_record.get("source_release_revision") or ""))
+            source_generation = _endpoint_generation(reused_record.get("source_endpoint_generation"))
+        except RuntimeError as error:
+            raise RuntimeError(
+                "cannot reuse live backends because the original CatDesk/Host generation is invalid"
+            ) from error
+        prior_state_for_layout["release_revision"] = source_revision
+        prior_state_for_layout["endpoint_generation"] = source_generation
+    prior_manifest = _prior_identity_manifest(prior_state_for_layout, manifest)
     prior_layout = production_layout(
         prior_manifest,
         runtime_root=layout["runtime_root"],

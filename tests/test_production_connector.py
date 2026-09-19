@@ -7144,6 +7144,79 @@ class ProductionConnectorContractTests(unittest.TestCase):
                     pc.start_local_runtime(manifest, layout)
             spawn.assert_not_called()
 
+    def test_chained_jobs_upgrade_reuses_original_catdesk_host_generation(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
+            upgraded, layout, prior_layout, prior, installed, hook_identity = (
+                self._canonical_jobs_upgrade_fixture(raw_root)
+            )
+            chained_manifest = {
+                **upgraded,
+                "release_revision": "c" * 40,
+                "endpoint_generation": 17,
+            }
+            chained_layout = pc.production_layout(
+                chained_manifest,
+                runtime_root=layout["runtime_root"],
+                bridge_socket=layout["bridge_socket"],
+            )
+            chained_layout["bridge_binary"].parent.mkdir(parents=True, exist_ok=True)
+            chained_layout["bridge_binary"].write_text("bridge", encoding="utf-8")
+            chained_layout["bridge_binary"].chmod(0o700)
+            chained_layout["process_runtime_binary"].write_text("process-runtime", encoding="utf-8")
+            chained_layout["process_runtime_binary"].chmod(0o700)
+            chained_layout["computer_runtime_binary"].write_text("computer-runtime", encoding="utf-8")
+            chained_layout["computer_runtime_binary"].chmod(0o700)
+            chained_layout["process_runtime_backend_key"].parent.mkdir(parents=True, exist_ok=True)
+            chained_layout["process_runtime_backend_key"].write_text("n" * 64, encoding="utf-8")
+            chained_layout["process_runtime_backend_key"].chmod(0o600)
+            chained_layout["computer_runtime_backend_key"].write_text("c" * 64, encoding="utf-8")
+            chained_layout["computer_runtime_backend_key"].chmod(0o600)
+            chained_prior = {
+                **prior,
+                "release_revision": upgraded["release_revision"],
+                "endpoint_generation": upgraded["endpoint_generation"],
+                "reused_live_backends": {
+                    "source_release_revision": prior["release_revision"],
+                    "source_endpoint_generation": prior["endpoint_generation"],
+                    "runtime_hook_socket": str(prior_layout["runtime_hook_socket"]),
+                    "host_socket": str(prior_layout["host_socket"]),
+                    "host_backend_key": str(prior_layout["host_backend_key"]),
+                    "catdesk_backend_key": str(prior_layout["catdesk_backend_key"]),
+                    "release_manifest": str(prior_layout["release_manifest"]),
+                },
+            }
+            pc._write_json_private(chained_layout["runtime_state"], chained_prior)
+            observed_hook_paths = []
+
+            def hook_live(path, identity):
+                observed_hook_paths.append(Path(path))
+                return identity == hook_identity
+
+            with patch.object(pc, "PRODUCTION_RUNTIME_ROOT", chained_layout["runtime_root"]), patch.object(
+                pc, "PRODUCTION_BRIDGE_SOCKET", chained_layout["bridge_socket"]
+            ), patch.object(pc, "_process_identity_matches", return_value=True), patch.object(
+                pc, "_tcp_ready", return_value=True
+            ), patch.object(pc, "_runtime_hook_socket_is_live", side_effect=hook_live), patch.object(
+                pc, "_catdesk_slug", return_value="private"
+            ):
+                reused = pc._reuse_live_catdesk_host_for_jobs_upgrade(
+                    chained_prior, chained_layout, chained_manifest
+                )
+            self.assertEqual(observed_hook_paths, [prior_layout["runtime_hook_socket"]])
+            self.assertEqual(
+                reused["prior_layout"]["runtime_hook_socket"],
+                prior_layout["runtime_hook_socket"],
+            )
+            self.assertEqual(
+                reused["record"]["source_release_revision"],
+                prior["release_revision"],
+            )
+            self.assertEqual(reused["record"]["source_endpoint_generation"], 15)
+            self.assertNotEqual(
+                reused["prior_layout"]["runtime_hook_socket"],
+                chained_layout["runtime_hook_socket"],
+            )
+
     def test_canonical_jobs_upgrade_spawns_computer_runtime_after_process_runtime(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
             upgraded, layout, prior_layout, prior, installed, hook_identity = (
