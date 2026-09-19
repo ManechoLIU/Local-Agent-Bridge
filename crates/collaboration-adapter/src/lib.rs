@@ -355,6 +355,18 @@ pub enum CollaborationOperation {
         page_size: Option<u16>,
         page_token: Option<String>,
     },
+    BaseCreate {
+        name: String,
+        folder_token: Option<String>,
+        table_name: Option<String>,
+        fields_json: Option<String>,
+        time_zone: Option<String>,
+    },
+    BaseCreateView {
+        base_token: String,
+        table_id: String,
+        view_json: String,
+    },
     BaseCreateRecord {
         base_token: String,
         table_id: String,
@@ -393,7 +405,9 @@ impl CollaborationOperation {
     pub fn is_write(&self) -> bool {
         matches!(
             self,
-            Self::BaseCreateRecord { .. }
+            Self::BaseCreate { .. }
+                | Self::BaseCreateView { .. }
+                | Self::BaseCreateRecord { .. }
                 | Self::BaseUpdateRecord { .. }
                 | Self::MessageSend { .. }
                 | Self::MessageReply { .. }

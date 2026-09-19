@@ -617,10 +617,13 @@ impl ToolPolicy {
             .insert("feishu_base_list_records", Capability::CollaborationRead)
             .insert("feishu_chat_search", Capability::CollaborationRead)
             .insert("feishu_message_list", Capability::CollaborationRead)
+            .insert("feishu_base_create", Capability::CollaborationWrite)
+            .insert("feishu_base_create_view", Capability::CollaborationWrite)
             .insert("feishu_base_create_record", Capability::CollaborationWrite)
             .insert("feishu_base_update_record", Capability::CollaborationWrite)
             .insert("feishu_message_send", Capability::CollaborationWrite)
             .insert("feishu_message_reply", Capability::CollaborationWrite)
+            .insert("feishu_cli", Capability::CollaborationWrite)
             .insert("feishu_setup_start", Capability::ProviderAdmin)
             .insert("feishu_setup_poll", Capability::ProviderAdmin)
             .insert("feishu_auth_begin", Capability::ProviderAdmin)
@@ -993,15 +996,13 @@ async fn handle_mcp(
             // methods. Proof IDs are authority replay keys, so keep them unique.
             Uuid::new_v4().to_string()
         } else {
+            // Non-discovery paths only treat a non-empty x-request-id as the
+            // authority replay key. ChatGPT/tunnel reuses JSON-RPC id 0 without
+            // that header, so body id must not be an authority key.
             header_text(&headers, "x-request-id")
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
-                .unwrap_or_else(|| {
-                    parsed
-                        .get("id")
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| Uuid::new_v4().to_string())
-                })
+                .unwrap_or_else(|| Uuid::new_v4().to_string())
         };
     let nonce = Uuid::new_v4().to_string();
     let now_ms = SystemTime::now()
@@ -1288,6 +1289,48 @@ async fn handle_feishu_call(
         .and_then(|value| value.get("arguments"))
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
+    let id = parsed
+        .get("id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if tool_name == "feishu_cli" {
+        let argv = match collaboration_tools::validate_feishu_cli_argv(&arguments) {
+            Ok((argv, _)) => argv,
+            Err(error) => return text_response(StatusCode::BAD_REQUEST, &error),
+        };
+        return match tokio::task::spawn_blocking(move || runtime.execute_argv(&argv)).await {
+            Ok(Ok(data)) => {
+                let text = serde_json::to_string(&data).unwrap_or_else(|_| "{}".into());
+                json_response(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{"type":"text","text":text}],
+                            "structuredContent": data,
+                        }
+                    }),
+                )
+            }
+            Ok(Err(error)) => json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "id":id,
+                    "error":{
+                        "code":-32010,
+                        "message":error.message,
+                        "data":{"provider":"feishu","backend":"lark-cli"}
+                    }
+                }),
+            ),
+            Err(_) => text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Feishu CLI worker failed",
+            ),
+        };
+    }
     let operation = match collaboration_tools::parse_feishu_operation(
         tool_name,
         &arguments,
@@ -3010,6 +3053,80 @@ fn rebuild_response(
         .map_err(|error| format!("response rebuild failed: {error}"))
 }
 
+const TUNNEL_MCP_PROTOCOL_VERSION: &str = "2026-07-28";
+const BACKEND_MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
+fn backend_mcp_protocol_version(value: &str) -> &str {
+    if value == TUNNEL_MCP_PROTOCOL_VERSION {
+        BACKEND_MCP_PROTOCOL_VERSION
+    } else {
+        value
+    }
+}
+
+fn rewrite_protocol_versions(value: &mut serde_json::Value, from: &str, to: &str) -> bool {
+    let mut changed = false;
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in ["protocolVersion", "io.modelcontextprotocol/protocolVersion"] {
+                if let Some(serde_json::Value::String(existing)) = map.get_mut(key) {
+                    if existing == from {
+                        *existing = to.to_string();
+                        changed = true;
+                    }
+                }
+            }
+            for nested in map.values_mut() {
+                if rewrite_protocol_versions(nested, from, to) {
+                    changed = true;
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for nested in items {
+                if rewrite_protocol_versions(nested, from, to) {
+                    changed = true;
+                }
+            }
+        }
+        _ => {}
+    }
+    changed
+}
+
+fn rewrite_protocol_for_backend(body: Bytes) -> (Bytes, bool) {
+    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (body, false);
+    };
+    if !rewrite_protocol_versions(
+        &mut parsed,
+        TUNNEL_MCP_PROTOCOL_VERSION,
+        BACKEND_MCP_PROTOCOL_VERSION,
+    ) {
+        return (body, false);
+    }
+    match serde_json::to_vec(&parsed) {
+        Ok(bytes) => (Bytes::from(bytes), true),
+        Err(_) => (body, false),
+    }
+}
+
+fn restore_tunnel_protocol_version(bytes: Bytes) -> Bytes {
+    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return bytes;
+    };
+    if !rewrite_protocol_versions(
+        &mut parsed,
+        BACKEND_MCP_PROTOCOL_VERSION,
+        TUNNEL_MCP_PROTOCOL_VERSION,
+    ) {
+        return bytes;
+    }
+    serde_json::to_vec(&parsed)
+        .map(Bytes::from)
+        .unwrap_or(bytes)
+}
+
 async fn forward_to_backend(
     state: &BridgeIngress,
     target: &BackendTarget,
@@ -3017,6 +3134,12 @@ async fn forward_to_backend(
     proof_headers: &HashMap<String, String>,
     body: Bytes,
 ) -> Result<Response<Body>, String> {
+    let incoming_tunnel_protocol = incoming
+        .get("mcp-protocol-version")
+        .and_then(|value| value.to_str().ok())
+        == Some(TUNNEL_MCP_PROTOCOL_VERSION);
+    let (body, body_translated) = rewrite_protocol_for_backend(body);
+    let restore_to_tunnel = incoming_tunnel_protocol || body_translated;
     let mut request = state
         .inner
         .client
@@ -3024,6 +3147,11 @@ async fn forward_to_backend(
         .body(body.to_vec());
     for name in FORWARDED_HEADERS {
         if let Some(value) = incoming.get(*name).and_then(|value| value.to_str().ok()) {
+            let value = if *name == "mcp-protocol-version" {
+                backend_mcp_protocol_version(value)
+            } else {
+                value
+            };
             request = request.header(*name, value);
         }
     }
@@ -3042,13 +3170,19 @@ async fn forward_to_backend(
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let bytes = backend
+    let mut bytes = backend
         .bytes()
         .await
         .map_err(|error| format!("backend response read failed: {error}"))?;
+    if restore_to_tunnel && status == StatusCode::OK {
+        bytes = restore_tunnel_protocol_version(bytes);
+    }
     let mut response = Response::builder().status(status);
     if let Some(content_type) = content_type {
         response = response.header(header::CONTENT_TYPE, content_type);
+    }
+    if restore_to_tunnel {
+        response = response.header("mcp-protocol-version", TUNNEL_MCP_PROTOCOL_VERSION);
     }
     response
         .body(Body::from(bytes))
@@ -3061,6 +3195,10 @@ async fn forward_merged_tools_list(
     proof_headers: &HashMap<String, String>,
     body: Bytes,
 ) -> Result<Response<Body>, String> {
+    let request_id = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.get("id").cloned())
+        .unwrap_or(serde_json::Value::Null);
     let mut responses = vec![(
         "default",
         forward_to_backend(
@@ -3081,26 +3219,34 @@ async fn forward_merged_tools_list(
     if let Some(computer) = state.inner.computer_backend.as_ref() {
         responses.push((
             "computer",
-            forward_to_backend(state, computer, incoming, proof_headers, body).await?,
+            forward_to_backend(state, computer, incoming, proof_headers, body.clone()).await?,
         ));
     }
-    for (kind, response) in &responses {
-        if response.status() != StatusCode::OK {
-            return Err(format!(
-                "tools/list backend {kind} returned {}",
-                response.status()
-            ));
+    let request_id = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.get("id").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    let mut ok_responses = Vec::new();
+    for (kind, response) in responses {
+        if response.status() == StatusCode::OK {
+            ok_responses.push((kind, response));
         }
     }
-    let mut iter = responses.into_iter();
-    let (_, first) = iter
-        .next()
-        .ok_or_else(|| "tools/list has no default backend".to_string())?;
-    let first_bytes = axum::body::to_bytes(first.into_body(), usize::MAX)
-        .await
-        .map_err(|error| format!("default tools/list response read failed: {error}"))?;
-    let mut merged: serde_json::Value = serde_json::from_slice(&first_bytes)
-        .map_err(|error| format!("default tools/list response is not JSON: {error}"))?;
+    let mut iter = ok_responses.into_iter();
+    let mut merged = if let Some((kind, first)) = iter.next() {
+        let first_bytes = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .map_err(|error| format!("{kind} tools/list response read failed: {error}"))?;
+        serde_json::from_slice(&first_bytes).map_err(|error| {
+            format!("{kind} tools/list response is not JSON: {error}")
+        })?
+    } else {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": { "tools": [] }
+        })
+    };
     let tools = merged
         .get_mut("result")
         .and_then(|value| value.get_mut("tools"))
@@ -3332,9 +3478,23 @@ pub fn required_capability(method: &str, tool_name: &str) -> Result<Capability, 
 }
 
 fn text_response(status: StatusCode, message: &str) -> Response<Body> {
+    // Tunnel-client treats text/plain 502 as malformed_json / Connection failed.
+    // Keep HTTP status for production tests; always return JSON-RPC.
+    let code = if status.is_server_error() {
+        -32002
+    } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        -32001
+    } else {
+        -32600
+    };
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": serde_json::Value::Null,
+        "error": {"code": code, "message": message}
+    });
     Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Body::from(message.to_string()))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
         .expect("static response")
 }

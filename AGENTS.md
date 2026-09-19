@@ -177,6 +177,8 @@ Rules:
 
 - One `TASK_LEDGER.md`. Executors do not CAS it. Controller updates it from evidence.
 - Duplicate/conflict checks happen at **dispatch = that ledger write**, not after the fact and not by each manager scanning a stale copy.
+- Appointing a new host/session as the current Controller entry (`replace-desktop-session` / equivalent replace of the current target) claims execution ownership in the **same lock**. `bind-*-session` only adds lineage and does not take duty. Opening a window is not an appointment.
+
 - `BLOCKED` freezes that row only. Unfinished parent/child rows require recompute and dispatch. Do not idle because one Goal or one row is blocked.
 - Session Goal is allowed for the assigned package. Only the Controller rolls the **project** milestone Goal.
 - Human confirmation is only: payment, product-direction change, authorization gates, data security, and hard-to-reverse high risk (including public push/release). Local main commits, ordinary engineering, and authorized disposable tenant writes do not wait on the user.

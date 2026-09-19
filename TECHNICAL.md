@@ -141,3 +141,43 @@ main 916793e adds an independent product-side Chrome Host path for LAB-HOST-01. 
 The Host HMAC key remains in a local Native Messaging process. Runtime-facing calls use a 0600 Unix socket with request-id fencing; the state directory is 0700 and installer-generated Host key is 0600. The installer writes an exact-extension-origin Native Messaging manifest. This remains a same-user boundary and does not claim hostile same-UID isolation.
 
 The Runtime-facing integration exposes challenge issuance, Host attestation request, verifier consumption and re-entry delegation, but owns no Runtime lifecycle, Assignment ledger, retry scheduler or wake system. The Host harness is now 56/56 PASS. Real Chrome for Testing and the existing authenticated Personal Web profile both load the fixed-ID extension and connect to the Native Messaging Host; authenticated exact-conversation Host-signed attestation and a real confirmed submit have passed. `runtime-verifier-cli.mjs` now performs fresh challenge → Host machine evidence → exact target/generation/ownership verification and persists a one-shot verified-target receipt that survives verifier restart; `submit_reentry` can consume only that receipt, never a caller-supplied verified object. The Host installer can optionally register the verifier for Adaptive Agent Runtime using a 0600 config and hashes all five transitive verifier modules. Installed Runtime `d1de19b773b09a247d41c225071a0d48d359c117` now implements the matching trusted external-verifier + submit-adapter protocol, revalidates the executable and full verifier bundle before each execution, and has been canonical-ACKed by the unique project Controller. Installation/ACK is still not final strong identity evidence: LAB-GOV-02 and LAB-WEX-02 remain blocked until canonical ownership reconciliation and final lifecycle Live-E2E complete.
+
+## 2026-09-19：官方 CLI 协作面（飞书先行）技术合同
+
+本条覆盖并取代 2026-09-18「v1 固定 10 个 feishu_* / 未知与 raw API fail-closed」技术合同。实现必须与 `SPEC.md` 同日产品条一致，不另开设计文档。
+
+### 路径
+
+- **Web / 远程 Agent**：`ChatGPT -> OpenAI MCP tunnel / Connector -> Local Tool Bridge -> LarkCliProvider -> official lark-cli -> Feishu Open Platform`。
+- **Codex 桌面**：`Codex -> official lark-cli`（同一 `LARKSUITE_CLI_CONFIG_DIR` 与隔离 HOME）。桌面 MCP **不应**把 LAB Bridge HTTP 当作飞书网关；stdio/包装进程属于桌面宿主问题，不把「桌面经 LAB」写成架构。
+- 不经 CatDesk，不经 AI-Bridge 执行面。
+
+`crates/collaboration-adapter` 只做进程契约：绝对路径 CLI、隔离环境、禁止 shell interpolation、超时与输出上限、结果分类。**不**为每个官方子命令维护一份 MCP schema。Named 工具是 Thin Slice 糖衣，官方 CLI 才是兼容层。
+
+### Capability
+
+- `CollaborationRead`：status、chat search/list、base list tables/fields/records、view list（落地后）。
+- `CollaborationWrite`：base create/update record、message send/reply、create base、create view（后两项按 SPEC 下一刀落地）。
+- `feishu_cli` 逃生口：按写能力授权（可触发写入）；拒绝 `auth` / `login` / `config` / `profile` / `update`。**禁止**在 generic 路径自动附加 `--format json`（`whoami` 等命令会炸）。有 named 工具的动作应走 named 工具。
+
+### Web 工具面（有意做小）
+
+当前应出现在 Connector `tools/list` 的飞书 named 工具：
+
+`feishu_status`、`feishu_chat_search`、`feishu_message_list`、`feishu_base_list_tables`、`feishu_base_list_fields`、`feishu_base_list_records`、`feishu_base_create_record`、`feishu_base_update_record`、`feishu_message_send`、`feishu_message_reply`。
+
+下一刀 named：`feishu_base_create`、`feishu_base_create_view`（`type` 含 `kanban`）。可选 `feishu_cli` 逃生口，不得替代上一列表成为 Web 主入口。
+
+CatDesk/Host `tools/list` 失败时，飞书工具仍须出现（fail-open 飞书面），不得因 default backend 400 把整表打掉。`feishu_message_list` 对话题群将 `page_size` 提升到至少 20，避免空页。
+
+不为「未知 feishu_*」制定产品级 fail-closed 教条；未实现的 named 工具返回普通 tool-not-authorized / not found。不把 117 个 `base +*` 注册进 MCP。
+
+### 进程与发布
+
+生产 CLI 路径绝对、真实、可执行；可选 dependency pin 版本/hash。凭据只在官方 CLI config/HOME，不进仓库、不进 MCP arguments。写入后超时 = `ResultUnknownAfterDispatch`，不自动 retry。Base 行写入保持 field-list preflight。
+
+第二个官方 CLI：新开 Provider 配置与少量 named 工具，不先做通用注册表。官方新增用户不用的命令：忽略。官方改常用 named 包装的 flag：只改该包装。
+
+### 与规划层的关系
+
+`docs/product-planning-layer-design.md` 不承载飞书命令表。本协作面属于 LAB Tool Plane 的可插能力，普通调用不依赖 Adaptive Agent Runtime 在线。

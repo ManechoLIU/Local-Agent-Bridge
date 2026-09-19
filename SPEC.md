@@ -55,3 +55,43 @@
 - v1 **不声称**能够防御已经以与 Bridge 相同 macOS 用户身份运行的恶意本地进程。same-UID 恶意进程可读取/调试该用户进程或访问该用户本就有权访问的数据，因此 0600 UDS 不是这类对手的强隔离边界。
 - 当前临时 CatDesk loopback backend 也只在上述 v1 边界内成立：same-UID 恶意进程可尝试绕过 Local Tool Bridge 直接访问本机 backend。正式文档与 UI 不得把当前方案描述成 same-UID malware isolation。
 - 若未来把 same-UID hostile process 纳入安全目标，必须升级为独立 OS principal / sandbox worker、受认证的 backend peer，或把 Files/Shell/Jobs backend 直接并入 Local Tool Bridge，从结构上移除可绕过的同 UID backend。
+
+## 2026-09-19 用户确认：官方 CLI 协作面（飞书先行）
+
+本条覆盖并取代此前未提交的「v1 固定 10 个 feishu_* / 未知 fail-closed」合同。产品真相只保留这一份。不在 `docs/product-planning-layer-design.md` 再写一套飞书方案；规划层管的是 Planning vs Runtime，以及模型 Provider，不是飞书命令表。
+
+### 要解决的问题
+
+用户要在 ChatGPT Web 和 Codex 桌面使用**同一份已登录官方 CLI**（当前为 `lark-cli@1.0.96`，账号「哈喽」）。Web 到不了本机，必须经 LAB；桌面已在本机，不应再绕 LAB。不把官方 CLI 的全部子命令做成 MCP 工具；不为「官方可能大改 / 将来很多三方 CLI」现在建设通用插件总线。
+
+### 产品结果
+
+- **一次登录**：官方 CLI 的 config / 隔离 HOME 只维护一份；禁止产品路径再发起 `auth login`。
+- **Web**：ChatGPT Connector / 隧道 → Local Agent Bridge → 官方 CLI。Web 工具面以**少量 named 工具**为主，让模型能完成真实任务（搜群、读消息、读/写已有多维表格；下一切片含创建 Base 与看板 view）。
+- **桌面**：Codex 直连同一官方 CLI 登录态，不把 LAB Bridge 当作桌面飞书网关。LAB 不可用时，桌面飞书仍应可用。
+- **逃生口**：允许一个 `feishu_cli`（argv 交给官方 CLI），仅用于尚未做成 named 工具的命令。有专用工具时不得作为主入口。禁止用它做第二次 OAuth。
+- **扩展（现在不做框架）**：第二个官方 CLI 真正出现时，再复制「隔离 HOME + 禁止 login + 少量 named 工具 + 可选 argv 逃生口」。不预先做多 Provider 注册表。
+
+### 非目标
+
+- 把 `lark-cli` 全部 `+` 命令映射为 MCP 工具。
+- 桌面 MCP 必须经 LAB 才能用飞书。
+- 现在建设通用 `external_cli` 总线或企微/钉钉包装。
+- 经 AI-Bridge `office_im` 作为正式飞书路径。
+- 静默把「本机 CLI 已登录」说成 Web/桌面会话已接通。
+
+### 当前 Thin Slice（按使用频率，不按 CLI 目录完整性）
+
+1. 登录探测：`feishu_status`
+2. 群：`feishu_chat_search`、`feishu_message_list`；发送/回复仅在用户明确要说话时使用
+3. 已有多维表格：list tables/fields/records；create/update **一行**记录（写入前 schema preflight）
+4. 下一刀：创建 Base、创建 view（含 `type=kanban`）——仍是 named 工具，不是 argv 主路径
+
+群聊自动发送默认 bot；user identity 需显式。写操作发出后结果不确定则 `result_unknown_after_dispatch`，不自动重试。话题群消息列表不得使用会返回空页的过小 `page_size`（实测 <20 会空）。
+
+### 授权与验收
+
+- 凭据不得进入 MCP arguments、普通日志或模型可见输出。
+- Web：隧道或 Connector 的 `tools/list` 含上述 named 工具；真实 `feishu_status` 与至少一次 `feishu_chat_search` 或 `feishu_message_list` 成功。本机 HTTP 成功不能代替 Web 隧道证据。
+- 桌面：新会话使用同一 `LARKSUITE_CLI_CONFIG_DIR` / 隔离 HOME，不要求经 `127.0.0.1:18765`。
+- 创建 Base/看板在该切片落地前标未做，不得称为已接全 CLI。

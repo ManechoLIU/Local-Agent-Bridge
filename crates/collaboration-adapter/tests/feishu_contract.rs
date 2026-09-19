@@ -55,6 +55,36 @@ fn maps_read_operations_to_fixed_lark_cli_argv() {
 }
 
 #[test]
+fn maps_base_create_and_kanban_view() {
+    let provider = LarkCliProvider::for_test("/opt/homebrew/bin/lark-cli", None);
+    assert_eq!(
+        provider.argv_for(&CollaborationOperation::BaseCreate {
+            name: "项目表".into(),
+            folder_token: None,
+            table_name: Some("任务".into()),
+            fields_json: Some(r#"[{"name":"Title","type":"text"}]"#.into()),
+            time_zone: Some("Asia/Shanghai".into()),
+        }).unwrap(),
+        vec![
+            "base", "+base-create", "--name", "项目表",
+            "--table-name", "任务", "--fields", r#"[{"name":"Title","type":"text"}]"#,
+            "--time-zone", "Asia/Shanghai", "--format", "json", "--as", "user"
+        ]
+    );
+    assert_eq!(
+        provider.argv_for(&CollaborationOperation::BaseCreateView {
+            base_token: "bascn_x".into(),
+            table_id: "tbl_x".into(),
+            view_json: r#"{"name":"看板","type":"kanban"}"#.into(),
+        }).unwrap(),
+        vec![
+            "base", "+view-create", "--base-token", "bascn_x", "--table-id", "tbl_x",
+            "--json", r#"{"name":"看板","type":"kanban"}"#, "--format", "json", "--as", "user"
+        ]
+    );
+}
+
+#[test]
 fn maps_message_writes_with_explicit_identity_and_no_shell() {
     let provider = LarkCliProvider::for_test("/opt/homebrew/bin/lark-cli", None);
     let argv = provider.argv_for(&CollaborationOperation::MessageSend {

@@ -43,6 +43,33 @@ impl CollaborationRuntime {
         })
     }
 
+    pub fn execute_argv(&self, argv: &[String]) -> Result<Value, CollaborationError> {
+        let output = self.provider.execute_argv_with(
+            argv,
+            &ProcessRunner,
+            self.timeout,
+            self.output_limit,
+            true,
+        )?;
+        let stdout = output.stdout.trim();
+        if stdout.is_empty() {
+            return Ok(json!({
+                "ok": output.exit_code == 0,
+                "exitCode": output.exit_code,
+                "stderr": output.stderr,
+            }));
+        }
+        match serde_json::from_str::<Value>(stdout) {
+            Ok(value) => Ok(value),
+            Err(_) => Ok(json!({
+                "ok": output.exit_code == 0,
+                "exitCode": output.exit_code,
+                "raw": stdout.chars().take(8000).collect::<String>(),
+                "stderr": output.stderr,
+            })),
+        }
+    }
+
     pub fn execute(&self, operation: &CollaborationOperation) -> Result<Value, CollaborationError> {
         let output = self.provider.execute_with(
             operation,
@@ -612,6 +639,37 @@ pub fn feishu_tool_definitions() -> Vec<Value> {
                 "message_id":{"type":"string"},"text":{"type":"string"},"identity":{"type":"string","enum":["user","bot"]}
             },"required":["message_id","text"],"additionalProperties":false
         })),
+        tool("feishu_base_create", "Create a new Feishu Base (multidimensional table). Optional first table schema via table_name+fields. Does not start OAuth.", json!({
+            "type":"object",
+            "properties":{
+                "name":{"type":"string"},
+                "folder_token":{"type":"string"},
+                "table_name":{"type":"string"},
+                "fields":{"type":"array","items":{"type":"object"}},
+                "time_zone":{"type":"string"}
+            },
+            "required":["name"],
+            "additionalProperties":false
+        })),
+        tool("feishu_base_create_view", "Create a view in a Feishu Base table. view.type: grid, kanban, gallery, calendar, or gantt. Example kanban: name plus type kanban.", json!({
+            "type":"object",
+            "properties":{
+                "base_token":{"type":"string"},
+                "table_id":{"type":"string"},
+                "view":{"type":"object","description":"Must include name; type defaults to grid. Use type=kanban for a board."}
+            },
+            "required":["base_token","table_id","view"],
+            "additionalProperties":false
+        })),
+        tool("feishu_cli", "Run any already-logged-in lark-cli@1.0.96 command using argv after the binary. Examples: base +base-create; base +view-create with type kanban. Do not pass auth/login. High-risk-write requires yes=true. Prefer this over run_command.", json!({
+            "type":"object",
+            "properties":{
+                "argv":{"type":"array","items":{"type":"string"},"description":"Arguments after lark-cli, e.g. [base, +base-create, --name, Project]"},
+                "yes":{"type":"boolean","description":"Set true to pass --yes for high-risk-write"}
+            },
+            "required":["argv"],
+            "additionalProperties":false
+        })),
     ]
 }
 
@@ -676,6 +734,59 @@ pub fn parse_feishu_operation(
                 chat_id: required_string(args, "chat_id")?,
                 page_size: optional_u16(args, "page_size")?,
                 page_token: optional_string(args, "page_token")?,
+            })
+        }
+        "feishu_base_create" => {
+            reject_unknown(args, &["name", "folder_token", "table_name", "fields", "time_zone"])?;
+            let fields_json = match args.get("fields") {
+                None | Some(Value::Null) => None,
+                Some(value) if value.is_array() => Some(value.to_string()),
+                Some(_) => return Err("fields must be an array of field objects".into()),
+            };
+            Ok(CollaborationOperation::BaseCreate {
+                name: required_string(args, "name")?,
+                folder_token: optional_string(args, "folder_token")?,
+                table_name: optional_string(args, "table_name")?,
+                fields_json,
+                time_zone: optional_string(args, "time_zone")?,
+            })
+        }
+        "feishu_base_create_view" => {
+            reject_unknown(args, &["base_token", "table_id", "view", "name", "type"])?;
+            let view = match args.get("view") {
+                Some(Value::Object(_)) => args.get("view").cloned().unwrap(),
+                Some(Value::String(raw)) => serde_json::from_str(raw)
+                    .map_err(|_| "view must be an object or JSON object string".to_string())?,
+                None | Some(Value::Null) => {
+                    let mut obj = serde_json::Map::new();
+                    if let Some(name) = args.get("name") {
+                        obj.insert("name".into(), name.clone());
+                    }
+                    if let Some(kind) = args.get("type") {
+                        obj.insert("type".into(), kind.clone());
+                    }
+                    Value::Object(obj)
+                }
+                Some(_) => return Err("view must be an object or JSON object string".into()),
+            };
+            if view
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            {
+                return Err("view.name must be a non-empty string".into());
+            }
+            if let Some(kind) = view.get("type").and_then(Value::as_str) {
+                if !matches!(kind, "grid" | "kanban" | "gallery" | "calendar" | "gantt") {
+                    return Err("view.type must be grid, kanban, gallery, calendar, or gantt".into());
+                }
+            }
+            Ok(CollaborationOperation::BaseCreateView {
+                base_token: required_string(args, "base_token")?,
+                table_id: required_string(args, "table_id")?,
+                view_json: view.to_string(),
             })
         }
         "feishu_base_create_record" => {
@@ -802,4 +913,48 @@ fn validated_generated_key(value: &str) -> Result<String, String> {
         return Err("generated idempotency key is invalid".into());
     }
     Ok(value.to_string())
+}
+
+
+pub fn validate_feishu_cli_argv(arguments: &Value) -> Result<(Vec<String>, bool), String> {
+    let args = arguments
+        .as_object()
+        .ok_or_else(|| "feishu_cli arguments must be an object".to_string())?;
+    let yes = args.get("yes").and_then(Value::as_bool).unwrap_or(false);
+    let argv_value = args
+        .get("argv")
+        .ok_or_else(|| "feishu_cli requires argv: array of lark-cli arguments without the binary".to_string())?;
+    let items = argv_value
+        .as_array()
+        .ok_or_else(|| "feishu_cli argv must be an array of strings".to_string())?;
+    if items.is_empty() {
+        return Err("feishu_cli argv must not be empty".into());
+    }
+    if items.len() > 40 {
+        return Err("feishu_cli argv is limited to 40 items".into());
+    }
+    let mut argv = Vec::with_capacity(items.len() + 1);
+    for item in items {
+        let part = item
+            .as_str()
+            .ok_or_else(|| "feishu_cli argv items must be strings".to_string())?;
+        if part.len() > 8000 {
+            return Err("feishu_cli argv item is too long".into());
+        }
+        if part.is_empty() {
+            return Err("feishu_cli argv item must not be empty".into());
+        }
+        argv.push(part.to_string());
+    }
+    let head = argv[0].as_str();
+    if matches!(head, "auth" | "config" | "profile" | "update") {
+        return Err("feishu_cli refuses auth/config/profile/update; reuse the already-logged-in CLI".into());
+    }
+    if argv.iter().any(|part| part == "login") {
+        return Err("feishu_cli refuses login; do not start a second OAuth".into());
+    }
+    if yes && !argv.iter().any(|part| part == "--yes") {
+        argv.push("--yes".into());
+    }
+    Ok((argv, yes))
 }

@@ -341,6 +341,24 @@ impl LarkCliProvider {
         self.environment.iter().cloned().collect()
     }
 
+    pub fn execute_argv_with<R: ProviderRunner>(
+        &self,
+        argv: &[String],
+        runner: &R,
+        timeout: Duration,
+        output_limit: usize,
+        write_operation: bool,
+    ) -> Result<ProcessOutput, CollaborationError> {
+        runner.run_with_env(
+            self.cli_path.to_string_lossy().as_ref(),
+            argv,
+            &self.environment,
+            timeout,
+            output_limit,
+            write_operation,
+        )
+    }
+
     pub fn execute_with<R: ProviderRunner>(
         &self,
         operation: &CollaborationOperation,
@@ -501,15 +519,74 @@ impl LarkCliProvider {
                     "--chat-id".into(),
                     chat_id.clone(),
                 ]);
-                if let Some(page_size) = page_size {
-                    validate_page_size(*page_size, 50)?;
-                    argv.extend(["--page-size".into(), page_size.to_string()]);
-                }
+                let size = page_size.unwrap_or(50).max(20);
+                validate_page_size(size, 50)?;
+                argv.extend(["--page-size".into(), size.to_string()]);
                 if let Some(page_token) = page_token {
                     validate_text("page_token", page_token, 512)?;
                     argv.extend(["--page-token".into(), page_token.clone()]);
                 }
                 argv.extend([
+                    "--format".into(),
+                    "json".into(),
+                    "--as".into(),
+                    "user".into(),
+                ]);
+            }
+            CollaborationOperation::BaseCreate {
+                name,
+                folder_token,
+                table_name,
+                fields_json,
+                time_zone,
+            } => {
+                validate_text("name", name, 256)?;
+                argv.extend(["base".into(), "+base-create".into(), "--name".into(), name.clone()]);
+                if let Some(folder_token) = folder_token {
+                    validate_token("folder_token", folder_token)?;
+                    argv.extend(["--folder-token".into(), folder_token.clone()]);
+                }
+                match (table_name.as_ref(), fields_json.as_ref()) {
+                    (None, None) => {}
+                    (Some(table_name), Some(fields_json)) => {
+                        validate_text("table_name", table_name, 256)?;
+                        validate_json_array("fields", fields_json)?;
+                        argv.extend([
+                            "--table-name".into(),
+                            table_name.clone(),
+                            "--fields".into(),
+                            fields_json.clone(),
+                        ]);
+                    }
+                    _ => {
+                        return Err(CollaborationError::invalid_argument(
+                            "table_name and fields must be provided together",
+                        ));
+                    }
+                }
+                if let Some(time_zone) = time_zone {
+                    validate_text("time_zone", time_zone, 64)?;
+                    argv.extend(["--time-zone".into(), time_zone.clone()]);
+                }
+                argv.extend(["--format".into(), "json".into(), "--as".into(), "user".into()]);
+            }
+            CollaborationOperation::BaseCreateView {
+                base_token,
+                table_id,
+                view_json,
+            } => {
+                validate_token("base_token", base_token)?;
+                validate_token("table_id", table_id)?;
+                validate_json_text(view_json)?;
+                argv.extend([
+                    "base".into(),
+                    "+view-create".into(),
+                    "--base-token".into(),
+                    base_token.clone(),
+                    "--table-id".into(),
+                    table_id.clone(),
+                    "--json".into(),
+                    view_json.clone(),
                     "--format".into(),
                     "json".into(),
                     "--as".into(),
@@ -667,6 +744,17 @@ fn validate_page_size(value: u16, max: u16) -> Result<(), CollaborationError> {
     if value == 0 || value > max {
         return Err(CollaborationError::invalid_argument(format!(
             "page_size must be between 1 and {max}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_json_array(name: &str, value: &str) -> Result<(), CollaborationError> {
+    validate_text(name, value, 64 * 1024)?;
+    let trimmed = value.trim();
+    if !(trimmed.starts_with('[') && trimmed.ends_with(']')) {
+        return Err(CollaborationError::invalid_argument(format!(
+            "{name} must be a JSON array string"
         )));
     }
     Ok(())
