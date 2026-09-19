@@ -52,6 +52,7 @@ PRODUCTION_RUNTIME_ROOT = Path.home() / ".local-agent-bridge" / "production-conn
 PRODUCTION_BRIDGE_SOCKET = Path("/tmp/local-agent-bridge-production/bridge.sock")
 PRODUCTION_CATDESK_PORT = 33331
 PRODUCTION_HOST_MCP_PORT = 33321
+PRODUCTION_PROCESS_RUNTIME_PORT = 33442
 PRODUCTION_BRIDGE_CAPABILITY_TTL_MS = 86_400_000
 PRODUCTION_BRIDGE_CAPABILITY_RENEW_BEFORE_MS = 3_600_000
 AI_BRIDGE_EXECUTABLE = Path("/Applications/AI-Bridge.app/Contents/MacOS/ai-bridge")
@@ -224,6 +225,12 @@ def default_release_sources(repo_root: Path = CANONICAL_PROJECT_ROOT) -> dict[st
     ).expanduser()
     return {
         "bridge_binary": root / "crates" / "local-tool-bridge" / "target" / "release" / "local-tool-bridge",
+        "process_runtime_binary": root
+        / "crates"
+        / "process-runtime"
+        / "target"
+        / "release"
+        / "process-runtime",
         "catdesk_binary": Path(
             os.environ.get(
                 "LAB_PRODUCTION_CATDESK_BINARY",
@@ -305,6 +312,7 @@ def production_layout(
         "release_dir": release_dir,
         "release_manifest": release_dir / "release.json",
         "bridge_binary": release_dir / "bin" / "local-tool-bridge",
+        "process_runtime_binary": release_dir / "bin" / "process-runtime",
         "catdesk_binary": release_dir / "bin" / "catdesk",
         "node_binary": release_dir / "bin" / "node-runtime",
         "catdesk_runner": release_dir / "bin" / "run-catdesk.py",
@@ -323,6 +331,7 @@ def production_layout(
         "runtime_hook_dir": release_dir / "runtime-host-tool-hook",
         "runtime_hook_entrypoint": release_dir / "runtime-host-tool-hook" / RUNTIME_HOST_TOOL_HOOK_ENTRYPOINT_RELATIVE_PATH,
         "host_backend_key": secrets_dir / "host-backend.key",
+        "process_runtime_backend_key": secrets_dir / "process-runtime-backend.key",
         "host_attestation_key": secrets_dir / "host-attestation.key",
         "host_socket_dir": host_socket_dir,
         "host_socket": host_socket_dir / "host.sock",
@@ -345,6 +354,7 @@ def production_layout(
         "rollback_receipt": root / "activation-rollback.json",
         "logs_dir": root / "logs",
         "catdesk_child_pid": runtime_generation_dir / "catdesk-child.pid",
+        "process_runtime_state_dir": runtime_generation_dir / "process-runtime",
     }
 
 
@@ -400,6 +410,24 @@ def production_component_env(
         "LAB_HOST_ADAPTER_SOCKET": str(layout["host_socket"]),
         "LAB_RUNTIME_HOST_TOOL_HOOK_SOCKET": str(layout["runtime_hook_socket"]),
     }
+    process_bind = _numeric_loopback_bind(f"127.0.0.1:{PRODUCTION_PROCESS_RUNTIME_PORT}")
+    process_backend_url = f"http://{process_bind}/mcp"
+    process_runtime = {
+        **fence,
+        "PROCESS_RUNTIME_BIND": process_bind,
+        "PROCESS_RUNTIME_BACKEND_KEY_FILE": str(layout["process_runtime_backend_key"]),
+        "PROCESS_RUNTIME_WORKSPACE": str(manifest["workspace"]),
+        "PROCESS_RUNTIME_WORKSPACE_ID": CONNECTOR_ID,
+        "PROCESS_RUNTIME_STATE_DIR": str(layout["process_runtime_state_dir"]),
+    }
+    bridge["LAB_PROCESS_BACKEND_URL"] = process_backend_url
+    bridge["LAB_PROCESS_BACKEND_KEY_FILE"] = str(layout["process_runtime_backend_key"])
+    _require_paired_backend_env(
+        bridge,
+        url_key="LAB_PROCESS_BACKEND_URL",
+        key_file_key="LAB_PROCESS_BACKEND_KEY_FILE",
+        label="process",
+    )
     dependencies = _validate_runtime_dependencies(manifest)
     feishu_admin_enabled = manifest.get("feishu_admin_enabled") is True
     feishu = dependencies.get("feishu_cli")
@@ -411,7 +439,7 @@ def production_component_env(
         bridge["LAB_FEISHU_CLI"] = str(feishu["path"])
         bridge["LAB_FEISHU_TIMEOUT_MS"] = "30000"
         bridge["LAB_FEISHU_OUTPUT_LIMIT"] = str(1024 * 1024)
-    return {"host": host, "bridge": bridge}
+    return {"host": host, "bridge": bridge, "process_runtime": process_runtime}
 
 
 def production_tunnel_profile(
@@ -466,6 +494,7 @@ def install_release_bundle(
     release_dir = layout["release_dir"]
     required = {
         "bridge_binary",
+        "process_runtime_binary",
         "catdesk_binary",
         "catdesk_config",
         "catdesk_backend_key",
@@ -486,6 +515,7 @@ def install_release_bundle(
         raise RuntimeError("production release source path is invalid") from error
     for name in (
         "bridge_binary",
+        "process_runtime_binary",
         "catdesk_binary",
         "catdesk_config",
         "catdesk_backend_key",
@@ -550,6 +580,11 @@ def install_release_bundle(
         release_dir.mkdir(mode=0o700)
         release_dir_created = True
         _copy_owned_file(resolved_sources["bridge_binary"], layout["bridge_binary"], 0o700)
+        _copy_owned_file(
+            resolved_sources["process_runtime_binary"],
+            layout["process_runtime_binary"],
+            0o700,
+        )
         _copy_owned_file(resolved_sources["catdesk_binary"], layout["catdesk_binary"], 0o700)
         _copy_owned_file(Path(source_node["path"]), layout["node_binary"], 0o700)
         copied_node_digest = _sha256_file(layout["node_binary"])
@@ -576,6 +611,10 @@ def install_release_bundle(
         _private_dir(layout["host_backend_key"].parent)
         layout["host_backend_key"].write_bytes(secrets.token_bytes(32).hex().encode("ascii"))
         layout["host_backend_key"].chmod(0o600)
+        layout["process_runtime_backend_key"].write_bytes(
+            secrets.token_bytes(32).hex().encode("ascii")
+        )
+        layout["process_runtime_backend_key"].chmod(0o600)
 
         _write_json_private(layout["release_tunnel_profile"], profile)
 
@@ -4253,11 +4292,15 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
     catdesk_pid = state.get("catdesk_supervisor_pid") if state_matches else None
     host_pid = state.get("host_pid") if state_matches else None
     runtime_hook_pid = state.get("runtime_hook_pid") if state_matches else None
+    process_runtime_pid = state.get("process_runtime_pid") if state_matches else None
     bridge_pid = state.get("bridge_pid") if state_matches else None
     node = ((installed or {}).get("runtime_dependencies") or {}).get("node", {}).get("path")
     catdesk_identity = state.get("catdesk_supervisor_process_identity") if state_matches else None
     host_identity = state.get("host_process_identity") if state_matches else None
     runtime_hook_identity = state.get("runtime_hook_process_identity") if state_matches else None
+    process_runtime_identity = (
+        state.get("process_runtime_process_identity") if state_matches else None
+    )
     bridge_identity = state.get("bridge_process_identity") if state_matches else None
     catdesk_process = bool(
         isinstance(catdesk_pid, int)
@@ -4273,7 +4316,10 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
         and host_identity.get("exe_realpath")
         == str(Path(node).resolve(strict=True))
         and host_identity.get("argv")
-        == [str(Path(node).resolve(strict=True)), str(layout["host_mcp_adapter"])]
+        == [
+            str(Path(node).resolve(strict=True)),
+            str(_resolved_command_path(layout["host_mcp_adapter"])),
+        ]
         and _process_identity_matches(host_identity)
     )
     runtime_hook_process = bool(
@@ -4281,6 +4327,23 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
         and isinstance(runtime_hook_identity, dict)
         and runtime_hook_identity.get("pid") == runtime_hook_pid
         and _process_identity_matches(runtime_hook_identity)
+    )
+    process_runtime_binary = None
+    if release_installed:
+        binary_path = layout.get("process_runtime_binary")
+        if isinstance(binary_path, Path) and binary_path.is_file():
+            try:
+                process_runtime_binary = str(binary_path.resolve(strict=True))
+            except OSError:
+                process_runtime_binary = None
+    process_runtime_process = bool(
+        process_runtime_binary
+        and isinstance(process_runtime_pid, int)
+        and isinstance(process_runtime_identity, dict)
+        and process_runtime_identity.get("pid") == process_runtime_pid
+        and process_runtime_identity.get("exe_realpath") == process_runtime_binary
+        and process_runtime_identity.get("argv") == [process_runtime_binary]
+        and _process_identity_matches(process_runtime_identity)
     )
     bridge_process = bool(
         isinstance(bridge_pid, int)
@@ -4295,6 +4358,10 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
         and _runtime_hook_socket_is_live(
             layout["runtime_hook_socket"], state.get("runtime_hook_socket_identity")
         )
+    )
+    process_runtime_ready = bool(
+        process_runtime_process
+        and _tcp_ready("127.0.0.1", PRODUCTION_PROCESS_RUNTIME_PORT)
     )
     tools: list[str] = []
     bridge_ready = False
@@ -4319,6 +4386,7 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
         and backend_ready
         and host_ready
         and runtime_hook_ready
+        and process_runtime_ready
         and bridge_ready
     )
     tunnel = production_tunnel_status(manifest, layout)
@@ -4338,6 +4406,7 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
         "backend_ready": backend_ready,
         "host_ready": host_ready,
         "runtime_hook_ready": runtime_hook_ready,
+        "process_runtime_ready": process_runtime_ready,
         "bridge_ready": bridge_ready,
         "bridge_capability_renewal_enabled": bridge_lease["renewal_enabled"],
         "bridge_capability_lease_remaining_ms": bridge_lease["remaining_ms"],
@@ -4347,6 +4416,7 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
         "catdesk_supervisor_pid": catdesk_pid,
         "host_pid": host_pid,
         "runtime_hook_pid": runtime_hook_pid,
+        "process_runtime_pid": process_runtime_pid,
         "bridge_pid": bridge_pid,
         "tools": tools,
         "manifest_has_artifacts": bool(installed and installed.get("artifacts_sha256")),
@@ -4562,6 +4632,8 @@ def _start_local_runtime_unlocked(
         raise RuntimeError("production CatDesk port is occupied by an unverified process")
     if _tcp_ready("127.0.0.1", PRODUCTION_HOST_MCP_PORT):
         raise RuntimeError("production Host MCP port is occupied by an unverified process")
+    if _tcp_ready("127.0.0.1", PRODUCTION_PROCESS_RUNTIME_PORT):
+        raise RuntimeError("production Process Runtime port is occupied by an unverified process")
     if layout["bridge_socket"].exists():
         raise RuntimeError("production Bridge socket exists without a verified runtime owner")
     if layout["runtime_hook_socket"].exists() or layout["runtime_hook_socket"].is_symlink():
@@ -4576,6 +4648,14 @@ def _start_local_runtime_unlocked(
     _private_dir(layout["bridge_state_dir"])
     slug = _catdesk_slug(layout["catdesk_config"])
     component_env = production_component_env(manifest, layout, catdesk_slug=slug)
+    _require_paired_backend_env(
+        component_env["bridge"],
+        url_key="LAB_PROCESS_BACKEND_URL",
+        key_file_key="LAB_PROCESS_BACKEND_KEY_FILE",
+        label="process",
+    )
+    if "process_runtime" not in component_env:
+        raise RuntimeError("production process-runtime env is missing")
     base_env = {
         "HOME": str(Path.home()),
         "PATH": os.environ.get("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"),
@@ -4601,7 +4681,8 @@ def _start_local_runtime_unlocked(
 
         dependencies = _validate_runtime_dependencies(installed)
         node = Path(dependencies["node"]["path"])
-        host_command = [str(node), str(layout["host_mcp_adapter"])]
+        host_adapter = _resolved_command_path(layout["host_mcp_adapter"])
+        host_command = [str(node), str(host_adapter)]
         host = _spawn_logged(
             host_command,
             layout["logs_dir"] / "host.out",
@@ -4638,6 +4719,27 @@ def _start_local_runtime_unlocked(
         )
         started[-1] = (runtime_hook, runtime_hook_identity, False)
         runtime_hook_socket_identity = _wait_for_runtime_hook(runtime_hook, layout)
+
+        _private_dir(layout["process_runtime_state_dir"])
+        process_runtime_binary = layout["process_runtime_binary"].resolve(strict=True)
+        process_runtime_command = [str(process_runtime_binary)]
+        process_runtime = _spawn_logged(
+            process_runtime_command,
+            layout["logs_dir"] / "process-runtime.out",
+            layout["logs_dir"] / "process-runtime.err",
+            cwd=layout["release_dir"],
+            env={**base_env, **component_env["process_runtime"]},
+        )
+        started.append((process_runtime, None, False))
+        process_runtime_identity = _capture_process_identity(
+            process_runtime.pid,
+            expected_executable=process_runtime_binary,
+            expected_argv=process_runtime_command,
+        )
+        started[-1] = (process_runtime, process_runtime_identity, False)
+        _wait_for_tcp(
+            process_runtime, PRODUCTION_PROCESS_RUNTIME_PORT, "production Process Runtime"
+        )
 
         session_id = f"bridge-session-production-{uuid.uuid4()}"
         capability_id = f"bridge-cap-production-{uuid.uuid4()}"
@@ -4676,11 +4778,13 @@ def _start_local_runtime_unlocked(
             "catdesk_supervisor_pid": catdesk.pid,
             "host_pid": host.pid,
             "runtime_hook_pid": runtime_hook.pid,
+            "process_runtime_pid": process_runtime.pid,
             "bridge_pid": bridge.pid,
             "catdesk_supervisor_process_identity": catdesk_identity,
             "host_process_identity": host_identity,
             "runtime_hook_process_identity": runtime_hook_identity,
             "runtime_hook_socket_identity": runtime_hook_socket_identity,
+            "process_runtime_process_identity": process_runtime_identity,
             "bridge_process_identity": bridge_identity,
             "bridge_execution_session_id": session_id,
             "bridge_capability_id": capability_id,
@@ -5389,6 +5493,49 @@ def _tcp_ready(host: str, port: int) -> bool:
         return False
 
 
+def _resolved_command_path(path: Path) -> Path:
+    """Return the real path used as argv[0]/argv[1] so macOS /tmp vs /private/tmp matches.
+
+    Host MCP's adapter only starts when process.argv[1] equals import.meta.url.
+    Passing a /tmp path on macOS makes Node see /private/tmp and exit 0 with no logs.
+    """
+    try:
+        return Path(path).expanduser().resolve()
+    except OSError:
+        return Path(path)
+
+
+def _numeric_loopback_bind(bind: str) -> str:
+    text = str(bind or "").strip()
+    host, separator, port = text.rpartition(":")
+    if separator != ":" or not host or not port.isdigit():
+        raise RuntimeError("production Process Runtime bind must be numeric-loopback host:port")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError as error:
+        raise RuntimeError("production Process Runtime bind host must be a numeric IP") from error
+    if not ip.is_loopback:
+        raise RuntimeError("production Process Runtime bind must be numeric loopback")
+    return f"{ip}:{int(port)}"
+
+
+def _require_paired_backend_env(
+    env: dict[str, str],
+    *,
+    url_key: str,
+    key_file_key: str,
+    label: str,
+) -> None:
+    if not isinstance(env, dict):
+        raise RuntimeError(f"production {label} env must be an object")
+    url = str(env.get(url_key) or "").strip()
+    key_file = str(env.get(key_file_key) or "").strip()
+    if bool(url) != bool(key_file):
+        raise RuntimeError(f"{url_key} and {key_file_key} must be configured together")
+    if not url or not key_file:
+        raise RuntimeError(f"production {label} backend must be configured")
+
+
 def _catdesk_slug(config_path: Path) -> str:
     _validate_private_source(config_path, "production CatDesk config")
     with config_path.open("rb") as handle:
@@ -5535,6 +5682,7 @@ def _stop_verified_local_runtime(state: dict[str, Any], layout: dict[str, Path])
     targets: list[tuple[dict[str, Any], bool]] = []
     for pid_key, identity_key, process_group in (
         ("bridge_pid", "bridge_process_identity", False),
+        ("process_runtime_pid", "process_runtime_process_identity", False),
         ("runtime_hook_pid", "runtime_hook_process_identity", False),
         ("host_pid", "host_process_identity", False),
         ("catdesk_supervisor_pid", "catdesk_supervisor_process_identity", True),
@@ -5567,6 +5715,7 @@ def _stop_prior_local_runtime_for_release_upgrade(state: dict[str, Any], layout:
     live_state = dict(state)
     for pid_key, identity_key in (
         ("bridge_pid", "bridge_process_identity"),
+        ("process_runtime_pid", "process_runtime_process_identity"),
         ("runtime_hook_pid", "runtime_hook_process_identity"),
         ("host_pid", "host_process_identity"),
         ("catdesk_supervisor_pid", "catdesk_supervisor_process_identity"),
@@ -6591,8 +6740,23 @@ def install_production_release(
         )
         if completed.returncode != 0:
             raise RuntimeError(f"production Bridge release build failed: {completed.stderr.strip()[-600:]}")
+        process_build = subprocess.run(
+            ["cargo", "build", "--release"],
+            cwd=snapshot / "crates" / "process-runtime",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if process_build.returncode != 0:
+            raise RuntimeError(
+                "production Process Runtime release build failed: "
+                + process_build.stderr.strip()[-600:]
+            )
         resolved_sources = dict(sources or default_release_sources(snapshot))
         resolved_sources["bridge_binary"] = snapshot / "crates" / "local-tool-bridge" / "target" / "release" / "local-tool-bridge"
+        resolved_sources["process_runtime_binary"] = (
+            snapshot / "crates" / "process-runtime" / "target" / "release" / "process-runtime"
+        )
         resolved_sources["host_source_dir"] = snapshot / "experiments" / "web-host-attestation"
         return install_release_bundle(manifest, layout, resolved_sources)
 
@@ -6630,6 +6794,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--browser-executable", action="append", type=Path, default=[])
     parser.add_argument("--fallback-health-url-file", type=Path, default=AI_BRIDGE_FALLBACK_HEALTH_URL_FILE)
     parser.add_argument("--rollback-receipt", type=Path)
+    parser.add_argument(
+        "--feishu-admin",
+        action="store_true",
+        help="build a Feishu Setup Release with ProviderAdmin tools only",
+    )
+    parser.add_argument(
+        "--feishu-cli",
+        type=Path,
+        help="pin an installed Feishu lark-cli executable into the immutable release",
+    )
+    parser.add_argument(
+        "--feishu-cli-version",
+        help="exact lark-cli semantic version paired with --feishu-cli",
+    )
     args = parser.parse_args(argv)
 
     manifest = (
@@ -6638,6 +6816,9 @@ def main(argv: list[str] | None = None) -> int:
         else release_manifest(
             release_revision=args.release_revision,
             endpoint_generation=args.endpoint_generation,
+            feishu_admin_enabled=args.feishu_admin,
+            feishu_cli_executable=args.feishu_cli,
+            feishu_cli_version=args.feishu_cli_version,
         )
     )
     if args.action == "manifest":

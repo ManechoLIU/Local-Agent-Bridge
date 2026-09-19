@@ -170,7 +170,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
             if not path.exists():
                 path.write_text(f"// {relative}\n", encoding="utf-8")
             path.chmod(0o700 if relative == "chrome-host/runtime-verifier-cli.mjs" else 0o600)
-        for name in ("bridge", "catdesk"):
+        for name in ("bridge", "catdesk", "process-runtime"):
             path = sources_root / name
             path.write_bytes(name.encode() * 32)
             path.chmod(0o700)
@@ -198,6 +198,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
         tunnel.chmod(0o600)
         return {
             "bridge_binary": sources_root / "bridge",
+            "process_runtime_binary": sources_root / "process-runtime",
             "catdesk_binary": sources_root / "catdesk",
             "catdesk_config": sources_root / "catdesk-config",
             "catdesk_backend_key": sources_root / "catdesk-key",
@@ -695,6 +696,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 "bridge_state_dir",
                 "bridge_receipt_journal",
                 "catdesk_child_pid",
+                "process_runtime_state_dir",
             ):
                 self.assertTrue(layout[key].is_relative_to(runtime_generation_dir), key)
                 self.assertFalse(layout[key].is_relative_to(layout["release_dir"]), key)
@@ -735,6 +737,21 @@ class ProductionConnectorContractTests(unittest.TestCase):
             self.assertEqual(
                 layout["node_binary"],
                 layout["release_dir"] / "bin" / "node-runtime",
+            )
+            self.assertEqual(
+                layout["process_runtime_binary"],
+                layout["release_dir"] / "bin" / "process-runtime",
+            )
+            self.assertEqual(
+                layout["process_runtime_backend_key"],
+                layout["release_dir"] / "secrets" / "process-runtime-backend.key",
+            )
+            self.assertEqual(
+                layout["process_runtime_state_dir"],
+                runtime_generation_dir / "process-runtime",
+            )
+            self.assertTrue(
+                layout["process_runtime_state_dir"].is_relative_to(runtime_generation_dir)
             )
             self.assertEqual(layout["bridge_socket"], socket)
             self.assertEqual(
@@ -780,6 +797,34 @@ class ProductionConnectorContractTests(unittest.TestCase):
             self.assertEqual(env["bridge"]["LAB_PRODUCTION_WORKSPACE"], str(pc.canonical_workspace()))
             self.assertEqual(env["bridge"]["LAB_PRODUCTION_TUNNEL_PROFILE_NAME"], pc.TUNNEL_PROFILE_NAME)
             self.assertIn("host_attestation", env["bridge"]["LAB_BRIDGE_CAPABILITIES"])
+            self.assertEqual(
+                env["bridge"]["LAB_PROCESS_BACKEND_URL"],
+                f"http://127.0.0.1:{pc.PRODUCTION_PROCESS_RUNTIME_PORT}/mcp",
+            )
+            self.assertEqual(
+                env["bridge"]["LAB_PROCESS_BACKEND_KEY_FILE"],
+                str(layout["process_runtime_backend_key"]),
+            )
+            self.assertEqual(
+                env["process_runtime"]["PROCESS_RUNTIME_BIND"],
+                f"127.0.0.1:{pc.PRODUCTION_PROCESS_RUNTIME_PORT}",
+            )
+            self.assertEqual(
+                env["process_runtime"]["PROCESS_RUNTIME_BACKEND_KEY_FILE"],
+                str(layout["process_runtime_backend_key"]),
+            )
+            self.assertEqual(
+                env["process_runtime"]["PROCESS_RUNTIME_WORKSPACE"],
+                str(pc.canonical_workspace()),
+            )
+            self.assertEqual(
+                env["process_runtime"]["PROCESS_RUNTIME_WORKSPACE_ID"],
+                pc.CONNECTOR_ID,
+            )
+            self.assertEqual(
+                env["process_runtime"]["PROCESS_RUNTIME_STATE_DIR"],
+                str(layout["process_runtime_state_dir"]),
+            )
 
             source = {
                 "config_version": 1,
@@ -987,8 +1032,13 @@ class ProductionConnectorContractTests(unittest.TestCase):
             pc.validate_installed_release(layout)
             self.assertEqual(stat.S_IMODE(layout["release_manifest"].stat().st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(layout["host_backend_key"].stat().st_mode), 0o600)
+            self.assertEqual(
+                stat.S_IMODE(layout["process_runtime_backend_key"].stat().st_mode), 0o600
+            )
             self.assertEqual(stat.S_IMODE(layout["tunnel_profile"].stat().st_mode), 0o600)
             self.assertTrue(os.access(layout["bridge_binary"], os.X_OK))
+            self.assertTrue(os.access(layout["process_runtime_binary"], os.X_OK))
+            self.assertEqual(stat.S_IMODE(layout["process_runtime_binary"].stat().st_mode), 0o700)
             self.assertTrue(os.access(layout["native_host_wrapper"], os.X_OK))
             self.assertEqual(
                 pc.tomllib.loads(
@@ -1736,6 +1786,15 @@ class ProductionConnectorContractTests(unittest.TestCase):
         self.assertEqual(
             sources["bridge_binary"],
             pc.CANONICAL_PROJECT_ROOT / "crates" / "local-tool-bridge" / "target" / "release" / "local-tool-bridge",
+        )
+        self.assertEqual(
+            sources["process_runtime_binary"],
+            pc.CANONICAL_PROJECT_ROOT
+            / "crates"
+            / "process-runtime"
+            / "target"
+            / "release"
+            / "process-runtime",
         )
         self.assertEqual(sources["host_source_dir"], pc.CANONICAL_PROJECT_ROOT / "experiments" / "web-host-attestation")
         self.assertEqual(
@@ -5050,6 +5109,8 @@ class ProductionConnectorContractTests(unittest.TestCase):
             layout["bridge_binary"].parent.mkdir(parents=True)
             layout["bridge_binary"].write_text("bridge", encoding="utf-8")
             layout["bridge_binary"].chmod(0o700)
+            layout["process_runtime_binary"].write_text("process-runtime", encoding="utf-8")
+            layout["process_runtime_binary"].chmod(0o700)
             for key, value in (
                 ("release_catdesk_config", "mcpSlug = 'private'\n"),
                 ("release_catdesk_backend_key", "k" * 64),
@@ -5071,7 +5132,11 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 "sha256": pc._sha256_file(release_node),
             }
             processes = [
-                MagicMock(pid=801), MagicMock(pid=802), MagicMock(pid=803), MagicMock(pid=804)
+                MagicMock(pid=801),
+                MagicMock(pid=802),
+                MagicMock(pid=803),
+                MagicMock(pid=804),
+                MagicMock(pid=805),
             ]
             identities = [
                 self._identity(process.pid, [f"/private/process-{process.pid}"])
@@ -5103,7 +5168,20 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 ) as stop_prior, patch.object(
                     pc, "_tcp_ready", return_value=False
                 ), patch.object(pc, "_catdesk_slug", return_value="private"), patch.object(
-                    pc, "production_component_env", return_value={"host": {}, "bridge": {}}
+                    pc,
+                    "production_component_env",
+                    return_value={
+                        "host": {},
+                        "bridge": {
+                            "LAB_PROCESS_BACKEND_URL": "http://127.0.0.1:33442/mcp",
+                            "LAB_PROCESS_BACKEND_KEY_FILE": str(
+                                layout["process_runtime_backend_key"]
+                            ),
+                        },
+                        "process_runtime": {
+                            "PROCESS_RUNTIME_BIND": "127.0.0.1:33442",
+                        },
+                    },
                 ), patch.object(
                     pc, "_kernel_python_executable", return_value=kernel_python
                 ), patch.object(
@@ -5131,10 +5209,30 @@ class ProductionConnectorContractTests(unittest.TestCase):
                         pc.start_local_runtime(manifest, layout)
             finally:
                 bridge_listener.close()
-            self.assertEqual(stop.call_count, 4)
+            self.assertEqual(stop.call_count, 5)
             stop_prior.assert_called_once_with(prior, layout)
             self.assertEqual(spawn.call_args_list[0].args[0][0], str(kernel_python))
             self.assertEqual(spawn.call_args_list[1].args[0][0], str(release_node))
+            self.assertEqual(
+                spawn.call_args_list[1].args[0][1],
+                str(layout["host_mcp_adapter"].resolve()),
+            )
+            self.assertEqual(
+                spawn.call_args_list[3].args[0][0],
+                str(layout["process_runtime_binary"].resolve()),
+            )
+            self.assertEqual(
+                spawn.call_args_list[4].args[0][0],
+                str(layout["bridge_binary"].resolve()),
+            )
+            self.assertEqual(
+                spawn.call_args_list[4].kwargs["env"]["LAB_PROCESS_BACKEND_URL"],
+                "http://127.0.0.1:33442/mcp",
+            )
+            self.assertEqual(
+                spawn.call_args_list[4].kwargs["env"]["LAB_PROCESS_BACKEND_KEY_FILE"],
+                str(layout["process_runtime_backend_key"]),
+            )
             self.assertEqual(
                 capture.call_args_list[0].kwargs["expected_executable"], kernel_python
             )
@@ -5600,6 +5698,140 @@ class ProductionConnectorContractTests(unittest.TestCase):
             self.assertTrue(pc._process_identity_matches(identity))
         with patch.object(pc, "_capture_process_identity", return_value={**identity, "start_timestamp": 1789099201.0}):
             self.assertFalse(pc._process_identity_matches(identity))
+
+    def test_feishu_release_cli_flags_forward_to_manifest_contract(self):
+        manifest = self._manifest()
+        setup_argv = [
+            "manifest",
+            "--release-revision",
+            REVISION,
+            "--endpoint-generation",
+            "7",
+            "--feishu-admin",
+        ]
+        with patch.object(pc, "release_manifest", return_value=manifest) as release, patch(
+            "builtins.print"
+        ):
+            self.assertEqual(pc.main(setup_argv), 0)
+        release.assert_called_once_with(
+            release_revision=REVISION,
+            endpoint_generation=7,
+            feishu_admin_enabled=True,
+            feishu_cli_executable=None,
+            feishu_cli_version=None,
+        )
+
+        pinned_argv = [
+            "manifest",
+            "--release-revision",
+            REVISION,
+            "--endpoint-generation",
+            "8",
+            "--feishu-cli",
+            "/private/provider/lark-cli",
+            "--feishu-cli-version",
+            "1.0.96",
+        ]
+        with patch.object(pc, "release_manifest", return_value=manifest) as release, patch(
+            "builtins.print"
+        ):
+            self.assertEqual(pc.main(pinned_argv), 0)
+        release.assert_called_once_with(
+            release_revision=REVISION,
+            endpoint_generation=8,
+            feishu_admin_enabled=False,
+            feishu_cli_executable=Path("/private/provider/lark-cli"),
+            feishu_cli_version="1.0.96",
+        )
+
+    def test_production_process_backend_env_is_paired_and_fail_closed(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest, runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
+            )
+            env = pc.production_component_env(
+                manifest, layout, catdesk_slug="private-slug"
+            )
+            self.assertEqual(
+                env["bridge"]["LAB_PROCESS_BACKEND_URL"],
+                f"http://127.0.0.1:{pc.PRODUCTION_PROCESS_RUNTIME_PORT}/mcp",
+            )
+            self.assertEqual(
+                env["bridge"]["LAB_PROCESS_BACKEND_KEY_FILE"],
+                str(layout["process_runtime_backend_key"]),
+            )
+            self.assertEqual(
+                env["process_runtime"]["PROCESS_RUNTIME_BIND"],
+                f"127.0.0.1:{pc.PRODUCTION_PROCESS_RUNTIME_PORT}",
+            )
+            pc._require_paired_backend_env(
+                env["bridge"],
+                url_key="LAB_PROCESS_BACKEND_URL",
+                key_file_key="LAB_PROCESS_BACKEND_KEY_FILE",
+                label="process",
+            )
+            with self.assertRaisesRegex(RuntimeError, "together"):
+                pc._require_paired_backend_env(
+                    {"LAB_PROCESS_BACKEND_URL": "http://127.0.0.1:33442/mcp"},
+                    url_key="LAB_PROCESS_BACKEND_URL",
+                    key_file_key="LAB_PROCESS_BACKEND_KEY_FILE",
+                    label="process",
+                )
+            with self.assertRaisesRegex(RuntimeError, "together"):
+                pc._require_paired_backend_env(
+                    {"LAB_PROCESS_BACKEND_KEY_FILE": str(layout["process_runtime_backend_key"])},
+                    url_key="LAB_PROCESS_BACKEND_URL",
+                    key_file_key="LAB_PROCESS_BACKEND_KEY_FILE",
+                    label="process",
+                )
+            with self.assertRaisesRegex(RuntimeError, "must be configured"):
+                pc._require_paired_backend_env(
+                    {},
+                    url_key="LAB_PROCESS_BACKEND_URL",
+                    key_file_key="LAB_PROCESS_BACKEND_KEY_FILE",
+                    label="process",
+                )
+            with self.assertRaisesRegex(RuntimeError, "numeric IP"):
+                pc._numeric_loopback_bind("localhost:33442")
+            with self.assertRaisesRegex(RuntimeError, "numeric loopback"):
+                pc._numeric_loopback_bind("0.0.0.0:33442")
+
+    def test_start_local_fail_closes_when_process_backend_env_is_unpaired(self):
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
+            root = Path(raw_root)
+            layout = pc.production_layout(
+                manifest, runtime_root=root / "runtime", bridge_socket=root / "bridge.sock"
+            )
+            for key, value in (
+                ("release_catdesk_config", "mcpSlug = 'private'\n"),
+                ("release_catdesk_backend_key", "k" * 64),
+            ):
+                layout[key].parent.mkdir(parents=True, exist_ok=True)
+                layout[key].write_text(value, encoding="utf-8")
+                layout[key].chmod(0o600)
+            installed = json.loads(json.dumps(manifest))
+            installed["artifacts_sha256"] = {"bin/process-runtime": "a" * 64}
+            with patch.object(
+                pc, "validate_installed_release", return_value=installed
+            ), patch.object(
+                pc, "production_status", return_value={"local_runtime_ready": False, "tunnel_ready": False}
+            ), patch.object(pc, "_tcp_ready", return_value=False), patch.object(
+                pc, "_catdesk_slug", return_value="private"
+            ), patch.object(
+                pc,
+                "production_component_env",
+                return_value={
+                    "host": {},
+                    "bridge": {"LAB_PROCESS_BACKEND_URL": "http://127.0.0.1:33442/mcp"},
+                    "process_runtime": {"PROCESS_RUNTIME_BIND": "127.0.0.1:33442"},
+                },
+            ), patch.object(pc, "_spawn_logged") as spawn:
+                with self.assertRaisesRegex(RuntimeError, "together"):
+                    pc.start_local_runtime(manifest, layout)
+            spawn.assert_not_called()
 
     def test_status_exit_is_nonzero_until_tunnel_is_ready(self):
         manifest = self._manifest()
