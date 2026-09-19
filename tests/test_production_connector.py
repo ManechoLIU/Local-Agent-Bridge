@@ -2721,6 +2721,117 @@ class ProductionConnectorContractTests(unittest.TestCase):
                     pc.reconcile_dead_recorded_bridge_pid_to_live_exclusive(manifest, layout)
             self.assertEqual(layout["runtime_state"].read_bytes(), before)
 
+    def test_production_status_reconciles_dead_recorded_bridge_pid_then_uses_live_pid(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            manifest, layout, _, live_identity = self._dead_bridge_pid_live_exclusive_fixture(
+                root, recorded_pid=1130, live_pid=12057
+            )
+            layout["bridge_socket"].write_bytes(b"")
+            layout["bridge_socket"].chmod(0o600)
+
+            def pid_alive(pid):
+                return pid == 12057
+
+            def identity_matches(identity):
+                return identity.get("pid") == 12057
+
+            with patch.object(
+                pc, "_unique_process_identity_for_executable", return_value=live_identity
+            ), patch.object(
+                pc, "_verify_process_owned_unix_socket"
+            ), patch.object(
+                pc, "_pid_alive", side_effect=pid_alive
+            ), patch.object(
+                pc, "_process_identity_matches", side_effect=identity_matches
+            ), patch.object(
+                pc, "smoke_tools", return_value=sorted(pc.REQUIRED_TOOLS)
+            ), patch.object(
+                pc,
+                "_bridge_capability_lease_status",
+                return_value={
+                    "ready": True,
+                    "renewal_enabled": True,
+                    "remaining_ms": 1000,
+                    "expires_at_ms": 2000,
+                },
+            ), patch.object(
+                pc, "production_tunnel_status", return_value={"ready": False}
+            ):
+                status = pc.production_status(manifest, layout)
+
+            self.assertEqual(status["bridge_pid"], 12057)
+            self.assertTrue(status["bridge_ready"])
+            self.assertEqual(status["tools"], sorted(pc.REQUIRED_TOOLS))
+            state = json.loads(layout["runtime_state"].read_text(encoding="utf-8"))
+            self.assertEqual(state["bridge_pid"], 12057)
+            self.assertEqual(state["bridge_process_identity"], live_identity)
+            self.assertIsNot(state.get("bridge_ready"), True)
+
+    def test_production_status_does_not_rewrite_when_recorded_bridge_pid_is_alive(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            manifest, layout, _, live_identity = self._dead_bridge_pid_live_exclusive_fixture(
+                root, recorded_pid=1130, live_pid=12057
+            )
+            before = layout["runtime_state"].read_bytes()
+            with patch.object(
+                pc, "_unique_process_identity_for_executable", return_value=live_identity
+            ), patch.object(
+                pc, "_verify_process_owned_unix_socket"
+            ), patch.object(
+                pc, "_pid_alive", return_value=True
+            ), patch.object(
+                pc, "reconcile_dead_recorded_bridge_pid_to_live_exclusive"
+            ) as forbidden_locked, patch.object(
+                pc, "_reconcile_dead_recorded_bridge_pid_to_live_exclusive_unlocked"
+            ) as forbidden_unlocked, patch.object(
+                pc, "production_tunnel_status", return_value={"ready": False}
+            ):
+                status = pc.production_status(manifest, layout)
+            self.assertEqual(status["bridge_pid"], 1130)
+            self.assertFalse(status["bridge_ready"])
+            self.assertEqual(layout["runtime_state"].read_bytes(), before)
+            forbidden_locked.assert_not_called()
+            forbidden_unlocked.assert_not_called()
+
+    def test_production_status_keeps_dead_bridge_pid_unready_when_reconcile_fails(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            manifest, layout, _, live_identity = self._dead_bridge_pid_live_exclusive_fixture(
+                root, recorded_pid=1130, live_pid=12057
+            )
+            before = layout["runtime_state"].read_bytes()
+            layout["bridge_socket"].write_bytes(b"")
+            layout["bridge_socket"].chmod(0o600)
+            with patch.object(
+                pc,
+                "_unique_process_identity_for_executable",
+                side_effect=RuntimeError("production Bridge executable must have exactly one live process"),
+            ), patch.object(
+                pc, "_pid_alive", return_value=False
+            ), patch.object(
+                pc, "smoke_tools", return_value=sorted(pc.REQUIRED_TOOLS)
+            ) as smoke, patch.object(
+                pc,
+                "_bridge_capability_lease_status",
+                return_value={
+                    "ready": True,
+                    "renewal_enabled": True,
+                    "remaining_ms": 1000,
+                    "expires_at_ms": 2000,
+                },
+            ) as lease, patch.object(
+                pc, "production_tunnel_status", return_value={"ready": False}
+            ):
+                status = pc.production_status(manifest, layout)
+            self.assertEqual(status["bridge_pid"], 1130)
+            self.assertFalse(status["bridge_ready"])
+            self.assertEqual(status["tools"], [])
+            self.assertEqual(layout["runtime_state"].read_bytes(), before)
+            smoke.assert_not_called()
+            lease.assert_not_called()
+
     def test_tunnel_operational_gate_requires_loopback_exact_status_and_fresh_structured_event_chain(self):
         manifest = self._manifest()
         with tempfile.TemporaryDirectory() as raw_root:

@@ -4703,6 +4703,29 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
         and state.get("workspace") == manifest["workspace"]
         and state.get("tunnel_profile_name") == TUNNEL_PROFILE_NAME
     )
+    if state_matches:
+        recorded_bridge_pid = state.get("bridge_pid")
+        if (
+            isinstance(recorded_bridge_pid, int)
+            and recorded_bridge_pid >= 1
+            and not _pid_alive(recorded_bridge_pid)
+        ):
+            # Status is called from both locked and unlocked callers. Use the
+            # unlocked helper to avoid flock deadlock. Reconcile never claims
+            # bridge_ready; readiness still comes from identity+lease/smoke.
+            try:
+                _reconcile_dead_recorded_bridge_pid_to_live_exclusive_unlocked(
+                    manifest, layout
+                )
+            except Exception:
+                pass
+            state = _read_json_object(layout["runtime_state"])
+            state_matches = bool(
+                state.get("release_revision") == manifest["release_revision"]
+                and state.get("endpoint_generation") == manifest["endpoint_generation"]
+                and state.get("workspace") == manifest["workspace"]
+                and state.get("tunnel_profile_name") == TUNNEL_PROFILE_NAME
+            )
     catdesk_pid = state.get("catdesk_supervisor_pid") if state_matches else None
     host_pid = state.get("host_pid") if state_matches else None
     runtime_hook_pid = state.get("runtime_hook_pid") if state_matches else None
