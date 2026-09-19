@@ -1166,7 +1166,12 @@ async fn handle_mcp(
                 );
             }
         }
-    } else if method == "tools/call" && tool_name == "run_command" {
+    } else if method == "tools/call"
+        && matches!(
+            tool_name,
+            "run_command" | "start_command" | "poll_command" | "cancel_command"
+        )
+    {
         backend_for_run_command(&state)
     } else {
         &state.inner.default_backend

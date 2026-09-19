@@ -17,12 +17,16 @@ use std::{
         process::{CommandExt, ExitStatusExt},
     },
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, ChildStderr, ChildStdout, Command, Stdio},
     sync::Arc,
     thread,
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
+
+mod jobs;
+
+use jobs::{JobSnapshot, JobTable};
 
 const MAX_COMMAND_BYTES: usize = 65_536;
 const MAX_RUN_TIMEOUT_MS: u64 = 120_000;
@@ -31,6 +35,19 @@ const SAFE_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbi
 const PROVENANCE: &str = "lab_process_runtime_v1";
 const BACKEND_KEY_HEADER: &str = "x-lab-backend-key";
 const SIGNED_PROVENANCE: &str = "local_ingress_hmac_v1";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BridgeBinding {
+    pub principal_id: String,
+    pub execution_session_id: String,
+}
+
+pub(crate) struct SpawnedProcess {
+    pub child: Child,
+    pub stdout: ChildStdout,
+    pub stderr: ChildStderr,
+    pub timeout: Duration,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunCommandRequest {
@@ -208,7 +225,7 @@ impl ProcessSandboxPolicy {
     }
 }
 
-fn execute_prepared(prepared: PreparedCommand) -> Result<RunCommandResult, String> {
+pub(crate) fn spawn_sandbox(prepared: PreparedCommand) -> Result<SpawnedProcess, String> {
     if prepared.program.as_os_str() != "/usr/bin/sandbox-exec" {
         return Err("Process Runtime only launches sandbox-exec".into());
     }
@@ -238,23 +255,33 @@ fn execute_prepared(prepared: PreparedCommand) -> Result<RunCommandResult, Strin
         .stderr
         .take()
         .ok_or_else(|| "sandbox-exec stderr unavailable".to_string())?;
-    let stdout_thread = thread::spawn(move || read_bounded(stdout));
-    let stderr_thread = thread::spawn(move || read_bounded(stderr));
+    Ok(SpawnedProcess {
+        child,
+        stdout,
+        stderr,
+        timeout: prepared.timeout,
+    })
+}
+
+fn execute_prepared(prepared: PreparedCommand) -> Result<RunCommandResult, String> {
+    let mut spawned = spawn_sandbox(prepared)?;
+    let stdout_thread = thread::spawn(move || read_bounded(spawned.stdout));
+    let stderr_thread = thread::spawn(move || read_bounded(spawned.stderr));
 
     let started = Instant::now();
     let mut timed_out = false;
     let status = loop {
-        match child.try_wait() {
+        match spawned.child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() >= prepared.timeout => {
+            Ok(None) if started.elapsed() >= spawned.timeout => {
                 timed_out = true;
-                let pid = child.id() as i32;
+                let pid = spawned.child.id() as i32;
                 unsafe {
                     libc::killpg(pid, libc::SIGKILL);
                 }
-                break child
-                    .wait()
-                    .map_err(|error| format!("sandbox-exec wait after timeout failed: {error}"))?;
+                break spawned.child.wait().map_err(|error| {
+                    format!("sandbox-exec wait after timeout failed: {error}")
+                })?;
             }
             Ok(None) => thread::sleep(Duration::from_millis(10)),
             Err(error) => return Err(format!("sandbox-exec wait failed: {error}")),
@@ -317,6 +344,7 @@ struct ProcessRuntimeInner {
     backend_key_sha256: [u8; 32],
     policy: ProcessSandboxPolicy,
     workspace_id: String,
+    jobs: JobTable,
 }
 
 impl ProcessRuntime {
@@ -339,6 +367,7 @@ impl ProcessRuntime {
                 backend_key_sha256,
                 policy,
                 workspace_id,
+                jobs: JobTable::new(),
             }),
         })
     }
@@ -389,10 +418,14 @@ async fn handle_mcp(
             json!({"jsonrpc":"2.0","id":id,"result":{"tools":tool_specs()}}),
         ),
         "tools/call" => {
-            if let Err(error) = signed_bridge_binding(&headers, &body, &runtime.inner.workspace_id)
-            {
-                return text_response(StatusCode::FORBIDDEN, &error);
-            }
+            let binding = match signed_bridge_binding(
+                &headers,
+                &body,
+                &runtime.inner.workspace_id,
+            ) {
+                Ok(value) => value,
+                Err(error) => return text_response(StatusCode::FORBIDDEN, &error),
+            };
             let params = parsed.get("params").cloned().unwrap_or_else(|| json!({}));
             let name = match params.get("name").and_then(Value::as_str) {
                 Some(value) => value,
@@ -403,27 +436,58 @@ async fn handle_mcp(
                     );
                 }
             };
-            if name != "run_command" {
-                return text_response(
-                    StatusCode::FORBIDDEN,
-                    "Process Runtime v1 exposes only run_command",
-                );
-            }
             let arguments = params
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let request = match parse_run_command_arguments(&arguments) {
-                Ok(value) => value,
-                Err(error) => return text_response(StatusCode::BAD_REQUEST, &error),
-            };
-            let policy = runtime.inner.policy.clone();
-            match tokio::task::spawn_blocking(move || policy.run(request)).await {
-                Ok(Ok(result)) => tool_result(id, json!(result)),
-                Ok(Err(error)) => text_response(StatusCode::FORBIDDEN, &error),
-                Err(error) => text_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("Process Runtime worker failed: {error}"),
+            match name {
+                "run_command" => {
+                    let request = match parse_command_arguments("run_command", &arguments) {
+                        Ok(value) => value,
+                        Err(error) => return text_response(StatusCode::BAD_REQUEST, &error),
+                    };
+                    let policy = runtime.inner.policy.clone();
+                    match tokio::task::spawn_blocking(move || policy.run(request)).await {
+                        Ok(Ok(result)) => tool_result(id, json!(result)),
+                        Ok(Err(error)) => text_response(StatusCode::FORBIDDEN, &error),
+                        Err(error) => text_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &format!("Process Runtime worker failed: {error}"),
+                        ),
+                    }
+                }
+                "start_command" => {
+                    let request = match parse_command_arguments("start_command", &arguments) {
+                        Ok(value) => value,
+                        Err(error) => return text_response(StatusCode::BAD_REQUEST, &error),
+                    };
+                    dispatch_job(id, move || {
+                        runtime.inner.jobs.start(
+                            &runtime.inner.policy,
+                            &runtime.inner.workspace_id,
+                            &binding,
+                            request,
+                        )
+                    })
+                    .await
+                }
+                "poll_command" => {
+                    let job_id = match parse_job_id_arguments("poll_command", &arguments) {
+                        Ok(value) => value,
+                        Err(error) => return text_response(StatusCode::BAD_REQUEST, &error),
+                    };
+                    job_result(id, runtime.inner.jobs.poll(&binding, &job_id))
+                }
+                "cancel_command" => {
+                    let job_id = match parse_job_id_arguments("cancel_command", &arguments) {
+                        Ok(value) => value,
+                        Err(error) => return text_response(StatusCode::BAD_REQUEST, &error),
+                    };
+                    job_result(id, runtime.inner.jobs.cancel(&binding, &job_id))
+                }
+                _ => text_response(
+                    StatusCode::FORBIDDEN,
+                    "Process Runtime v1 exposes only run_command/start_command/poll_command/cancel_command",
                 ),
             }
         }
@@ -438,22 +502,22 @@ async fn handle_mcp(
     }
 }
 
-fn parse_run_command_arguments(arguments: &Value) -> Result<RunCommandRequest, String> {
+fn parse_command_arguments(tool: &str, arguments: &Value) -> Result<RunCommandRequest, String> {
     let command = arguments
         .get("command")
         .and_then(Value::as_str)
-        .ok_or_else(|| "run_command requires arguments.command".to_string())?
+        .ok_or_else(|| format!("{tool} requires arguments.command"))?
         .to_string();
     let cwd = match arguments.get("cwd") {
         None | Some(Value::Null) => None,
         Some(Value::String(value)) => Some(value.clone()),
-        Some(_) => return Err("run_command cwd must be a string".into()),
+        Some(_) => return Err(format!("{tool} cwd must be a string")),
     };
     let timeout_ms = match arguments.get("timeout_ms") {
         None | Some(Value::Null) => 30_000,
         Some(value) => value
             .as_u64()
-            .ok_or_else(|| "run_command timeout_ms must be a positive integer".to_string())?,
+            .ok_or_else(|| format!("{tool} timeout_ms must be a positive integer"))?,
     };
     Ok(RunCommandRequest {
         command,
@@ -462,11 +526,46 @@ fn parse_run_command_arguments(arguments: &Value) -> Result<RunCommandRequest, S
     })
 }
 
+fn parse_job_id_arguments(tool: &str, arguments: &Value) -> Result<String, String> {
+    let job_id = arguments
+        .get("job_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{tool} requires arguments.job_id"))?;
+    if job_id.is_empty() || job_id.len() > 128 {
+        return Err(format!("{tool} job_id is invalid"));
+    }
+    if job_id.as_bytes().contains(&0) {
+        return Err(format!("{tool} job_id contains NUL"));
+    }
+    Ok(job_id.to_string())
+}
+
+fn job_result(id: Value, result: Result<JobSnapshot, String>) -> Response<Body> {
+    match result {
+        Ok(snapshot) => tool_result(id, json!(snapshot)),
+        Err(error) => text_response(StatusCode::FORBIDDEN, &error),
+    }
+}
+
+async fn dispatch_job(
+    id: Value,
+    work: impl FnOnce() -> Result<JobSnapshot, String> + Send + 'static,
+) -> Response<Body> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(Ok(snapshot)) => tool_result(id, json!(snapshot)),
+        Ok(Err(error)) => text_response(StatusCode::FORBIDDEN, &error),
+        Err(error) => text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Process Runtime worker failed: {error}"),
+        ),
+    }
+}
+
 fn signed_bridge_binding(
     headers: &HeaderMap,
     body: &[u8],
     expected_workspace_id: &str,
-) -> Result<(), String> {
+) -> Result<BridgeBinding, String> {
     let required = |name: &str| {
         headers
             .get(name)
@@ -486,14 +585,17 @@ fn signed_bridge_binding(
     let _request_id = required("x-lab-request-id")?;
     let _nonce = required("x-lab-request-nonce")?;
     let _mac = required("x-lab-request-mac")?;
-    let _principal = required("x-lab-principal-id")?;
-    let _session = required("x-lab-execution-session-id")?;
+    let principal_id = required("x-lab-principal-id")?;
+    let execution_session_id = required("x-lab-execution-session-id")?;
     let _capability = required("x-lab-capability-id")?;
     let workspace_id = required("x-lab-workspace-id")?;
     if workspace_id != expected_workspace_id {
         return Err("signed Bridge workspace_id does not match Process Runtime workspace".into());
     }
-    Ok(())
+    Ok(BridgeBinding {
+        principal_id,
+        execution_session_id,
+    })
 }
 
 fn valid_backend_key(headers: &HeaderMap, expected: &[u8; 32]) -> bool {
@@ -514,20 +616,51 @@ fn hex_sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn tool_specs() -> Vec<Value> {
-    vec![json!({
-        "name": "run_command",
-        "description": "LAB Process Runtime v1 bounded command",
-        "inputSchema": {
-            "type": "object",
-            "required": ["command"],
-            "properties": {
-                "command": {"type": "string", "minLength": 1, "maxLength": 65536},
-                "cwd": {"type": "string"},
-                "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 120000}
-            }
+fn command_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["command"],
+        "properties": {
+            "command": {"type": "string", "minLength": 1, "maxLength": 65536},
+            "cwd": {"type": "string"},
+            "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 120000}
         }
-    })]
+    })
+}
+
+fn job_id_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["job_id"],
+        "properties": {
+            "job_id": {"type": "string", "minLength": 1, "maxLength": 128}
+        }
+    })
+}
+
+fn tool_specs() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "run_command",
+            "description": "LAB Process Runtime v1 bounded command",
+            "inputSchema": command_input_schema()
+        }),
+        json!({
+            "name": "start_command",
+            "description": "LAB Process Runtime v1 start a bounded background job",
+            "inputSchema": command_input_schema()
+        }),
+        json!({
+            "name": "poll_command",
+            "description": "LAB Process Runtime v1 poll a bounded background job",
+            "inputSchema": job_id_input_schema()
+        }),
+        json!({
+            "name": "cancel_command",
+            "description": "LAB Process Runtime v1 cancel a bounded background job",
+            "inputSchema": job_id_input_schema()
+        }),
+    ]
 }
 
 fn tool_result(id: Value, value: Value) -> Response<Body> {

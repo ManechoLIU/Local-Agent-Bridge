@@ -232,6 +232,14 @@ async fn run_command_routes_through_process_runtime_provenance_and_fail_closes_o
         tools.iter().any(|tool| tool["name"] == "read"),
         "file tools must remain on the default backend"
     );
+    for name in ["start_command", "poll_command", "cancel_command"] {
+        let matches: Vec<_> = tools.iter().filter(|tool| tool["name"] == name).collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "tools/list must expose one {name} after Process Runtime routing: {list_json}"
+        );
+    }
 
     let ok = app
         .clone()
@@ -342,25 +350,40 @@ async fn run_command_routes_through_process_runtime_provenance_and_fail_closes_o
     );
 
     let start = app
+        .clone()
         .oneshot(request("jobs", "start_command", json!({})))
         .await
         .unwrap();
-    assert_eq!(start.status(), StatusCode::OK);
-    let start = response_json(start).await;
-    assert_eq!(start["result"]["backend"], "catdesk");
+    assert_eq!(
+        start.status(),
+        StatusCode::BAD_REQUEST,
+        "start_command must be served by Process Runtime, not CatDesk"
+    );
+
+    let read = app
+        .oneshot(request("read", "read", json!({"path":"x"})))
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+    let read = response_json(read).await;
+    assert_eq!(read["result"]["backend"], "catdesk");
 
     let default_calls = default_capture.0.lock().await;
     assert!(
         default_calls.iter().all(|(_, body)| {
-            body.pointer("/params/name").and_then(Value::as_str) != Some("run_command")
+            let name = body.pointer("/params/name").and_then(Value::as_str);
+            name != Some("run_command")
+                && name != Some("start_command")
+                && name != Some("poll_command")
+                && name != Some("cancel_command")
         }),
-        "run_command must not fall back to CatDesk when Process Runtime is configured: {default_calls:?}"
+        "process tools must not fall back to CatDesk when Process Runtime is configured: {default_calls:?}"
     );
     assert!(
         default_calls.iter().any(|(_, body)| {
-            body.pointer("/params/name").and_then(Value::as_str) == Some("start_command")
+            body.pointer("/params/name").and_then(Value::as_str) == Some("read")
         }),
-        "start_command may remain on the default backend this slice"
+        "Files must remain on the default backend: {default_calls:?}"
     );
 }
 
@@ -460,5 +483,180 @@ async fn run_command_chatgpt_2026_07_28_body_keeps_process_runtime_hash_and_prov
             body.pointer("/params/name").and_then(Value::as_str) == Some("read")
         }),
         "file read must remain on the default backend: {default_calls:?}"
+    );
+}
+
+async fn poll_until_job(app: &axum::Router, job_id: &str) -> Value {
+    let started = std::time::Instant::now();
+    loop {
+        let response = app
+            .clone()
+            .oneshot(request(
+                "poll",
+                "poll_command",
+                json!({"job_id": job_id}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = response_json(response).await;
+        let structured = value["result"]["structuredContent"].clone();
+        if structured["state"] != "running" {
+            return structured;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(20) {
+            panic!("job {job_id} still running: {structured}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn jobs_route_through_process_runtime_success_cancel_timeout_and_files_stay_on_catdesk() {
+    let (policy, _workspace) = process_policy("bridge-jobs");
+    let process_app = ProcessRuntime::new(PROCESS_KEY.as_bytes(), policy, WORKSPACE_ID)
+        .unwrap()
+        .router();
+    let process_url = serve(process_app).await;
+    let default_capture = Capture::default();
+    let default_url = serve(
+        Router::new()
+            .route("/mcp", post(default_backend))
+            .with_state(default_capture.clone()),
+    )
+    .await;
+    let app = bridge(&default_url, &process_url);
+
+    let start = app
+        .clone()
+        .oneshot(request(
+            "start-ok",
+            "start_command",
+            json!({
+                "command": "printf 'LAB-PROC-02-OK\n' >/dev/null && printf 'LAB-PROC-02-OK\n'",
+                "timeout_ms": 15000
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(start.status(), StatusCode::OK);
+    let start = response_json(start).await;
+    let started = &start["result"]["structuredContent"];
+    assert_eq!(started["provenance"], "lab_process_runtime_v1");
+    assert_eq!(started["state"], "running");
+    let job_id = started["job_id"].as_str().expect("job_id").to_string();
+    let done = poll_until_job(&app, &job_id).await;
+    assert_eq!(done["provenance"], "lab_process_runtime_v1");
+    assert_eq!(done["state"], "succeeded", "job did not succeed: {done}");
+    assert_eq!(done["success"], true);
+    assert!(
+        done["stdout"].as_str().unwrap_or("").contains("LAB-PROC-02-OK"),
+        "stdout missing job marker: {done}"
+    );
+
+    let start = app
+        .clone()
+        .oneshot(request(
+            "start-cancel",
+            "start_command",
+            json!({"command":"sleep 30","timeout_ms":60000}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(start.status(), StatusCode::OK);
+    let start = response_json(start).await;
+    let job_id = start["result"]["structuredContent"]["job_id"]
+        .as_str()
+        .expect("job_id")
+        .to_string();
+    let cancel = app
+        .clone()
+        .oneshot(request(
+            "cancel",
+            "cancel_command",
+            json!({"job_id": job_id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cancel.status(), StatusCode::OK);
+    let cancel = response_json(cancel).await;
+    assert_eq!(
+        cancel["result"]["structuredContent"]["provenance"],
+        "lab_process_runtime_v1"
+    );
+    let done = poll_until_job(&app, &job_id).await;
+    assert_eq!(done["state"], "cancelled", "job was not cancelled: {done}");
+
+    let start = app
+        .clone()
+        .oneshot(request(
+            "start-timeout",
+            "start_command",
+            json!({"command":"sleep 30","timeout_ms":400}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(start.status(), StatusCode::OK);
+    let start = response_json(start).await;
+    let job_id = start["result"]["structuredContent"]["job_id"]
+        .as_str()
+        .expect("job_id")
+        .to_string();
+    let done = poll_until_job(&app, &job_id).await;
+    assert_eq!(done["state"], "timed_out", "job did not time out: {done}");
+    assert_eq!(done["timed_out"], true);
+    assert_eq!(done["provenance"], "lab_process_runtime_v1");
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let leak = PathBuf::from(format!("/tmp/lab-proc02-bridge-should-not-exist-{stamp}"));
+    let _ = std::fs::remove_file(&leak);
+    let start = app
+        .clone()
+        .oneshot(request(
+            "start-leak",
+            "start_command",
+            json!({
+                "command": format!("printf leak > {}", leak.display()),
+                "timeout_ms": 10000
+            }),
+        ))
+        .await
+        .unwrap();
+    let start = response_json(start).await;
+    let job_id = start["result"]["structuredContent"]["job_id"]
+        .as_str()
+        .expect("job_id")
+        .to_string();
+    let done = poll_until_job(&app, &job_id).await;
+    assert_eq!(done["success"], false);
+    assert!(!leak.exists(), "sandbox leaked a file at {}", leak.display());
+
+    let read = app
+        .clone()
+        .oneshot(request("read", "read", json!({"path":"x"})))
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+    let read = response_json(read).await;
+    assert_eq!(read["result"]["backend"], "catdesk");
+
+    let default_calls = default_capture.0.lock().await;
+    assert!(
+        default_calls.iter().all(|(_, body)| {
+            let name = body.pointer("/params/name").and_then(Value::as_str);
+            name != Some("start_command")
+                && name != Some("poll_command")
+                && name != Some("cancel_command")
+        }),
+        "jobs must not fall back to CatDesk: {default_calls:?}"
+    );
+    assert!(
+        default_calls.iter().any(|(_, body)| {
+            body.pointer("/params/name").and_then(Value::as_str) == Some("read")
+        }),
+        "Files must remain on the default backend: {default_calls:?}"
     );
 }

@@ -84,7 +84,7 @@ async fn run_command_http_executes_and_unknown_tool_fails_closed() {
         "jsonrpc":"2.0",
         "id":"jobs",
         "method":"tools/call",
-        "params":{"name":"start_command","arguments":{}}
+        "params":{"name":"not_a_real_tool","arguments":{}}
     })
     .to_string();
     let response = app
