@@ -4,8 +4,8 @@
 
 ## 当前目标
 
-- 当前 Goal：LAB-HOST-01 保持 VERIFY，用户授权延后 Web 再验，禁止标 CLOSED，不跑 discover_current_entry，不 HMAC。LAB-COMP-03 已 CLOSED。总控不空转 poll。
-- 下一可见检查点：LAB-HOST-01 仍 VERIFY（延后 Web）。LAB-COMP-03 CLOSED：现网 g18 tools 含 computer_*，feishu_status 与 jobs 仍在。
+- 当前 Goal：LAB-COLLAB-02 飞书云文档 Thin Slice：named `feishu_docs_search` / `feishu_docs_fetch`（lark-cli docs +search/+fetch）。不映射 docs 全量。桌面 stdio 与 LAB 生产同源登录。HOST-01 保持 VERIFY。
+- 下一可见检查点：LAB-COLLAB-02 本机 CLI + LAB/桌面 tools 含 docs search/fetch；真实搜一篇并 fetch 正文。HOST-01 仍 VERIFY。
 - 当前阻塞：本刀无外部阻塞。LAB-HOST-01 仍 VERIFY（用户授权延后 Web live discover，禁止 CLOSED/HMAC）。WEX-02..05 与 ROBUSTNESS P1 仍等 Host。旁系 `01a0b898` Grok 桥接 idle，不入主台账，本刀不碰 MULTI_PROVIDER / https_mcp_ingress。
 - 规则版本：Adaptive Agent Runtime `02ee696ae5de9477532bfe973c745af3bc83dd3c`；manifest sha256=`cf77e1997b83eca2a68139c67777f79a7f2d553db960e2e63bc3a20ac46cfb5a`；desktop_codex source `01a0b48e-76a7-7a60-9448-a4ba1deabdf2` 已 ACK（ownership generation=12）；integrity_error 已清除；02ee696 desktop live-E2E 已 accept at 2026-09-19T13:52:21Z（wake after ACK + CLOSED desktop-closed-cycle-02ee696）。HOST-01 仍 VERIFY
 - M0 Migration Preview：READY。当前 managed preview path=Personal / ordinary ChatGPT Web Plus -> OpenAI Secure MCP Tunnel -> new 0600 UDS Local Tool Bridge -> hardened CatDesk Files/Shell/Process/Jobs -> local machine；不经过 Work，不以 Codex 作为产品 runtime，不经过旧 AI-Bridge Files/Shell 执行面。2026-09-09 fresh gate：security-boundary 20/20 PASS；local-tool-bridge ingress 10/10 + runtime recovery 3/3 PASS；hardened CatDesk job cancel/timeout/descendant-tree/active-limit targeted 6/6 PASS；direct UDS tools/list 仅 10 个 M0 tools；真实 write/read/delete、/bin/pwd、job succeeded、cancelled、100ms timed_out 均 PASS；managed status backend/bridge/tunnel=true。
@@ -16,6 +16,7 @@
 
 | ID | 状态 / 负责人 | 目标与边界 | 依赖 / 阻塞 | 验收与验证 | 证据 / 下一步 |
 | --- | --- | --- | --- | --- | --- |
+| LAB-COLLAB-02 | `ACTIVE` / 项目总控 | 飞书云文档查看：`feishu_docs_search`、`feishu_docs_fetch` 走同一 lark-cli 登录；不接 create/update/media。桌面 mcp-stdio 与 LAB Bridge named 同步。 | 不得覆盖 HOST/COMP/CHECKPOINT；不得二次 OAuth；不得停 CatDesk/Host。Sheets 不在本刀。 | CLI `docs +search/+fetch` 成功；stdio 与生产 tools/list 含两工具；真实 search+fetch 有正文。 | 用户 2026-09-20 要求接下文档查看。 |
 | LAB-COLLAB-01 | `CLOSED` / 项目总控 | 按 SPEC/TECHNICAL 2026-09-19：Web 经 LAB 少量 named 飞书工具；桌面 stdio 直连同一 lark-cli 登录态不经 Bridge；named 含 create Base / kanban view / 一行记录；`feishu_cli` 仅逃生口。不建多 CLI 总线，不把 117 个命令映射为 MCP，不经 AI-Bridge。 | 不得覆盖 LAB-GOV/HOST/COMP 行；验收表 `LAB-COLLAB-01验收-可删` | Web/桌面 tools/list 含 named 工具；CLI+飞书窗口已见表格与看板 `vewxuPTpf1`、记录 `LAB验收一行` | 执行面 Meitner 回执 + 总控复验：仓库源与运行时 `mcp-stdio.py` sha256=`bc52f25e23572665dbfdc51b30339a29f1cbc8b36488733f0ae6d3b9d6539432` 一致；stdio `0.1.3` 14 tools；`feishu_status` 哈喽 ok。合同/实现已合 `54862dc`/`f32bca0`。非目标：仪表盘 named、Web 上再活建一张表。 |
 | LAB-AAR-02 | `CLOSED` / 项目总控 | 官方 install+ACK：revision `2ff6bd7`，appoint/replace 缺省切 ownership。 | 不手改 hash；不把 live_e2e_required 当成安装失败 | install.json revision=2ff6bd7；handshake loaded=installed；ACK desktop VERIFIED | 已安装。GOV-02 accept-live-e2e 另案 |
 | LAB-AAR-01 | `CLOSED` / 项目总控 | 任命换窗/换宿主时 `replace-desktop-session` 同一把锁 claim ownership；bind 不当班。合同在 AGENTS.md，门禁在 AAR `lifecycle_hook.py`。 | 不新造总控；不把开窗当任命 | unittest：auto-claim / skip-when-on-duty / explicit claim 5/5 PASS | 已落盘技能脚本+AGENTS；非目标：用文档代替门禁 |
