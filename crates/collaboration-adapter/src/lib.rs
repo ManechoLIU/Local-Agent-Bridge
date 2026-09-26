@@ -399,6 +399,33 @@ pub enum CollaborationOperation {
         identity: Identity,
         idempotency_key: String,
     },
+    WikiNodeGet {
+        node_token: String,
+    },
+    DocsSearch {
+        query: String,
+        page_size: Option<u16>,
+    },
+    DocsFetch {
+        doc: String,
+        doc_format: Option<String>,
+    },
+    DocsUpdate {
+        doc: String,
+        command: String,
+        pattern: Option<String>,
+        content: Option<String>,
+        doc_format: Option<String>,
+        block_id: Option<String>,
+        src_block_ids: Option<String>,
+    },
+    DocsMediaInsert {
+        doc: String,
+        file: String,
+        width: Option<u16>,
+        caption: Option<String>,
+        align: Option<String>,
+    },
 }
 
 impl CollaborationOperation {
@@ -411,6 +438,8 @@ impl CollaborationOperation {
                 | Self::BaseUpdateRecord { .. }
                 | Self::MessageSend { .. }
                 | Self::MessageReply { .. }
+                | Self::DocsUpdate { .. }
+                | Self::DocsMediaInsert { .. }
         )
     }
 }

@@ -661,7 +661,42 @@ pub fn feishu_tool_definitions() -> Vec<Value> {
             "required":["base_token","table_id","view"],
             "additionalProperties":false
         })),
-        tool("feishu_cli", "Run any already-logged-in lark-cli@1.0.96 command using argv after the binary. Examples: base +base-create; base +view-create with type kanban. Do not pass auth/login. High-risk-write requires yes=true. Prefer this over run_command.", json!({
+        tool("feishu_wiki_node_get", "Resolve a Feishu wiki/docx URL to obj_token. Use before docs fetch/update when you only have a wiki link.", json!({
+            "type":"object","properties":{"node_token":{"type":"string"}},"required":["node_token"],"additionalProperties":false
+        })),
+        tool("feishu_docs_search", "Search Feishu docs and wiki by keyword. Does not start OAuth.", json!({
+            "type":"object","properties":{"query":{"type":"string"},"page_size":{"type":"integer","minimum":1,"maximum":20}},"required":["query"],"additionalProperties":false
+        })),
+        tool("feishu_docs_fetch", "Read a Feishu cloud document. doc is a URL or token. Prefer markdown.", json!({
+            "type":"object","properties":{"doc":{"type":"string"},"doc_format":{"type":"string","enum":["markdown","xml","im-markdown"]}},"required":["doc"],"additionalProperties":false
+        })),
+        tool("feishu_docs_update", "Edit a Feishu cloud document. command: str_replace, overwrite, append, block_move_after, block_delete. Do not use for image upload.", json!({
+            "type":"object",
+            "properties":{
+                "doc":{"type":"string"},
+                "command":{"type":"string","enum":["str_replace","overwrite","append","block_move_after","block_delete"]},
+                "pattern":{"type":"string"},
+                "content":{"type":"string"},
+                "doc_format":{"type":"string","enum":["markdown","xml"]},
+                "block_id":{"type":"string"},
+                "src_block_ids":{"type":"string"}
+            },
+            "required":["doc","command"],
+            "additionalProperties":false
+        })),
+        tool("feishu_docs_media_insert", "Upload a local image into a Feishu document (appends at end). Then feishu_docs_update command=block_move_after to place it.", json!({
+            "type":"object",
+            "properties":{
+                "doc":{"type":"string"},
+                "file":{"type":"string"},
+                "width":{"type":"integer"},
+                "caption":{"type":"string"},
+                "align":{"type":"string","enum":["left","center","right"]}
+            },
+            "required":["doc","file"],
+            "additionalProperties":false
+        })),
+        tool("feishu_cli", "Escape hatch for already-logged-in lark-cli. Prefer named docs/IM/Base tools. Do not pass auth/login. High-risk-write requires yes=true.", json!({
             "type":"object",
             "properties":{
                 "argv":{"type":"array","items":{"type":"string"},"description":"Arguments after lark-cli, e.g. [base, +base-create, --name, Project]"},
@@ -822,6 +857,48 @@ pub fn parse_feishu_operation(
                 text: required_string(args, "text")?,
                 identity: optional_identity(args)?,
                 idempotency_key: validated_generated_key(generated_idempotency_key)?,
+            })
+        }
+        "feishu_wiki_node_get" => {
+            reject_unknown(args, &["node_token"])?;
+            Ok(CollaborationOperation::WikiNodeGet {
+                node_token: required_string(args, "node_token")?,
+            })
+        }
+        "feishu_docs_search" => {
+            reject_unknown(args, &["query", "page_size"])?;
+            Ok(CollaborationOperation::DocsSearch {
+                query: required_string(args, "query")?,
+                page_size: optional_u16(args, "page_size")?,
+            })
+        }
+        "feishu_docs_fetch" => {
+            reject_unknown(args, &["doc", "doc_format"])?;
+            Ok(CollaborationOperation::DocsFetch {
+                doc: required_string(args, "doc")?,
+                doc_format: optional_string(args, "doc_format")?,
+            })
+        }
+        "feishu_docs_update" => {
+            reject_unknown(args, &["doc", "command", "pattern", "content", "doc_format", "block_id", "src_block_ids"])?;
+            Ok(CollaborationOperation::DocsUpdate {
+                doc: required_string(args, "doc")?,
+                command: required_string(args, "command")?,
+                pattern: optional_string(args, "pattern")?,
+                content: optional_string(args, "content")?,
+                doc_format: optional_string(args, "doc_format")?,
+                block_id: optional_string(args, "block_id")?,
+                src_block_ids: optional_string(args, "src_block_ids")?,
+            })
+        }
+        "feishu_docs_media_insert" => {
+            reject_unknown(args, &["doc", "file", "width", "caption", "align"])?;
+            Ok(CollaborationOperation::DocsMediaInsert {
+                doc: required_string(args, "doc")?,
+                file: required_string(args, "file")?,
+                width: optional_u16(args, "width")?,
+                caption: optional_string(args, "caption")?,
+                align: optional_string(args, "align")?,
             })
         }
         _ => Err(format!("unsupported Feishu tool: {tool_name}")),

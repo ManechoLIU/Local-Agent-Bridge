@@ -21,7 +21,7 @@ DEFAULT_CLI = os.path.join(
 DEFAULT_CONFIG_DIR = os.path.join(PROVIDER_ROOT, "config")
 DEFAULT_HOME = os.path.join(PROVIDER_ROOT, "home")
 SERVER_NAME = "lark-cli"
-SERVER_VERSION = "0.1.3"
+SERVER_VERSION = "0.1.4"
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18", "2026-07-28")
 DEFAULT_PROTOCOL_VERSION = "2025-06-18"
 FRAME = {"mode": "headers"}  # headers | ndjson
@@ -181,6 +181,48 @@ def tools() -> list:
             {"type": "object", "properties": {"base_token": {"type": "string"}, "table_id": {"type": "string"}, "record_id": {"type": "string"}, "fields": {"type": "object"}}, "required": ["base_token", "table_id", "record_id", "fields"], "additionalProperties": False},
             read_only=False,
         ),
+
+        tool(
+            "feishu_wiki_node_get",
+            "Resolve a Feishu wiki/docx URL to node + obj_token. Use before docs fetch/update when you only have a wiki link.",
+            {"type": "object", "properties": {"node_token": {"type": "string"}}, "required": ["node_token"], "additionalProperties": False},
+        ),
+        tool(
+            "feishu_docs_search",
+            "Search Feishu docs and wiki by keyword. Does not start OAuth.",
+            {"type": "object", "properties": {"query": {"type": "string"}, "page_size": {"type": "integer"}}, "required": ["query"], "additionalProperties": False},
+        ),
+        tool(
+            "feishu_docs_fetch",
+            "Read a Feishu cloud document. doc is a URL or token. Prefer markdown for review.",
+            {"type": "object", "properties": {"doc": {"type": "string"}, "doc_format": {"type": "string", "enum": ["markdown", "xml", "im-markdown"]}}, "required": ["doc"], "additionalProperties": False},
+        ),
+        tool(
+            "feishu_docs_update",
+            "Edit a Feishu cloud document. command: str_replace, overwrite, append, block_move_after, block_delete. Do not use for image upload.",
+            {"type": "object", "properties": {
+                "doc": {"type": "string"},
+                "command": {"type": "string", "enum": ["str_replace", "overwrite", "append", "block_move_after", "block_delete"]},
+                "pattern": {"type": "string"},
+                "content": {"type": "string"},
+                "doc_format": {"type": "string", "enum": ["markdown", "xml"]},
+                "block_id": {"type": "string"},
+                "src_block_ids": {"type": "string"}
+            }, "required": ["doc", "command"], "additionalProperties": False},
+            read_only=False,
+        ),
+        tool(
+            "feishu_docs_media_insert",
+            "Upload a local image/file into a Feishu document (appends at end). Then use feishu_docs_update block_move_after to place it.",
+            {"type": "object", "properties": {
+                "doc": {"type": "string"},
+                "file": {"type": "string"},
+                "width": {"type": "integer"},
+                "caption": {"type": "string"},
+                "align": {"type": "string", "enum": ["left", "center", "right"]}
+            }, "required": ["doc", "file"], "additionalProperties": False},
+            read_only=False,
+        ),
         tool(
             "feishu_cli",
             "Escape hatch: pass argv through to already-logged-in official lark-cli. Do not pass auth/login. Prefer named send/reply/record tools.",
@@ -308,6 +350,70 @@ def argv_for(name: str, arguments: Dict[str, Any]) -> List[str]:
             "--format", "json",
             "--as", "user",
         ]
+
+    if name == "feishu_wiki_node_get":
+        return [
+            "wiki", "+node-get",
+            "--node-token", _require_text(arguments, "node_token"),
+            "--as", "user",
+            "--format", "json",
+        ]
+    if name == "feishu_docs_search":
+        argv = [
+            "docs", "+search",
+            "--query", _require_text(arguments, "query"),
+            "--as", "user",
+            "--format", "json",
+        ]
+        if arguments.get("page_size"):
+            argv += ["--page-size", str(int(arguments["page_size"]))]
+        return argv
+    if name == "feishu_docs_fetch":
+        argv = [
+            "docs", "+fetch",
+            "--doc", _require_text(arguments, "doc"),
+            "--as", "user",
+        ]
+        fmt = arguments.get("doc_format") or "markdown"
+        argv += ["--doc-format", str(fmt)]
+        return argv
+    if name == "feishu_docs_update":
+        command = _require_text(arguments, "command")
+        allowed = {"str_replace", "overwrite", "append", "block_move_after", "block_delete"}
+        if command not in allowed:
+            raise ValueError("unsupported docs update command")
+        argv = [
+            "docs", "+update",
+            "--doc", _require_text(arguments, "doc"),
+            "--command", command,
+            "--as", "user",
+        ]
+        if arguments.get("pattern"):
+            argv += ["--pattern", str(arguments["pattern"])]
+        if arguments.get("content") is not None:
+            argv += ["--content", str(arguments["content"])]
+        if arguments.get("doc_format"):
+            argv += ["--doc-format", str(arguments["doc_format"])]
+        if arguments.get("block_id"):
+            argv += ["--block-id", str(arguments["block_id"])]
+        if arguments.get("src_block_ids"):
+            argv += ["--src-block-ids", str(arguments["src_block_ids"])]
+        return argv
+    if name == "feishu_docs_media_insert":
+        argv = [
+            "docs", "+media-insert",
+            "--doc", _require_text(arguments, "doc"),
+            "--file", _require_text(arguments, "file"),
+            "--as", "user",
+            "--type", "image",
+        ]
+        if arguments.get("width"):
+            argv += ["--width", str(int(arguments["width"]))]
+        if arguments.get("caption"):
+            argv += ["--caption", str(arguments["caption"])]
+        if arguments.get("align"):
+            argv += ["--align", str(arguments["align"])]
+        return argv
     if name == "feishu_cli":
         return validate_feishu_cli_argv(arguments)
     raise KeyError(name)
@@ -460,7 +566,7 @@ def handle(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "instructions": (
                     "Official lark-cli wrapper using the already-logged-in Feishu "
                     "user. Use feishu_status / feishu_chat_search / bitable list "
-                    "tools. Writes use named send/reply/record tools; feishu_cli "
+                    "tools. Docs use feishu_docs_fetch / feishu_docs_update / feishu_docs_media_insert. Writes use named send/reply/record/docs tools; feishu_cli "
                     "is escape hatch only. Do not run auth login or config init."
                 ),
             },

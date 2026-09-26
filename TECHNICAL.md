@@ -191,9 +191,9 @@ The Runtime-facing integration exposes challenge issuance, Host attestation requ
 
 当前应出现在 Connector `tools/list` 的飞书 named 工具：
 
-`feishu_status`、`feishu_chat_search`、`feishu_message_list`、`feishu_base_list_tables`、`feishu_base_list_fields`、`feishu_base_list_records`、`feishu_base_create_record`、`feishu_base_update_record`、`feishu_message_send`、`feishu_message_reply`。
+`feishu_status`、`feishu_chat_search`、`feishu_message_list`、`feishu_base_list_tables`、`feishu_base_list_fields`、`feishu_base_list_records`、`feishu_base_create_record`、`feishu_base_update_record`、`feishu_message_send`、`feishu_message_reply`、`feishu_wiki_node_get`、`feishu_docs_search`、`feishu_docs_fetch`、`feishu_docs_update`、`feishu_docs_media_insert`。
 
-下一刀 named：`feishu_base_create`、`feishu_base_create_view`（`type` 含 `kanban`）。可选 `feishu_cli` 逃生口，不得替代上一列表成为 Web 主入口。
+已落地 named：`feishu_base_create`、`feishu_base_create_view`（`type` 含 `kanban`）。文档读写走 named 工具，不要用 `office_im` 或 `shell_command`。可选 `feishu_cli` 逃生口，不得替代上一列表成为 Web 主入口。
 
 CatDesk/Host `tools/list` 失败时，飞书工具仍须出现（fail-open 飞书面），不得因 default backend 400 把整表打掉。`feishu_message_list` 对话题群将 `page_size` 提升到至少 20，避免空页。
 

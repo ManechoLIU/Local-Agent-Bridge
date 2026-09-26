@@ -154,6 +154,66 @@ fn write_operations_are_marked_as_side_effecting() {
 }
 
 #[test]
+fn docs_named_tools_map_to_official_cli_shortcuts() {
+    let provider = LarkCliProvider::for_test("/opt/homebrew/bin/lark-cli", None);
+    let fetch = provider
+        .argv_for(&CollaborationOperation::DocsFetch {
+            doc: "https://example.feishu.cn/docx/ABC".into(),
+            doc_format: Some("markdown".into()),
+        })
+        .unwrap();
+    assert_eq!(
+        fetch,
+        vec![
+            "docs",
+            "+fetch",
+            "--doc",
+            "https://example.feishu.cn/docx/ABC",
+            "--as",
+            "user",
+            "--doc-format",
+            "markdown",
+        ]
+    );
+    let update = provider
+        .argv_for(&CollaborationOperation::DocsUpdate {
+            doc: "R72edNM5woRooIxqR8gcksRcn1e".into(),
+            command: "str_replace".into(),
+            pattern: Some("旧文".into()),
+            content: Some("新文".into()),
+            doc_format: None,
+            block_id: None,
+            src_block_ids: None,
+        })
+        .unwrap();
+    assert!(update.contains(&"+update".into()));
+    assert!(!update.iter().any(|item| item == "update"));
+    let media = provider
+        .argv_for(&CollaborationOperation::DocsMediaInsert {
+            doc: "R72edNM5woRooIxqR8gcksRcn1e".into(),
+            file: "/tmp/fig.png".into(),
+            width: Some(900),
+            caption: Some("图1".into()),
+            align: Some("center".into()),
+        })
+        .unwrap();
+    assert_eq!(media[1], "+media-insert");
+    assert!(CollaborationOperation::DocsMediaInsert {
+        doc: "x".into(),
+        file: "/tmp/a.png".into(),
+        width: None,
+        caption: None,
+        align: None,
+    }
+    .is_write());
+    assert!(!CollaborationOperation::DocsFetch {
+        doc: "x".into(),
+        doc_format: None,
+    }
+    .is_write());
+}
+
+#[test]
 fn profile_is_appended_as_a_global_flag_without_changing_operation_mapping() {
     let provider = LarkCliProvider::for_test("/opt/homebrew/bin/lark-cli", Some("lab-feishu".into()));
     let argv = provider.argv_for(&CollaborationOperation::Status).unwrap();

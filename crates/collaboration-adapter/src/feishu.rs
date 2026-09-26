@@ -691,6 +691,149 @@ impl LarkCliProvider {
                     "json".into(),
                 ]);
             }
+            CollaborationOperation::WikiNodeGet { node_token } => {
+                validate_text("node_token", node_token, 1024)?;
+                argv.extend([
+                    "wiki".into(),
+                    "+node-get".into(),
+                    "--node-token".into(),
+                    node_token.clone(),
+                    "--as".into(),
+                    "user".into(),
+                    "--format".into(),
+                    "json".into(),
+                ]);
+            }
+            CollaborationOperation::DocsSearch { query, page_size } => {
+                validate_text("query", query, 512)?;
+                argv.extend([
+                    "docs".into(),
+                    "+search".into(),
+                    "--query".into(),
+                    query.clone(),
+                    "--as".into(),
+                    "user".into(),
+                    "--format".into(),
+                    "json".into(),
+                ]);
+                if let Some(page_size) = page_size {
+                    validate_page_size(*page_size, 20)?;
+                    argv.extend(["--page-size".into(), page_size.to_string()]);
+                }
+            }
+            CollaborationOperation::DocsFetch { doc, doc_format } => {
+                validate_text("doc", doc, 1024)?;
+                argv.extend([
+                    "docs".into(),
+                    "+fetch".into(),
+                    "--doc".into(),
+                    doc.clone(),
+                    "--as".into(),
+                    "user".into(),
+                    "--doc-format".into(),
+                    doc_format
+                        .clone()
+                        .unwrap_or_else(|| "markdown".into()),
+                ]);
+            }
+            CollaborationOperation::DocsUpdate {
+                doc,
+                command,
+                pattern,
+                content,
+                doc_format,
+                block_id,
+                src_block_ids,
+            } => {
+                validate_text("doc", doc, 1024)?;
+                validate_text("command", command, 64)?;
+                match command.as_str() {
+                    "str_replace" | "overwrite" | "append" | "block_move_after" | "block_delete" => {}
+                    _ => {
+                        return Err(CollaborationError::invalid_argument(
+                            "unsupported docs update command",
+                        ));
+                    }
+                }
+                argv.extend([
+                    "docs".into(),
+                    "+update".into(),
+                    "--doc".into(),
+                    doc.clone(),
+                    "--command".into(),
+                    command.clone(),
+                    "--as".into(),
+                    "user".into(),
+                ]);
+                if let Some(pattern) = pattern {
+                    validate_text("pattern", pattern, 8 * 1024)?;
+                    argv.extend(["--pattern".into(), pattern.clone()]);
+                }
+                if let Some(content) = content {
+                    validate_text("content", content, 512 * 1024)?;
+                    argv.extend(["--content".into(), content.clone()]);
+                }
+                if let Some(doc_format) = doc_format {
+                    validate_text("doc_format", doc_format, 32)?;
+                    argv.extend(["--doc-format".into(), doc_format.clone()]);
+                }
+                if let Some(block_id) = block_id {
+                    validate_text("block_id", block_id, 256)?;
+                    argv.extend(["--block-id".into(), block_id.clone()]);
+                }
+                if let Some(src_block_ids) = src_block_ids {
+                    validate_text("src_block_ids", src_block_ids, 1024)?;
+                    argv.extend(["--src-block-ids".into(), src_block_ids.clone()]);
+                }
+            }
+            CollaborationOperation::DocsMediaInsert {
+                doc,
+                file,
+                width,
+                caption,
+                align,
+            } => {
+                validate_text("doc", doc, 1024)?;
+                validate_text("file", file, 1024)?;
+                if !file.starts_with('/') {
+                    return Err(CollaborationError::invalid_argument(
+                        "file must be an absolute path",
+                    ));
+                }
+                argv.extend([
+                    "docs".into(),
+                    "+media-insert".into(),
+                    "--doc".into(),
+                    doc.clone(),
+                    "--file".into(),
+                    file.clone(),
+                    "--as".into(),
+                    "user".into(),
+                    "--type".into(),
+                    "image".into(),
+                ]);
+                if let Some(width) = width {
+                    if *width == 0 {
+                        return Err(CollaborationError::invalid_argument("width must be positive"));
+                    }
+                    argv.extend(["--width".into(), width.to_string()]);
+                }
+                if let Some(caption) = caption {
+                    validate_text("caption", caption, 512)?;
+                    argv.extend(["--caption".into(), caption.clone()]);
+                }
+                if let Some(align) = align {
+                    match align.as_str() {
+                        "left" | "center" | "right" => {}
+                        _ => {
+                            return Err(CollaborationError::invalid_argument(
+                                "align must be left, center, or right",
+                            ));
+                        }
+                    }
+                    argv.extend(["--align".into(), align.clone()]);
+                }
+            }
         }
 
         Ok(argv)
