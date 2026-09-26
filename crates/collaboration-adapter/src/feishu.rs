@@ -393,14 +393,15 @@ impl LarkCliProvider {
             require_json_output(&output.stdout)?;
         }
 
-        let argv = self.argv_for(operation)?;
+        let prepared = prepare_docs_media_insert(operation, &self.environment)?;
+        let argv = self.argv_for(&prepared)?;
         let output = runner.run_with_env(
             self.cli_path.to_string_lossy().as_ref(),
             &argv,
             &self.environment,
             timeout,
             output_limit,
-            operation.is_write(),
+            prepared.is_write(),
         )?;
         require_json_output(&output.stdout)?;
         Ok(output)
@@ -838,6 +839,93 @@ impl LarkCliProvider {
 
         Ok(argv)
     }
+}
+
+
+fn prepare_docs_media_insert(
+    operation: &CollaborationOperation,
+    environment: &[(String, String)],
+) -> Result<CollaborationOperation, CollaborationError> {
+    let CollaborationOperation::DocsMediaInsert {
+        doc,
+        file,
+        width,
+        caption,
+        align,
+    } = operation
+    else {
+        return Ok(operation.clone());
+    };
+    validate_text("file", file, 1024)?;
+    if !file.starts_with('/') {
+        return Err(CollaborationError::invalid_argument(
+            "file must be an absolute path on this Mac",
+        ));
+    }
+    let source = std::path::Path::new(file);
+    if !source.is_file() {
+        return Err(CollaborationError::invalid_argument(format!(
+            "file does not exist on this Mac: {file}. Save the image into the Local Agent Bridge workspace first. Do not use chat sandbox paths or Downloads if the shell sandbox blocked the write."
+        )));
+    }
+    let lower = file.to_ascii_lowercase();
+    if !(lower.ends_with(".svg")
+        || lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".webp"))
+    {
+        return Err(CollaborationError::invalid_argument(
+            "file must be png, jpg, gif, webp, or svg",
+        ));
+    }
+    let upload = if lower.ends_with(".svg") {
+        convert_svg_to_png(source, environment)?
+    } else {
+        file.clone()
+    };
+    Ok(CollaborationOperation::DocsMediaInsert {
+        doc: doc.clone(),
+        file: upload,
+        width: *width,
+        caption: caption.clone(),
+        align: align.clone(),
+    })
+}
+
+fn convert_svg_to_png(
+    source: &std::path::Path,
+    environment: &[(String, String)],
+) -> Result<String, CollaborationError> {
+    let tmp = environment
+        .iter()
+        .find(|(key, _)| key == "TMPDIR")
+        .map(|(_, value)| std::path::PathBuf::from(value))
+        .unwrap_or_else(|| std::env::temp_dir());
+    std::fs::create_dir_all(&tmp).map_err(|error| CollaborationError::invalid_argument(format!(
+        "cannot create temp dir for svg conversion: {error}"
+    )))?;
+    let status = std::process::Command::new("/usr/bin/qlmanage")
+        .args(["-t", "-s", "2800", "-o"])
+        .arg(&tmp)
+        .arg(source)
+        .status()
+        .map_err(|error| CollaborationError::invalid_argument(format!(
+            "svg to png conversion failed to start: {error}"
+        )))?;
+    if !status.success() {
+        return Err(CollaborationError::invalid_argument(
+            "svg to png conversion failed",
+        ));
+    }
+    let generated = tmp.join(format!("{}.png", source.file_name().unwrap().to_string_lossy()));
+    if !generated.is_file() {
+        return Err(CollaborationError::invalid_argument(
+            "svg to png conversion produced no png",
+        ));
+    }
+    Ok(generated.to_string_lossy().into_owned())
 }
 
 fn validate_text(name: &str, value: &str, max_len: usize) -> Result<(), CollaborationError> {

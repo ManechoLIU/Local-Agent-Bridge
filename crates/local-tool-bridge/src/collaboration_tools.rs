@@ -684,7 +684,7 @@ pub fn feishu_tool_definitions() -> Vec<Value> {
             "required":["doc","command"],
             "additionalProperties":false
         })),
-        tool("feishu_docs_media_insert", "Upload a local image into a Feishu document (appends at end). Then feishu_docs_update command=block_move_after to place it.", json!({
+        tool("feishu_docs_media_insert", "Insert an image into a Feishu doc. file must be an absolute path that already exists on this Mac (workspace PNG/JPG/SVG is OK; SVG is converted automatically). Do not use /mnt/data or Downloads if the shell sandbox blocked writing there. Then feishu_docs_update command=block_move_after to place it.", json!({
             "type":"object",
             "properties":{
                 "doc":{"type":"string"},

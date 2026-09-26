@@ -400,10 +400,25 @@ def argv_for(name: str, arguments: Dict[str, Any]) -> List[str]:
             argv += ["--src-block-ids", str(arguments["src_block_ids"])]
         return argv
     if name == "feishu_docs_media_insert":
+        path = _require_text(arguments, "file")
+        if not path.startswith("/"):
+            raise ValueError("file must be an absolute path on this Mac")
+        if not os.path.isfile(path):
+            raise ValueError(
+                "file does not exist on this Mac: %s. Save into the Local Agent Bridge workspace. Do not use chat sandbox paths or Downloads if the shell sandbox blocked the write." % path
+            )
+        if path.lower().endswith(".svg"):
+            tmp = os.environ.get("TMPDIR") or "/tmp"
+            os.makedirs(tmp, exist_ok=True)
+            converted = os.path.join(tmp, os.path.basename(path) + ".png")
+            proc = subprocess.run(["/usr/bin/qlmanage", "-t", "-s", "2800", "-o", tmp, path], capture_output=True, timeout=20)
+            if proc.returncode != 0 or not os.path.isfile(converted):
+                raise ValueError("svg to png conversion failed")
+            path = converted
         argv = [
             "docs", "+media-insert",
             "--doc", _require_text(arguments, "doc"),
-            "--file", _require_text(arguments, "file"),
+            "--file", path,
             "--as", "user",
             "--type", "image",
         ]
