@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Read,
     os::unix::{
@@ -840,6 +840,19 @@ fn resolve_cwd(workspace: &Path, extra: &[PathBuf], raw: Option<&str>) -> Result
     Ok(current)
 }
 
+fn ancestor_literals(path: &Path) -> Vec<PathBuf> {
+    let mut ancestors = Vec::new();
+    let mut current = path;
+    while let Some(parent) = current.parent() {
+        if parent.as_os_str().is_empty() {
+            break;
+        }
+        ancestors.push(parent.to_path_buf());
+        current = parent;
+    }
+    ancestors
+}
+
 fn seatbelt_escape(path: &Path) -> Result<String, String> {
     let raw = path
         .to_str()
@@ -857,6 +870,22 @@ fn build_profile(
     trusted: &[PathBuf],
     extra: &[PathBuf],
 ) -> Result<String, String> {
+    // Apple Git realpath/stat walks ancestor prefixes such as /Users.
+    // Grant metadata-only literals for path resolution; never parent listing,
+    // file contents, or write.
+    let mut ancestor_rules = String::new();
+    let mut seen_ancestors = BTreeSet::new();
+    for root in std::iter::once(workspace).chain(extra.iter().map(PathBuf::as_path)) {
+        for ancestor in ancestor_literals(root) {
+            if seen_ancestors.insert(ancestor.clone()) {
+                let ancestor = seatbelt_escape(&ancestor)?;
+                ancestor_rules.push_str(&format!(
+                    "(allow file-read-metadata (literal \"{ancestor}\"))\n"
+                ));
+            }
+        }
+    }
+
     let workspace = seatbelt_escape(workspace)?;
     let scratch = seatbelt_escape(scratch)?;
     let cache = seatbelt_escape(cache)?;
@@ -901,7 +930,7 @@ fn build_profile(
 (allow file-read-metadata (literal "/dev/null"))
 (allow file-read-data (literal "/dev/null"))
 (allow file-write* (literal "/dev/null"))
-(allow file-read-metadata (subpath "{workspace}"))
+{ancestor_rules}(allow file-read-metadata (subpath "{workspace}"))
 (allow file-read-data (subpath "{workspace}"))
 (allow file-write* (subpath "{workspace}"))
 (allow file-read-metadata (subpath "{scratch}"))
