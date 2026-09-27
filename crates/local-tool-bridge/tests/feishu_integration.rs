@@ -353,3 +353,67 @@ async fn initialize_injects_feishu_docs_instructions_when_provider_is_enabled() 
     assert!(instructions.to_ascii_lowercase().contains("do not ask"));
 }
 
+#[tokio::test]
+async fn extra_file_roots_allow_absolute_read_and_write() {
+    use bridge_security_core::Capability;
+    let root = private_test_root("extra-files");
+    let file = root.join("note.html");
+    fs::write(&file, "<h1>稳住</h1>").unwrap();
+
+    let context = ExecutionContext {
+        principal_id: "extra-files-principal".into(),
+        execution_session_id: "extra-files-session".into(),
+        capability_id: "extra-files-capability".into(),
+        workspace_id: "extra-files-workspace".into(),
+    };
+    let grant = CapabilityGrant {
+        principal_id: context.principal_id.clone(),
+        execution_session_id: context.execution_session_id.clone(),
+        capability_id: context.capability_id.clone(),
+        workspace_id: context.workspace_id.clone(),
+        capabilities: vec![Capability::Discovery, Capability::FileRead, Capability::FileWrite],
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+    let mut authority = CapabilityAuthority::new_for_test([88_u8; 32]);
+    let issued = authority.issue(grant, now - 1_000, 60_000, 1).unwrap();
+    authority.save_private(&root).unwrap();
+    let app = BridgeIngress::new(
+        authority,
+        issued,
+        context,
+        KEY.as_bytes(),
+        DEAD_BACKEND,
+        BACKEND_KEY,
+        &root,
+    )
+    .unwrap()
+    .with_extra_file_roots(vec![root.clone()])
+    .unwrap()
+    .router();
+
+    let read_body = serde_json::json!({
+        "jsonrpc":"2.0",
+        "id":"read",
+        "method":"tools/call",
+        "params":{"name":"read","arguments":{"paths":[file.display().to_string()]}}
+    }).to_string();
+    let response = app.clone().oneshot(call_request("read", &read_body)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = response_json(response).await;
+    let text = value["result"]["structuredContent"]["files"][0]["text"].as_str().unwrap();
+    assert!(text.contains("稳住"), "{value}");
+
+    let written = root.join("out.html");
+    let write_body = serde_json::json!({
+        "jsonrpc":"2.0",
+        "id":"write",
+        "method":"tools/call",
+        "params":{"name":"write","arguments":{"path": written.display().to_string(), "content": "ok"}}
+    }).to_string();
+    let response = app.oneshot(call_request("write", &write_body)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = response_json(response).await;
+    assert_eq!(value["result"]["structuredContent"]["bytesWritten"], 2);
+    assert_eq!(fs::read_to_string(&written).unwrap(), "ok");
+}
+

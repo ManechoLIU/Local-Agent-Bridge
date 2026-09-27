@@ -5,7 +5,7 @@ use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
 use local_tool_bridge::{
     BridgeIngress, PRODUCTION_CAPABILITY_TTL_MS, ProductionReleaseFence, ToolPolicy,
-    validate_production_release_manifest,
+    parse_extra_file_roots, validate_production_release_manifest,
 };
 use std::{
     env,
@@ -307,6 +307,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             settings.output_limit,
         )?;
     }
+    let extra_file_roots = extra_file_roots_from_env(production_mode)?;
+    if !extra_file_roots.is_empty() {
+        ingress = ingress.with_extra_file_roots(extra_file_roots)?;
+    }
     let app = ingress.router();
 
     let socket = PathBuf::from(&socket_path);
@@ -469,6 +473,10 @@ struct FeishuSettings {
     profile: Option<String>,
     timeout_ms: u64,
     output_limit: usize,
+}
+
+fn extra_file_roots_from_env(production: bool) -> Result<Vec<PathBuf>, String> {
+    parse_extra_file_roots(env::var("LAB_EXTRA_FILE_ROOTS").ok().as_deref(), production)
 }
 
 fn feishu_settings_from_values(

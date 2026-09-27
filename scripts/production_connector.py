@@ -446,6 +446,7 @@ def production_component_env(
         "LAB_HOST_BACKEND_KEY_FILE": str(layout["host_backend_key"]),
         "LAB_HOST_ADAPTER_SOCKET": str(layout["host_socket"]),
         "LAB_RUNTIME_HOST_TOOL_HOOK_SOCKET": str(layout["runtime_hook_socket"]),
+        "LAB_EXTRA_FILE_ROOTS": "/Users/echoman/Documents/ChatGPT/Anker",
     }
     process_bind = _numeric_loopback_bind(
         f"127.0.0.1:{_layout_process_runtime_port(layout)}",
