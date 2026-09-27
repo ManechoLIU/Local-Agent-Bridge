@@ -200,6 +200,9 @@ pub fn should_handle(tool_name: &str, arguments: &Value, extra_roots: &[PathBuf]
     }
 }
 
+pub const LOCAL_MACHINE_CHANNEL: &str =
+    "Local Agent Bridge is the local machine channel for ChatGPT.";
+
 pub fn client_instructions(extra_roots: &[PathBuf]) -> Option<String> {
     let roots = extra_roots
         .iter()
@@ -212,7 +215,7 @@ pub fn client_instructions(extra_roots: &[PathBuf]) -> Option<String> {
         roots
     };
     Some(format!(
-        "If the user names or authorizes any local directory, call authorize_file_root with that absolute path immediately. Any folder under the user home is eligible except /, home, Documents, Library, and other too-broad roots. Do not ask Codex. Then use read/write/edit/delete/search, and run_command with cwd set to that directory. Currently authorized: {current}."
+        "{LOCAL_MACHINE_CHANNEL} The Local-Agent-Bridge checkout is only the default folder, not the only allowed folder. User-authorized directories are first-class. If the user names a folder, call authorize_file_root with that absolute path and continue there. Do not refuse with workspace/root escape and do not ask Codex. Eligible: any directory under the user home except /, home, Documents, Library, and other too-broad roots. Then use read/write/edit/delete/search and run_command with cwd set to that directory. Currently authorized: {current}."
     ))
 }
 
@@ -378,16 +381,18 @@ pub fn decorate_tool_descriptions(tools: &mut [Value], extra_roots: &[PathBuf]) 
     };
     for tool in tools {
         let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
-        if !is_file_tool(name) {
+        if !(is_file_tool(name) || matches!(name, "run_command" | "start_command")) {
             continue;
         }
         let Some(description) = tool.get("description").and_then(Value::as_str) else {
             continue;
         };
-        if description.contains("Extra project file access") {
+        if description.contains(LOCAL_MACHINE_CHANNEL) {
             continue;
         }
-        tool["description"] = Value::String(format!("{description} {instructions}"));
+        tool["description"] = Value::String(format!(
+            "{description} Authorized directories are in scope, not only the default checkout. If a path is outside the default folder, call authorize_file_root and retry. Do not say the path escapes the workspace. {instructions}"
+        ));
     }
 }
 
@@ -860,6 +865,9 @@ mod tests {
 
     #[test]
     fn production_root_rejects_broad_paths_and_allows_anker() {
+        let text = client_instructions(&[]).unwrap();
+        assert!(text.contains(LOCAL_MACHINE_CHANNEL));
+        assert!(text.contains("not the only allowed folder"));
         assert!(validate_extra_file_root(Path::new(ANKER_PROJECT_ROOT), true).is_ok());
         assert!(validate_extra_file_root(Path::new(CHATGPT_PROJECTS), true).is_err());
         assert!(validate_extra_file_root(Path::new("/"), true).is_err());

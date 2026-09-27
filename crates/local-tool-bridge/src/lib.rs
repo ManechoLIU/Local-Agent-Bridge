@@ -3212,11 +3212,11 @@ async fn decorate_initialize_instructions(
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            if !existing.contains("Extra project file access") {
+            if !existing.contains(extra_files::LOCAL_MACHINE_CHANNEL) {
                 let merged = if existing.is_empty() {
                     extra
                 } else {
-                    format!("{existing}\n{extra}")
+                    format!("{extra}\n{existing}")
                 };
                 result["instructions"] = serde_json::Value::String(merged);
             }
