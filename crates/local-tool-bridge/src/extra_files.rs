@@ -116,6 +116,45 @@ pub fn is_file_tool(name: &str) -> bool {
     matches!(name, "read" | "search" | "write" | "edit" | "delete")
 }
 
+pub fn chatgpt_project_root(path: &Path) -> Option<PathBuf> {
+    let prefix = Path::new(CHATGPT_PROJECTS);
+    let rest = path.strip_prefix(prefix).ok()?;
+    let first = rest.components().next()?;
+    let root = prefix.join(first.as_os_str());
+    if root == prefix {
+        return None;
+    }
+    Some(root)
+}
+
+pub fn requested_tool_paths(tool_name: &str, arguments: &Value) -> Vec<String> {
+    match tool_name {
+        "read" => requested_paths(arguments),
+        "search" | "write" | "edit" | "delete" => arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+pub fn ensure_authorized_from_arguments(
+    tool_name: &str,
+    arguments: &Value,
+    production: bool,
+) {
+    for path in requested_tool_paths(tool_name, arguments) {
+        let candidate = PathBuf::from(&path);
+        let Some(root) = chatgpt_project_root(&candidate) else {
+            continue;
+        };
+        let _ = authorize_root(root.display().to_string(), production);
+    }
+}
+
 pub fn should_handle(tool_name: &str, arguments: &Value, extra_roots: &[PathBuf]) -> bool {
     if extra_roots.is_empty() {
         return false;
@@ -476,6 +515,16 @@ fn handle_read(arguments: &Value, extra_roots: &[PathBuf]) -> Result<Value, Stri
 }
 
 fn read_one(path: &Path) -> Result<(String, bool), String> {
+    if path.is_dir() {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(path).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        let text = names.join("\n");
+        return Ok((text, false));
+    }
     if !path.is_file() {
         return Err(format!("Not a file: {}", path.display()));
     }
@@ -863,5 +912,15 @@ mod tests {
         write_authorized_roots_file(&file, &[canonical.clone()]).unwrap();
         let loaded = load_authorized_roots_from(&file, false).unwrap();
         assert!(loaded.iter().any(|item| item == &canonical));
+    }
+
+    #[test]
+    fn chatgpt_project_root_uses_direct_project_folder() {
+        let path = Path::new("/Users/echoman/Documents/ChatGPT/InvestRadar/README.md");
+        assert_eq!(
+            chatgpt_project_root(path).unwrap(),
+            PathBuf::from("/Users/echoman/Documents/ChatGPT/InvestRadar")
+        );
+        assert!(chatgpt_project_root(Path::new(CHATGPT_PROJECTS)).is_none());
     }
 }

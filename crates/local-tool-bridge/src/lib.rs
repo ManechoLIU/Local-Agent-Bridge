@@ -1184,21 +1184,24 @@ async fn handle_mcp(
     }
 
     if method == "tools/call" && extra_files::is_file_tool(tool_name) {
+        let arguments = parsed
+            .get("params")
+            .and_then(|value| value.get("arguments"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        extra_files::ensure_authorized_from_arguments(
+            tool_name,
+            &arguments,
+            state.inner.extra_file_production,
+        );
         let extra_roots = state.extra_file_roots_now();
-        if !extra_roots.is_empty() {
-            let arguments = parsed
-                .get("params")
-                .and_then(|value| value.get("arguments"))
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
-            if extra_files::should_handle(tool_name, &arguments, &extra_roots) {
-                return handle_extra_file_call(
-                    extra_roots,
-                    parsed.get("id").cloned().unwrap_or(serde_json::Value::Null),
-                    tool_name,
-                    &arguments,
-                );
-            }
+        if extra_files::should_handle(tool_name, &arguments, &extra_roots) {
+            return handle_extra_file_call(
+                extra_roots,
+                parsed.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                tool_name,
+                &arguments,
+            );
         }
     }
 
