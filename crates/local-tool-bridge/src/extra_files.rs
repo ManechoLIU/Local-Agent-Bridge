@@ -11,22 +11,64 @@ const CHATGPT_PROJECTS: &str = "/Users/echoman/Documents/ChatGPT";
 #[allow(dead_code)]
 pub const ANKER_PROJECT_ROOT: &str = "/Users/echoman/Documents/ChatGPT/Anker";
 
+pub const DEFAULT_AUTHORIZED_ROOTS_FILE: &str =
+    "/Users/echoman/.local-agent-bridge/authorized-file-roots";
+
+pub fn authorized_roots_file() -> PathBuf {
+    std::env::var("LAB_AUTHORIZED_FILE_ROOTS_FILE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_AUTHORIZED_ROOTS_FILE))
+}
+
 pub fn parse_extra_file_roots(raw: Option<&str>, production: bool) -> Result<Vec<PathBuf>, String> {
-    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(Vec::new());
-    };
     let mut roots = Vec::new();
-    for part in raw.split([',', ':']) {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
+    if let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) {
+        for part in raw.split([',', '\n', ';']) {
+            let part = part.trim();
+            if part.is_empty() || part.starts_with('#') {
+                continue;
+            }
+            push_unique(&mut roots, validate_extra_file_root(Path::new(part), production)?);
         }
-        roots.push(validate_extra_file_root(Path::new(part), production)?);
     }
-    if roots.len() > 4 {
-        return Err("LAB_EXTRA_FILE_ROOTS is limited to 4 directories".into());
+    if roots.len() > 16 {
+        return Err("authorized file roots are limited to 16 directories".into());
     }
     Ok(roots)
+}
+
+pub fn load_authorized_roots_file(production: bool) -> Result<Vec<PathBuf>, String> {
+    load_authorized_roots_from(&authorized_roots_file(), production)
+}
+
+pub fn load_authorized_roots_from(path: &Path, production: bool) -> Result<Vec<PathBuf>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!("authorized file roots must be a regular file: {}", path.display()));
+    }
+    let raw = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    parse_extra_file_roots(Some(&raw), production)
+}
+
+pub fn effective_roots(startup: &[PathBuf], production: bool) -> Vec<PathBuf> {
+    let mut roots = startup.to_vec();
+    if let Ok(from_file) = load_authorized_roots_file(production) {
+        for root in from_file {
+            push_unique(&mut roots, root);
+        }
+    }
+    roots
+}
+
+fn push_unique(roots: &mut Vec<PathBuf>, root: PathBuf) {
+    if !roots.iter().any(|existing| existing == &root) {
+        roots.push(root);
+    }
 }
 
 pub fn validate_extra_file_root(path: &Path, production: bool) -> Result<PathBuf, String> {
@@ -39,24 +81,30 @@ pub fn validate_extra_file_root(path: &Path, production: bool) -> Result<PathBuf
     if !root.is_dir() {
         return Err(format!("extra file root is not a directory: {}", root.display()));
     }
-    if root == Path::new("/")
-        || root == Path::new("/Users")
-        || root == Path::new("/Users/echoman")
-        || root == Path::new("/Users/echoman/Documents")
-        || root == Path::new(CHATGPT_PROJECTS)
-    {
-        return Err("extra file root is too broad".into());
+    let forbidden = [
+        Path::new("/"),
+        Path::new("/Users"),
+        Path::new("/Users/echoman"),
+        Path::new("/Users/echoman/Library"),
+        Path::new("/Users/echoman/Documents"),
+        Path::new(CHATGPT_PROJECTS),
+        Path::new("/tmp"),
+        Path::new("/private/tmp"),
+        Path::new("/etc"),
+        Path::new("/var"),
+        Path::new("/System"),
+        Path::new("/Applications"),
+    ];
+    if forbidden.iter().any(|path| *path == root.as_path()) {
+        return Err("extra file root is too broad or sensitive".into());
     }
     if production {
-        let prefix = Path::new(CHATGPT_PROJECTS);
-        let rest = root
-            .strip_prefix(prefix)
-            .map_err(|_| "production extra file root must be a ChatGPT project folder".to_string())?;
-        if rest.components().count() != 1 {
-            return Err("production extra file root must be a direct ChatGPT project folder".into());
+        let home = Path::new("/Users/echoman");
+        if !root.starts_with(home) || root == home {
+            return Err("authorized file root must be inside your home directory".into());
         }
-        if root == Path::new(super::PRODUCTION_WORKSPACE) {
-            return Err("extra file root cannot be the production workspace".into());
+        if root.starts_with(Path::new("/Users/echoman/Library")) {
+            return Err("authorized file root cannot be under Library".into());
         }
     }
     Ok(root)
@@ -566,6 +614,7 @@ pub fn jsonrpc_result(id: Value, _tool_name: &str, data: Value, is_error: bool) 
     })
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,10 +627,20 @@ mod tests {
     }
 
     #[test]
-    fn production_root_must_be_direct_chatgpt_project() {
+    fn production_root_rejects_broad_paths_and_allows_anker() {
         assert!(validate_extra_file_root(Path::new(ANKER_PROJECT_ROOT), true).is_ok());
         assert!(validate_extra_file_root(Path::new(CHATGPT_PROJECTS), true).is_err());
         assert!(validate_extra_file_root(Path::new("/"), true).is_err());
+        assert!(validate_extra_file_root(Path::new("/Users/echoman"), true).is_err());
+    }
+
+    #[test]
+    fn authorized_file_is_merged_into_effective_roots() {
+        let root = temp_root("allowlist");
+        let file = std::env::temp_dir().join("lab-extra-files").join("allowlist-file");
+        fs::write(&file, format!("{}\n", root.display())).unwrap();
+        let loaded = load_authorized_roots_from(&file, false).unwrap();
+        assert!(loaded.iter().any(|item| item == &root.canonicalize().unwrap()));
     }
 
     #[test]

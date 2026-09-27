@@ -715,6 +715,7 @@ struct BridgeIngressInner {
     collaboration: Option<collaboration_tools::CollaborationRuntime>,
     feishu_admin: Option<collaboration_tools::FeishuAdminRuntime>,
     extra_file_roots: Vec<PathBuf>,
+    extra_file_production: bool,
     client: reqwest::Client,
     policy: ToolPolicy,
     state_dir: Option<PathBuf>,
@@ -780,6 +781,7 @@ impl BridgeIngress {
                 collaboration: None,
                 feishu_admin: None,
                 extra_file_roots: Vec::new(),
+                extra_file_production: false,
                 client: backend_client()?,
                 policy,
                 state_dir: Some(state_dir.into()),
@@ -819,6 +821,7 @@ impl BridgeIngress {
                 collaboration: None,
                 feishu_admin: None,
                 extra_file_roots: Vec::new(),
+                extra_file_production: false,
                 client: backend_client()?,
                 policy,
                 state_dir: Some(state_dir.into()),
@@ -935,6 +938,18 @@ impl BridgeIngress {
         })?;
         inner.extra_file_roots = roots;
         Ok(self)
+    }
+
+    pub fn with_extra_file_production(mut self, production: bool) -> Result<Self, String> {
+        let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
+            "extra file production flag must be configured before BridgeIngress is cloned".to_string()
+        })?;
+        inner.extra_file_production = production;
+        Ok(self)
+    }
+
+    fn extra_file_roots_now(&self) -> Vec<PathBuf> {
+        extra_files::effective_roots(&self.inner.extra_file_roots, self.inner.extra_file_production)
     }
 
     pub fn with_tool_receipt_chain(
@@ -1151,17 +1166,22 @@ async fn handle_mcp(
         return handle_feishu_call(&state, &parsed, tool_name).await;
     }
 
-    if method == "tools/call"
-        && extra_files::is_file_tool(tool_name)
-        && !state.inner.extra_file_roots.is_empty()
-    {
-        let arguments = parsed
-            .get("params")
-            .and_then(|value| value.get("arguments"))
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-        if extra_files::should_handle(tool_name, &arguments, &state.inner.extra_file_roots) {
-            return handle_extra_file_call(&state, parsed.get("id").cloned().unwrap_or(serde_json::Value::Null), tool_name, &arguments);
+    if method == "tools/call" && extra_files::is_file_tool(tool_name) {
+        let extra_roots = state.extra_file_roots_now();
+        if !extra_roots.is_empty() {
+            let arguments = parsed
+                .get("params")
+                .and_then(|value| value.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            if extra_files::should_handle(tool_name, &arguments, &extra_roots) {
+                return handle_extra_file_call(
+                    extra_roots,
+                    parsed.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                    tool_name,
+                    &arguments,
+                );
+            }
         }
     }
 
@@ -1223,9 +1243,9 @@ async fn handle_mcp(
             }
         }
         Ok(response) if method == "initialize"
-            && (state.inner.collaboration.is_some() || !state.inner.extra_file_roots.is_empty()) =>
+            && (state.inner.collaboration.is_some() || !state.extra_file_roots_now().is_empty()) =>
         {
-            match decorate_initialize_instructions(response, &state.inner.extra_file_roots).await {
+            match decorate_initialize_instructions(response, &state.extra_file_roots_now()).await {
                 Ok(response) => response,
                 Err(error) => text_response(StatusCode::BAD_GATEWAY, &error),
             }
@@ -3084,12 +3104,12 @@ fn map_backend_response_id(
 
 
 fn handle_extra_file_call(
-    state: &BridgeIngress,
+    extra_roots: Vec<PathBuf>,
     id: serde_json::Value,
     tool_name: &str,
     arguments: &serde_json::Value,
 ) -> Response<Body> {
-    match extra_files::handle_call(tool_name, arguments, &state.inner.extra_file_roots) {
+    match extra_files::handle_call(tool_name, arguments, &extra_roots) {
         Ok(data) => {
             let is_error = data.get("allFailed").and_then(serde_json::Value::as_bool).unwrap_or(false);
             json_response(StatusCode::OK, extra_files::jsonrpc_result(id, tool_name, data, is_error))
@@ -3535,7 +3555,7 @@ async fn forward_merged_tools_list(
             }
         }
     }
-    extra_files::decorate_tool_descriptions(tools, &state.inner.extra_file_roots);
+    extra_files::decorate_tool_descriptions(tools, &state.extra_file_roots_now());
     let response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")

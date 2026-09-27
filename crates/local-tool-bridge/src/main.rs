@@ -308,9 +308,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     let extra_file_roots = extra_file_roots_from_env(production_mode)?;
-    if !extra_file_roots.is_empty() {
-        ingress = ingress.with_extra_file_roots(extra_file_roots)?;
-    }
+    ingress = ingress.with_extra_file_roots(extra_file_roots)?;
+    ingress = ingress.with_extra_file_production(production_mode)?;
     let app = ingress.router();
 
     let socket = PathBuf::from(&socket_path);
