@@ -318,15 +318,30 @@ impl ProcessRunner {
         })?;
 
         if !status.success() {
-            return Err(CollaborationError::new(
-                CollaborationErrorKind::ProviderRejected,
-                if stderr.trim().is_empty() {
-                    format!("provider exited with status {status}")
-                } else {
-                    stderr.trim().to_string()
-                },
-                true,
-            ));
+            let stdout_trim = stdout.trim();
+            let stderr_trim = stderr.trim();
+            let detail = if !stdout_trim.is_empty() {
+                stdout_trim
+            } else if !stderr_trim.is_empty() {
+                stderr_trim
+            } else {
+                ""
+            };
+            let no_change = detail.contains("no document changes")
+                || detail.contains("degrade_code=1011");
+            let message = if no_change {
+                "str_replace produced no document changes. Fetch the current document and use an exact existing substring as pattern. Do not treat this as Feishu being unavailable.".to_string()
+            } else if detail.is_empty() {
+                format!("provider exited with status {status}")
+            } else {
+                detail.chars().take(1200).collect()
+            };
+            let kind = if no_change {
+                CollaborationErrorKind::InvalidArgument
+            } else {
+                CollaborationErrorKind::ProviderRejected
+            };
+            return Err(CollaborationError::new(kind, message, true));
         }
 
         Ok(ProcessOutput {

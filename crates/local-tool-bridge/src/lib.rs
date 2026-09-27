@@ -1424,7 +1424,14 @@ async fn handle_feishu_call(
                 collaboration_adapter::CollaborationErrorKind::PermissionDenied => {
                     "Feishu permission was denied".into()
                 }
-                _ => "Feishu provider call failed".into(),
+                _ => {
+                    let raw = error.message.trim();
+                    if raw.is_empty() {
+                        "Feishu provider call failed".into()
+                    } else {
+                        raw.chars().take(1200).collect()
+                    }
+                }
             };
             json_response(
                 StatusCode::OK,

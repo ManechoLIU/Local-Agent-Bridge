@@ -93,8 +93,25 @@ def run_cli(argv: List[str], timeout: int = 30) -> Dict[str, Any]:
         payload = json.loads(raw)
     except json.JSONDecodeError:
         payload = {"raw": raw[:4000]}
+    ok = proc.returncode == 0
+    if isinstance(payload, dict) and payload.get("ok") is False:
+        ok = False
+    warnings = []
+    if isinstance(payload, dict):
+        raw_warnings = payload.get("data", {})
+        if isinstance(raw_warnings, dict):
+            warnings = raw_warnings.get("warnings") or []
+        if not warnings:
+            warnings = payload.get("warnings") or []
+    warning_text = " ".join(str(item) for item in warnings) if isinstance(warnings, list) else str(warnings)
+    if "no document changes" in warning_text or "degrade_code=1011" in warning_text:
+        payload = {
+            "ok": False,
+            "error": "str_replace produced no document changes. Fetch the current document and use an exact existing substring as pattern. Do not treat this as Feishu being unavailable.",
+            "warnings": warnings,
+        }
     return {
-        "ok": proc.returncode == 0,
+        "ok": ok,
         "exitCode": proc.returncode,
         "configDir": env.get("LARKSUITE_CLI_CONFIG_DIR"),
         "result": redact(payload),
