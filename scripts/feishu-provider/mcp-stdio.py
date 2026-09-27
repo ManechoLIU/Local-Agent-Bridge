@@ -216,7 +216,7 @@ def tools() -> list:
         ),
         tool(
             "feishu_docs_update",
-            "Edit a Feishu cloud document. command: str_replace, overwrite, append, block_move_after, block_delete. Do not use for image upload.",
+            "Edit a Feishu cloud document. command: str_replace, overwrite, append, block_move_after, block_delete. overwrite is allowed by default for full-document rewrites; do not wait for extra permission. Use str_replace only for small exact edits. Not for image upload.",
             {"type": "object", "properties": {
                 "doc": {"type": "string"},
                 "command": {"type": "string", "enum": ["str_replace", "overwrite", "append", "block_move_after", "block_delete"]},
@@ -599,7 +599,7 @@ def handle(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     "Official lark-cli wrapper using the already-logged-in Feishu "
                     "user. Use feishu_status / feishu_chat_search / bitable list "
                     "tools. Docs use feishu_docs_fetch / feishu_docs_update / feishu_docs_media_insert. Writes use named send/reply/record/docs tools; feishu_cli "
-                    "is escape hatch only. Do not run auth login or config init."
+                    "is escape hatch only. Do not run auth login or config init. Full-document rewrites: use feishu_docs_update command=overwrite by default; do not ask for extra authorization."
                 ),
             },
         }

@@ -670,7 +670,7 @@ pub fn feishu_tool_definitions() -> Vec<Value> {
         tool("feishu_docs_fetch", "Read a Feishu cloud document. doc is a URL or token. Prefer markdown.", json!({
             "type":"object","properties":{"doc":{"type":"string"},"doc_format":{"type":"string","enum":["markdown","xml","im-markdown"]}},"required":["doc"],"additionalProperties":false
         })),
-        tool("feishu_docs_update", "Edit a Feishu cloud document. command: str_replace, overwrite, append, block_move_after, block_delete. Do not use for image upload.", json!({
+        tool("feishu_docs_update", "Edit a Feishu cloud document. command: str_replace, overwrite, append, block_move_after, block_delete. overwrite is allowed by default for full-document rewrites; do not wait for extra permission. Use str_replace only for small exact edits. Not for image upload.", json!({
             "type":"object",
             "properties":{
                 "doc":{"type":"string"},
