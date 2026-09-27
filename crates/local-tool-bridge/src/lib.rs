@@ -596,6 +596,9 @@ impl ToolPolicy {
             .insert("write", Capability::FileWrite)
             .insert("edit", Capability::FileWrite)
             .insert("delete", Capability::FileWrite)
+            .insert("authorize_file_root", Capability::FileWrite)
+            .insert("list_authorized_file_roots", Capability::FileRead)
+            .insert("revoke_file_root", Capability::FileWrite)
             .insert("run_command", Capability::Shell)
             .insert("start_command", Capability::ProcessJobs)
             .insert("poll_command", Capability::ProcessJobs)
@@ -1166,6 +1169,20 @@ async fn handle_mcp(
         return handle_feishu_call(&state, &parsed, tool_name).await;
     }
 
+    if method == "tools/call" && extra_files::is_authorization_tool(tool_name) {
+        let arguments = parsed
+            .get("params")
+            .and_then(|value| value.get("arguments"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        return handle_authorization_call(
+            state.inner.extra_file_production,
+            parsed.get("id").cloned().unwrap_or(serde_json::Value::Null),
+            tool_name,
+            &arguments,
+        );
+    }
+
     if method == "tools/call" && extra_files::is_file_tool(tool_name) {
         let extra_roots = state.extra_file_roots_now();
         if !extra_roots.is_empty() {
@@ -1243,7 +1260,9 @@ async fn handle_mcp(
             }
         }
         Ok(response) if method == "initialize"
-            && (state.inner.collaboration.is_some() || !state.extra_file_roots_now().is_empty()) =>
+            && (state.inner.collaboration.is_some()
+                || state.inner.extra_file_production
+                || !state.extra_file_roots_now().is_empty()) =>
         {
             match decorate_initialize_instructions(response, &state.extra_file_roots_now()).await {
                 Ok(response) => response,
@@ -3103,6 +3122,29 @@ fn map_backend_response_id(
 }
 
 
+fn handle_authorization_call(
+    production: bool,
+    id: serde_json::Value,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) -> Response<Body> {
+    match extra_files::handle_authorization_call(tool_name, arguments, production) {
+        Ok(data) => json_response(
+            StatusCode::OK,
+            extra_files::jsonrpc_result(id, tool_name, data, false),
+        ),
+        Err(error) => json_response(
+            StatusCode::OK,
+            extra_files::jsonrpc_result(
+                id,
+                tool_name,
+                serde_json::json!({"toolName": tool_name, "message": error}),
+                true,
+            ),
+        ),
+    }
+}
+
 fn handle_extra_file_call(
     extra_roots: Vec<PathBuf>,
     id: serde_json::Value,
@@ -3551,6 +3593,22 @@ async fn forward_merged_tools_list(
                 if !names.insert(name.to_string()) {
                     return Err(format!("duplicate merged tool name: {name}"));
                 }
+                tools.push(tool);
+            }
+        }
+    }
+    {
+        let mut names = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        for tool in extra_files::authorization_tool_definitions() {
+            let name = tool
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "authorization tool definition has no name".to_string())?;
+            if names.insert(name.to_string()) {
                 tools.push(tool);
             }
         }

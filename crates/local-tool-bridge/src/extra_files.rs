@@ -1,6 +1,8 @@
 use serde_json::{Value, json};
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -137,17 +139,175 @@ pub fn should_handle(tool_name: &str, arguments: &Value, extra_roots: &[PathBuf]
 }
 
 pub fn client_instructions(extra_roots: &[PathBuf]) -> Option<String> {
-    if extra_roots.is_empty() {
-        return None;
-    }
     let roots = extra_roots
         .iter()
         .map(|root| root.display().to_string())
         .collect::<Vec<_>>()
         .join(", ");
+    let current = if roots.is_empty() {
+        "none yet".to_string()
+    } else {
+        roots
+    };
     Some(format!(
-        "Extra project file access is enabled for: {roots}. Use read/write/edit/delete/search with those absolute paths. Do not say the path is outside the workspace. run_command remains limited to the Local Agent Bridge workspace."
+        "If the user authorizes a local directory, call authorize_file_root with that absolute path immediately. Do not ask Codex and do not wait for a second confirmation. Then use read/write/edit/delete/search on that path. Currently authorized: {current}. run_command remains limited to the Local Agent Bridge workspace."
     ))
+}
+
+pub fn is_authorization_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "authorize_file_root" | "list_authorized_file_roots" | "revoke_file_root"
+    )
+}
+
+pub fn authorization_tool_definitions() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "authorize_file_root",
+            "description": "Grant ChatGPT read/write access to one local directory the user just authorized in this chat. path must be an absolute directory. Call this immediately when the user says to authorize a folder. Do not ask Codex.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute directory the user authorized"}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "list_authorized_file_roots",
+            "description": "List local directories currently authorized for read/write outside the default workspace.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "revoke_file_root",
+            "description": "Remove one previously authorized local directory. path must be an absolute directory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }),
+    ]
+}
+
+pub fn handle_authorization_call(
+    tool_name: &str,
+    arguments: &Value,
+    production: bool,
+) -> Result<Value, String> {
+    match tool_name {
+        "list_authorized_file_roots" => {
+            let roots = load_authorized_roots_file(production).unwrap_or_default();
+            Ok(json!({
+                "toolName": "list_authorized_file_roots",
+                "roots": roots.iter().map(|root| root.display().to_string()).collect::<Vec<_>>(),
+                "message": format!("authorized {} director{}", roots.len(), if roots.len() == 1 { "y" } else { "ies" }),
+            }))
+        }
+        "authorize_file_root" => authorize_root(required_string(arguments, "path")?, production),
+        "revoke_file_root" => revoke_root(required_string(arguments, "path")?, production),
+        _ => Err(format!("unsupported authorization tool: {tool_name}")),
+    }
+}
+
+fn authorize_root(path: String, production: bool) -> Result<Value, String> {
+    let root = validate_extra_file_root(Path::new(&path), production)?;
+    let file = authorized_roots_file();
+    let mut roots = load_authorized_roots_from(&file, production).unwrap_or_default();
+    let already = roots.iter().any(|existing| existing == &root);
+    if !already {
+        if roots.len() >= 16 {
+            return Err("authorized file roots are limited to 16 directories".into());
+        }
+        roots.push(root.clone());
+        write_authorized_roots_file(&file, &roots)?;
+    }
+    Ok(json!({
+        "toolName": "authorize_file_root",
+        "authorized": true,
+        "already": already,
+        "path": root.display().to_string(),
+        "roots": roots.iter().map(|item| item.display().to_string()).collect::<Vec<_>>(),
+        "message": if already {
+            format!("already authorized {}", root.display())
+        } else {
+            format!("authorized {}", root.display())
+        },
+    }))
+}
+
+fn revoke_root(path: String, production: bool) -> Result<Value, String> {
+    let root = PathBuf::from(&path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&path));
+    let file = authorized_roots_file();
+    let mut roots = load_authorized_roots_from(&file, production).unwrap_or_default();
+    let before = roots.len();
+    roots.retain(|existing| existing != &root);
+    if roots.len() == before {
+        return Err(format!("not an authorized file root: {}", root.display()));
+    }
+    write_authorized_roots_file(&file, &roots)?;
+    Ok(json!({
+        "toolName": "revoke_file_root",
+        "revoked": true,
+        "path": root.display().to_string(),
+        "roots": roots.iter().map(|item| item.display().to_string()).collect::<Vec<_>>(),
+        "message": format!("revoked {}", root.display()),
+    }))
+}
+
+fn write_authorized_roots_file(path: &Path, roots: &[PathBuf]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        let mut perms = fs::metadata(parent)
+            .map(|meta| meta.permissions())
+            .unwrap_or_else(|_| fs::Permissions::from_mode(0o700));
+        perms.set_mode(0o700);
+        let _ = fs::set_permissions(parent, perms);
+    }
+    if path.exists() {
+        let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "authorized file roots must be a regular file: {}",
+                path.display()
+            ));
+        }
+    }
+    let mut body = String::from(
+        "# Directories ChatGPT/Local Agent Bridge may read and write.
+# One absolute path per line.
+",
+    );
+    for root in roots {
+        body.push_str(&root.display().to_string());
+        body.push('\n');
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|error| error.to_string())?;
+        file.write_all(body.as_bytes()).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+    }
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600)).map_err(|error| error.to_string())?;
+    fs::rename(&tmp, path).map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 pub fn decorate_tool_descriptions(tools: &mut [Value], extra_roots: &[PathBuf]) {
@@ -692,5 +852,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), "alpha gamma alpha");
+    }
+
+        #[test]
+    fn authorize_root_persists_to_allowlist_file() {
+        let root = temp_root("authorize");
+        let file = std::env::temp_dir().join("lab-extra-files").join("authorize-file");
+        let _ = fs::remove_file(&file);
+        let canonical = validate_extra_file_root(&root, false).unwrap();
+        write_authorized_roots_file(&file, &[canonical.clone()]).unwrap();
+        let loaded = load_authorized_roots_from(&file, false).unwrap();
+        assert!(loaded.iter().any(|item| item == &canonical));
     }
 }
