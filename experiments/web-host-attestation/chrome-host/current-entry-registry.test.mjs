@@ -46,6 +46,24 @@ test("registry recognizes only ChatGPT generation requests", () => {
   assert.equal(isChatGptGenerationRequest(req("r3", 7, "https://chatgpt.com/backend-api/conversations", "GET")), false);
   assert.equal(isChatGptGenerationRequest(req("r4", -1)), false);
   assert.equal(isChatGptGenerationRequest(req("r5", 7, "https://example.com/backend-api/f/conversation")), false);
+  assert.equal(isChatGptGenerationRequest(req("r6", 7, "https://chatgpt.com/backend-api/f/conversation/prepare")), false);
+  assert.equal(isChatGptGenerationRequest(req("r7", 7, "https://chatgpt.com/backend-api/conversation/init")), false);
+  assert.equal(isChatGptGenerationRequest({
+    ...req("r8", -1, "https://chatgpt.com/backend-api/f/conversation/prepare"),
+    initiator: "https://chatgpt.com"
+  }), false);
+  assert.equal(isChatGptGenerationRequest({
+    ...req("r9", -1),
+    initiator: "https://chatgpt.com"
+  }), true);
+  assert.equal(isChatGptGenerationRequest({
+    ...req("r10", -1),
+    initiator: "https://example.com"
+  }), false);
+  assert.equal(isChatGptGenerationRequest({
+    ...req("r11", -1),
+    originUrl: "https://chatgpt.com"
+  }), true);
 });
 
 test("unique active generation resolves exact tab and opaque generation anchor", async () => {
@@ -359,4 +377,100 @@ test("current-entry target selection rejects missing or ambiguous target", () =>
     ], { tab_id: 9 }),
     /AMBIGUOUS/
   );
+});
+
+const CONVERSATION = "6ab93a76-4e6c-83e9-95ae-71d28091ef08";
+const OTHER_CONVERSATION = "6a9e4158-cc8c-83ea-9763-05a7fd51f597";
+
+function chatgptPage(tabId, conversation = CONVERSATION) {
+  return {
+    id: "page-" + tabId,
+    tabId,
+    type: "page",
+    url: "https://chatgpt.com/g/g-p-6ab93a6fa99c8191b561d11798d0bf82-local-agent-bridge/c/" + conversation
+  };
+}
+
+function swGeneration(overrides = {}) {
+  return {
+    requestId: "sw-r1",
+    tabId: -1,
+    method: "POST",
+    url: "https://chatgpt.com/backend-api/f/conversation",
+    initiator: "https://chatgpt.com",
+    requestHeaders: [{
+      name: "Referer",
+      value: "https://chatgpt.com/g/g-p-6ab93a6fa99c8191b561d11798d0bf82-local-agent-bridge/c/" + CONVERSATION
+    }],
+    ...overrides
+  };
+}
+
+test("service worker generation with chatgpt initiator and referer records the unique tab", async () => {
+  const registry = createRegistry({
+    listChatGptPages: async () => [chatgptPage(11)]
+  });
+  assert.equal(await registry.observeStart(swGeneration()), true);
+  assert.equal((await registry.resolveCurrent()).tab_id, 11);
+});
+
+test("service worker generation can observeStart before the streaming request finishes", async () => {
+  const registry = createRegistry({
+    listChatGptPages: async () => [chatgptPage(11)]
+  });
+  assert.equal(await registry.observeStart(swGeneration()), true);
+  assert.equal((await registry.resolveCurrent())?.tab_id, 11);
+  assert.equal(await registry.observeFinish({ requestId: "sw-r1", tabId: -1 }), true);
+  assert.equal(await registry.resolveCurrent(), null);
+});
+
+test("service worker generation without referer does not guess a tab", async () => {
+  const registry = createRegistry({
+    listChatGptPages: async () => [chatgptPage(11), chatgptPage(12, OTHER_CONVERSATION)]
+  });
+  assert.equal(await registry.observeStart(swGeneration({ requestHeaders: [] })), false);
+  assert.equal(await registry.observeStart({
+    ...swGeneration({ requestHeaders: [] }),
+    conversation_id: CONVERSATION
+  }), false);
+  assert.equal(await registry.resolveCurrent(), null);
+});
+
+test("service worker generation binds the referer conversation among other chatgpt tabs", async () => {
+  const registry = createRegistry({
+    listChatGptPages: async () => [
+      chatgptPage(8, OTHER_CONVERSATION),
+      chatgptPage(11),
+      { id: "sw", tabId: -1, type: "service_worker", url: "https://chatgpt.com/sw.js" }
+    ]
+  });
+  assert.equal(await registry.observeStart(swGeneration()), true);
+  assert.equal((await registry.resolveCurrent()).tab_id, 11);
+});
+
+test("service worker generation fails closed when multiple tabs share the same conversation id", async () => {
+  const registry = createRegistry({
+    listChatGptPages: async () => [chatgptPage(11), chatgptPage(14)]
+  });
+  await assert.rejects(
+    registry.observeStart(swGeneration()),
+    /HOST_CURRENT_ENTRY_AMBIGUOUS/
+  );
+  assert.equal(await registry.resolveCurrent(), null);
+});
+
+test("service worker generation with conflicting conversation evidence fails closed", async () => {
+  const registry = createRegistry({
+    listChatGptPages: async () => [chatgptPage(11), chatgptPage(12, OTHER_CONVERSATION)]
+  });
+  await assert.rejects(registry.observeStart(swGeneration({
+    documentUrl: "https://chatgpt.com/c/" + OTHER_CONVERSATION
+  })), /AMBIGUOUS/);
+  await assert.rejects(registry.observeStart(swGeneration({
+    requestHeaders: [{
+      name: "Referer",
+      value: "https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    }]
+  })), /UNAVAILABLE/);
+  assert.equal(await registry.resolveCurrent(), null);
 });

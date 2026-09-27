@@ -16,12 +16,14 @@ function withPage(t, options = {}) {
     dispatchEvent() {}
   };
   const sendRect = options.sendRect || { left: 100, top: 200, width: 40, height: 20 };
+  const sendTestId = options.sendTestId !== false;
+  const stopTestId = options.stopTestId !== false;
   const sendButton = options.sendButton === false ? null : {
     disabled: Boolean(options.sendDisabled),
     getAttribute(name) {
-      if (name === "data-testid") return "send-button";
+      if (name === "data-testid") return sendTestId ? "send-button" : null;
       if (name === "aria-disabled") return options.sendAriaDisabled ? "true" : null;
-      if (name === "aria-label") return "Send";
+      if (name === "aria-label") return options.sendAriaLabel || "Send";
       return null;
     },
     getBoundingClientRect() { return { ...sendRect }; }
@@ -29,8 +31,8 @@ function withPage(t, options = {}) {
   const stopButton = options.controllerActive ? {
     disabled: false,
     getAttribute(name) {
-      if (name === "data-testid") return "stop-button";
-      if (name === "aria-label") return "Stop answering";
+      if (name === "data-testid") return stopTestId ? "stop-button" : null;
+      if (name === "aria-label") return options.stopAriaLabel || "Stop answering";
       return null;
     }
   } : null;
@@ -57,8 +59,8 @@ function withPage(t, options = {}) {
       if (selector === '#prompt-textarea[contenteditable="true"]') {
         return options.composer === false ? null : composer;
       }
-      if (selector === 'button[data-testid="send-button"]') return sendButton;
-      if (selector === 'button[data-testid="stop-button"]') return stopButton;
+      if (selector === 'button[data-testid="send-button"]') return sendTestId ? sendButton : null;
+      if (selector === 'button[data-testid="stop-button"]') return stopTestId ? stopButton : null;
       return null;
     },
     querySelectorAll(selector) {
@@ -153,6 +155,31 @@ test("prepare records baseline and initial send snapshot without dispatch", asyn
   assert.equal(page.composer.innerText, "resume");
 });
 
+test("resolve_send matches Chinese aria-label 发送提示词", async t => {
+  withPage(t, {
+    initialText: "resume",
+    sendTestId: false,
+    sendAriaLabel: "发送提示词"
+  });
+  const resolved = await op("resolve_send", { payload: "resume" });
+  assert.equal(resolved.resolved, true);
+  assert.equal(resolved.send_control.selector_kind, "aria_send");
+});
+
+test("prepare detects Chinese aria-label 停止回答 as controller_active", async t => {
+  const page = withPage(t, {
+    initialText: "resume",
+    controllerActive: true,
+    stopTestId: false,
+    stopAriaLabel: "停止回答"
+  });
+  const result = await op("prepare", { payload: "resume" });
+  assert.equal(result.status, "controller_active");
+  assert.equal(result.prepared, false);
+  assert.equal(result.retryable, true);
+  assert.equal(page.composer.innerText, "resume");
+});
+
 test("resolve_send re-resolves current coordinates and rejects changed composer", async t => {
   const page = withPage(t, { initialText: "resume", sendRect: { left: 300, top: 400, width: 20, height: 10 } });
   const resolved = await op("resolve_send", { payload: "resume" });
@@ -189,6 +216,31 @@ test("confirm requires exact new user message instead of composer-empty alone", 
   assert.equal(page.userMessages.length, 2);
 });
 
+test("confirm sees exact last visible user bubble when ChatGPT virtualizes history below baseline", async t => {
+  const payload = "LAB-HOST-01 live reentry CONFIRMED probe. Do not treat as user chat. Reply with one word: ACK.";
+  withPage(t, { initialText: "", userMessages: ["older visible", payload] });
+  const confirmed = await op("confirm", {
+    payload,
+    baseline_user_message_count: 50,
+    timeout_ms: 250
+  });
+  assert.equal(confirmed.submit_confirmed, true);
+  assert.equal(confirmed.exact_new_user_message, true);
+  assert.equal(confirmed.status, "submit_confirmed");
+});
+
+test("confirm does not treat an earlier identical visible bubble as the new submit", async t => {
+  withPage(t, { initialText: "", userMessages: ["resume", "later user turn"] });
+  const unknown = await op("confirm", {
+    payload: "resume",
+    baseline_user_message_count: 50,
+    timeout_ms: 250
+  });
+  assert.equal(unknown.submit_confirmed, false);
+  assert.equal(unknown.exact_new_user_message, false);
+  assert.equal(unknown.status, "result_unknown");
+});
+
 test("prepare_rollback authorizes only exact SHA-256-owned payload", async t => {
   const page = withPage(t, { initialText: "resume" });
   const digest = Buffer.from(await webcrypto.subtle.digest(
@@ -221,20 +273,36 @@ test("reconcile proves exact composer and user-message state from payload hash o
   assert.equal(page.composer.innerText, "resume");
 });
 
-test("reconcile ignores identical user messages that predate the submit baseline", async t => {
-  withPage(t, { initialText: "resume", userMessages: ["resume"] });
+test("reconcile ignores identical user messages that predate the last visible bubble", async t => {
+  withPage(t, { initialText: "resume", userMessages: ["resume", "later user turn"] });
   const digest = Buffer.from(await webcrypto.subtle.digest(
     "SHA-256",
     new TextEncoder().encode("resume")
   )).toString("hex");
   const result = await op("reconcile", {
     expected_payload_sha256: digest,
-    baseline_user_message_count: 1
+    baseline_user_message_count: 50
   });
   assert.equal(result.status, "observed");
   assert.equal(result.conversation_matches, true);
   assert.equal(result.composer_exact_payload, true);
   assert.equal(result.exact_user_message_present, false);
+});
+
+test("reconcile sees exact last visible user bubble when ChatGPT virtualizes history below baseline", async t => {
+  const payload = "LAB-HOST-01 live reentry CONFIRMED probe. Do not treat as user chat. Reply with one word: ACK.";
+  withPage(t, { initialText: "", userMessages: ["older visible", payload] });
+  const digest = Buffer.from(await webcrypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(payload)
+  )).toString("hex");
+  const result = await op("reconcile", {
+    expected_payload_sha256: digest,
+    baseline_user_message_count: 50
+  });
+  assert.equal(result.status, "observed");
+  assert.equal(result.conversation_matches, true);
+  assert.equal(result.exact_user_message_present, true);
 });
 
 test("reconcile missing or invalid baseline stays unresolved without manufacturing delivery evidence", async t => {

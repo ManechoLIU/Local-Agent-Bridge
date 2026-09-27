@@ -2,6 +2,7 @@ const GENERATION_PATHS = new Set([
   "/backend-api/f/conversation",
   "/backend-api/conversation"
 ]);
+const CONVERSATION_RE = /^[0-9a-f-]{20,80}$/i;
 const SESSION_RECORD_KEY = "lab_current_entry_registry_v1";
 const SESSION_RECORD_VERSION = 1;
 const MAX_REQUEST_ID_LENGTH = 256;
@@ -22,6 +23,82 @@ function pathFromUrl(value) {
 function validTabId(value) {
   const number = Number(value);
   return Number.isInteger(number) && number >= 0 ? number : null;
+}
+
+function isServiceWorkerTabId(value) {
+  return Number(value) === -1;
+}
+
+function requestHeader(details, name) {
+  const headers = details && Array.isArray(details.requestHeaders) ? details.requestHeaders : [];
+  const expected = String(name).toLowerCase();
+  for (const header of headers) {
+    if (String(header && header.name || "").toLowerCase() !== expected) continue;
+    const value = String(header && header.value || "").trim();
+    if (value) return value;
+  }
+  return null;
+}
+
+function isChatGptHttpsOrigin(value) {
+  try {
+    const url = new URL(String(value));
+    return url.protocol === "https:" && url.hostname === "chatgpt.com";
+  } catch {
+    return false;
+  }
+}
+
+function conversationIdFromChatgptUrl(value) {
+  try {
+    const url = new URL(String(value));
+    if (url.protocol !== "https:" || url.hostname !== "chatgpt.com") return null;
+    const parts = url.pathname.split("/").filter(Boolean);
+    const index = parts.lastIndexOf("c");
+    const conversation = index >= 0 ? parts[index + 1] : null;
+    return conversation && CONVERSATION_RE.test(conversation) ? conversation : null;
+  } catch {
+    return null;
+  }
+}
+
+function hasChatGptInitiator(details) {
+  return isChatGptHttpsOrigin(details && details.initiator)
+    || isChatGptHttpsOrigin(details && details.originUrl)
+    || isChatGptHttpsOrigin(requestHeader(details, "Origin"));
+}
+
+function generationConversationIds(details) {
+  const ids = new Set();
+  for (const value of [
+    details && details.referer,
+    details && details.documentUrl,
+    requestHeader(details, "Referer"),
+    details && details.url
+  ]) {
+    const conversationId = conversationIdFromChatgptUrl(value);
+    if (conversationId) ids.add(conversationId);
+  }
+  return ids;
+}
+
+function bindServiceWorkerGenerationTab(targets, conversationId) {
+  const tabIds = [];
+  const seen = new Set();
+  for (const target of Array.isArray(targets) ? targets : []) {
+    if (!target || target.type !== "page") continue;
+    const tabId = validTabId(target.tabId);
+    if (tabId == null) continue;
+    if (conversationIdFromChatgptUrl(target.url) !== conversationId) continue;
+    if (seen.has(tabId)) continue;
+    seen.add(tabId);
+    tabIds.push(tabId);
+  }
+  if (tabIds.length === 0) return null;
+  if (tabIds.length !== 1) {
+    throw new Error("HOST_CURRENT_ENTRY_AMBIGUOUS: service worker generation matches multiple ChatGPT tabs");
+  }
+  return tabIds[0];
 }
 
 async function generationAnchorSha256(requestIds) {
@@ -69,16 +146,17 @@ function storedRecord(value, now, futureSkewMs) {
 
 export function isChatGptGenerationRequest(details) {
   if (!details || String(details.method || "").toUpperCase() !== "POST") return false;
-  const tabId = validTabId(details.tabId);
-  if (tabId == null) return false;
-  return GENERATION_PATHS.has(pathFromUrl(details.url));
+  if (!GENERATION_PATHS.has(pathFromUrl(details.url))) return false;
+  if (validTabId(details.tabId) != null) return true;
+  return isServiceWorkerTabId(details.tabId) && hasChatGptInitiator(details);
 }
 
 export function createCurrentEntryRegistry({
   clock = Date.now,
   maxAgeMs = 30 * 60 * 1000,
   futureSkewMs = 5000,
-  sessionStore = globalThis.chrome?.storage?.session
+  sessionStore = globalThis.chrome?.storage?.session,
+  listChatGptPages
 } = {}) {
   if (!sessionStore || typeof sessionStore.get !== "function" || typeof sessionStore.set !== "function") {
     throw new Error("chrome.storage.session is required for current-entry registry");
@@ -147,6 +225,26 @@ export function createCurrentEntryRegistry({
     return task;
   }
 
+  async function resolveObservedTabId(details) {
+    const direct = validTabId(details && details.tabId);
+    if (direct != null) return direct;
+    if (!isServiceWorkerTabId(details && details.tabId)) return null;
+    const conversationIds = generationConversationIds(details);
+    if (conversationIds.size === 0) return null;
+    if (conversationIds.size !== 1) {
+      throw new Error("HOST_CURRENT_ENTRY_AMBIGUOUS: service worker generation conversation is ambiguous");
+    }
+    if (typeof listChatGptPages !== "function") {
+      throw new Error("HOST_CURRENT_ENTRY_UNAVAILABLE: service worker generation tab is unavailable");
+    }
+    const conversationId = [...conversationIds][0];
+    const tabId = bindServiceWorkerGenerationTab(await listChatGptPages(), conversationId);
+    if (tabId == null) {
+      throw new Error("HOST_CURRENT_ENTRY_UNAVAILABLE: service worker generation tab is unavailable");
+    }
+    return tabId;
+  }
+
   function prune(now) {
     let pruned = false;
     for (const [requestId, record] of active) {
@@ -195,9 +293,11 @@ export function createCurrentEntryRegistry({
           failure = new Error("HOST_CURRENT_ENTRY_UNAVAILABLE: request id exceeds maximum length");
           throw failure;
         }
+        const tabId = await resolveObservedTabId(details);
+        if (tabId == null) return false;
         const existing = active.get(requestId);
         if (existing) {
-          if (existing.tab_id === validTabId(details.tabId)) return true;
+          if (existing.tab_id === tabId) return true;
           failure = new Error("HOST_CURRENT_ENTRY_UNAVAILABLE: request id was observed in another tab");
           throw failure;
         }
@@ -207,7 +307,7 @@ export function createCurrentEntryRegistry({
         }
         active.set(requestId, Object.freeze({
           request_id: requestId,
-          tab_id: validTabId(details.tabId),
+          tab_id: tabId,
           started_at_ms: startedAtMs
         }));
         await persist();

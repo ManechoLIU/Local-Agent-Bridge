@@ -66,6 +66,30 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
     return document.querySelectorAll('[data-message-author-role="user"]').length;
   }
 
+  function visibleUserMessageNodes() {
+    return Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+  }
+
+  function normalizedUserMessageText(node) {
+    if (!node) return "";
+    const raw = typeof node.innerText === "string"
+      ? node.innerText
+      : String(node.textContent || "");
+    return normalizedText(raw);
+  }
+
+  async function exactVisibleUserMessageExists(isMatch, baselineCount) {
+    const nodes = visibleUserMessageNodes();
+    if (nodes.length === 0) return false;
+    if (await isMatch(nodes[nodes.length - 1])) return true;
+    const start = Number.isSafeInteger(baselineCount) && baselineCount >= 0 ? baselineCount : 0;
+    if (nodes.length <= start) return false;
+    for (let index = start; index < nodes.length; index += 1) {
+      if (await isMatch(nodes[index])) return true;
+    }
+    return false;
+  }
+
   function responseIsActive() {
     const stop = document.querySelector('button[data-testid="stop-button"]');
     if (stop) return true;
@@ -73,7 +97,7 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
       const label = String(node.getAttribute && node.getAttribute("aria-label") || "")
         .trim()
         .toLowerCase();
-      return label === "stop answering";
+      return label === "stop answering" || label === "停止回答";
     });
     return Boolean(labelled);
   }
@@ -90,7 +114,7 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
           const label = String(node.getAttribute && node.getAttribute("aria-label") || "")
             .trim()
             .toLowerCase();
-          return label === "send" || label === "send message";
+          return label === "send" || label === "send message" || label === "发送提示词" || label === "发送";
         }) || null
       }
     ];
@@ -315,22 +339,17 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
     const payload = String(input.payload == null ? "" : input.payload);
     const baseline = Number(input.baseline_user_message_count);
     const baselineCount = Number.isSafeInteger(baseline) && baseline >= 0 ? baseline : 0;
-    const timeoutMs = Number(input.timeout_ms == null ? 4000 : input.timeout_ms);
+    const timeoutMs = Number(input.timeout_ms == null ? 10000 : input.timeout_ms);
     const boundedTimeout = Number.isFinite(timeoutMs) && timeoutMs >= 250 && timeoutMs <= 10000
       ? Math.floor(timeoutMs)
       : 4000;
     const deadline = Date.now() + boundedTimeout;
 
-    function exactNewPayloadMessageExists() {
-      const nodes = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
-      for (let index = baselineCount; index < nodes.length; index += 1) {
-        const node = nodes[index];
-        const raw = typeof node.innerText === "string"
-          ? node.innerText
-          : String(node.textContent || "");
-        if (normalizedText(raw) === payload.trim()) return true;
-      }
-      return false;
+    async function exactNewPayloadMessageExists() {
+      const expected = payload.trim();
+      return exactVisibleUserMessageExists(function (node) {
+        return normalizedUserMessageText(node) === expected;
+      }, baselineCount);
     }
 
     while (Date.now() <= deadline) {
@@ -343,7 +362,7 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
       if (routeMatches) {
         const composer = document.querySelector('#prompt-textarea[contenteditable="true"]');
         const composerEmpty = normalizedComposerText(composer) === "";
-        const messageExists = exactNewPayloadMessageExists();
+        const messageExists = await exactNewPayloadMessageExists();
         if (messageExists) {
           return {
             dispatch_attempted: true,
@@ -462,16 +481,9 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
     }
 
     async function exactPayloadMessageExists() {
-      const nodes = Array.from(document.querySelectorAll('[data-message-author-role="user"]'))
-        .slice(baselineUserMessageCount);
-      for (let index = 0; index < nodes.length; index += 1) {
-        const node = nodes[index];
-        const raw = typeof node.innerText === "string"
-          ? node.innerText
-          : String(node.textContent || "");
-        if (await sha256Hex(normalizedText(raw)) === expectedPayloadSha256) return true;
-      }
-      return false;
+      return exactVisibleUserMessageExists(async function (node) {
+        return await sha256Hex(normalizedUserMessageText(node)) === expectedPayloadSha256;
+      }, baselineUserMessageCount);
     }
 
     const exactUserMessage = await exactPayloadMessageExists();

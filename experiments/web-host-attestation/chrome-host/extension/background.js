@@ -22,7 +22,10 @@ const CURRENT_ENTRY_REGISTRY_PROTOCOL_VERSION = 2;
 const submitJournal = createChromeSubmitJournal(chrome);
 const submitTransactions = createSubmitTransactionQueue();
 const currentEntryRegistry = createCurrentEntryRegistry({
-  sessionStore: chrome.storage.session
+  sessionStore: chrome.storage.session,
+  listChatGptPages: function () {
+    return chrome.debugger.getTargets();
+  }
 });
 
 const currentEntryRequestFilter = {
@@ -55,6 +58,9 @@ function observeCurrentEntryMutation(operation, details) {
 chrome.webRequest.onBeforeRequest.addListener(function (details) {
   observeCurrentEntryMutation("observeStart", details);
 }, currentEntryRequestFilter);
+chrome.webRequest.onBeforeSendHeaders.addListener(function (details) {
+  observeCurrentEntryMutation("observeStart", details);
+}, currentEntryRequestFilter, ["requestHeaders", "extraHeaders"]);
 chrome.webRequest.onCompleted.addListener(function (details) {
   observeCurrentEntryMutation("observeFinish", details);
 }, currentEntryRequestFilter);

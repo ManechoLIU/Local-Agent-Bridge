@@ -41,6 +41,7 @@ function storageArea(values, failure = null) {
 function chromeFixture(options = {}) {
   const listeners = {
     before: event(),
+    sendHeaders: event(),
     completed: event(),
     errored: event(),
     message: event(),
@@ -66,6 +67,7 @@ function chromeFixture(options = {}) {
     chrome: {
       webRequest: {
         onBeforeRequest: listeners.before,
+        onBeforeSendHeaders: listeners.sendHeaders,
         onCompleted: listeners.completed,
         onErrorOccurred: listeners.errored
       },
@@ -248,6 +250,38 @@ test("background completion and error events erase session entries before a work
       assert.match(reply.error, /HOST_CURRENT_ENTRY_UNAVAILABLE: no active ChatGPT generation/);
     });
   }
+});
+
+test("background observes a service worker generation from Referer headers", async function (t) {
+  const fixture = chromeFixture();
+  await loadBackground(t, fixture);
+  fixture.listeners.before.emit({
+    requestId: "generation-sw-1",
+    tabId: -1,
+    method: "POST",
+    url: "https://chatgpt.com/backend-api/f/conversation",
+    initiator: "https://chatgpt.com"
+  });
+  await flushAsyncWork();
+  fixture.listeners.message.emit({ request_id: "discover-missing", op: "discover_current_entry" });
+  const missing = await replyFor(fixture.port, "discover-missing");
+  assert.equal(missing.ok, false);
+  assert.match(missing.error, /HOST_CURRENT_ENTRY_UNAVAILABLE: no active ChatGPT generation/);
+
+  fixture.listeners.sendHeaders.emit({
+    requestId: "generation-sw-1",
+    tabId: -1,
+    method: "POST",
+    url: "https://chatgpt.com/backend-api/f/conversation",
+    initiator: "https://chatgpt.com",
+    requestHeaders: [{ name: "Referer", value: "https://chatgpt.com/c/" + CONVERSATION }]
+  });
+  await flushAsyncWork();
+  fixture.listeners.message.emit({ request_id: "discover-sw", op: "discover_current_entry" });
+  const reply = await replyFor(fixture.port, "discover-sw");
+  assert.equal(reply.ok, true);
+  assert.equal(reply.result.current_entry_context.conversation_id, CONVERSATION);
+  assert.equal(reply.result.current_entry_context.browser_target_id, "browser-target-7");
 });
 
 test("background reports rejected current-entry mutations without an unhandled rejection", async function (t) {
