@@ -116,6 +116,7 @@ pub fn is_file_tool(name: &str) -> bool {
     matches!(name, "read" | "search" | "write" | "edit" | "delete")
 }
 
+#[allow(dead_code)]
 pub fn chatgpt_project_root(path: &Path) -> Option<PathBuf> {
     let prefix = Path::new(CHATGPT_PROJECTS);
     let rest = path.strip_prefix(prefix).ok()?;
@@ -127,11 +128,34 @@ pub fn chatgpt_project_root(path: &Path) -> Option<PathBuf> {
     Some(root)
 }
 
+pub fn directory_to_authorize(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    if path.is_dir() {
+        return Some(path.to_path_buf());
+    }
+    if path.is_file() {
+        return path.parent().map(Path::to_path_buf);
+    }
+    if path.extension().is_some() {
+        return path.parent().map(Path::to_path_buf);
+    }
+    Some(path.to_path_buf())
+}
+
 pub fn requested_tool_paths(tool_name: &str, arguments: &Value) -> Vec<String> {
     match tool_name {
         "read" => requested_paths(arguments),
         "search" | "write" | "edit" | "delete" => arguments
             .get("path")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .into_iter()
+            .collect(),
+        "run_command" | "start_command" => arguments
+            .get("cwd")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .map(str::to_string)
@@ -147,8 +171,7 @@ pub fn ensure_authorized_from_arguments(
     production: bool,
 ) {
     for path in requested_tool_paths(tool_name, arguments) {
-        let candidate = PathBuf::from(&path);
-        let Some(root) = chatgpt_project_root(&candidate) else {
+        let Some(root) = directory_to_authorize(Path::new(&path)) else {
             continue;
         };
         let _ = authorize_root(root.display().to_string(), production);
@@ -189,7 +212,7 @@ pub fn client_instructions(extra_roots: &[PathBuf]) -> Option<String> {
         roots
     };
     Some(format!(
-        "If the user authorizes a local directory, call authorize_file_root with that absolute path immediately. Do not ask Codex and do not wait for a second confirmation. Then use read/write/edit/delete/search on that path. Currently authorized: {current}. run_command remains limited to the Local Agent Bridge workspace."
+        "If the user names or authorizes any local directory, call authorize_file_root with that absolute path immediately. Any folder under the user home is eligible except /, home, Documents, Library, and other too-broad roots. Do not ask Codex. Then use read/write/edit/delete/search, and run_command with cwd set to that directory. Currently authorized: {current}."
     ))
 }
 
@@ -204,7 +227,7 @@ pub fn authorization_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "authorize_file_root",
-            "description": "Grant ChatGPT read/write access to one local directory the user just authorized in this chat. path must be an absolute directory. Call this immediately when the user says to authorize a folder. Do not ask Codex.",
+            "description": "Grant ChatGPT read/write access to any local directory the user just authorized in this chat. Not limited to Documents/ChatGPT. path must be an absolute directory under the user home, except /, home, Documents, Library, and other too-broad roots. Call this immediately when the user names a folder. Do not ask Codex.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -922,5 +945,14 @@ mod tests {
             PathBuf::from("/Users/echoman/Documents/ChatGPT/InvestRadar")
         );
         assert!(chatgpt_project_root(Path::new(CHATGPT_PROJECTS)).is_none());
+    }
+
+    #[test]
+    fn directory_to_authorize_accepts_any_absolute_folder() {
+        let root = temp_root("any-dir");
+        assert_eq!(directory_to_authorize(&root).unwrap(), root);
+        let file = root.join("note.txt");
+        fs::write(&file, "x").unwrap();
+        assert_eq!(directory_to_authorize(&file).unwrap(), root);
     }
 }

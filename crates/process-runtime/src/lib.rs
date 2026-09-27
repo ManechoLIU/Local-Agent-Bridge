@@ -137,7 +137,7 @@ impl ProcessSandboxPolicy {
             prepare_private_dir(&dir, "runtime subdirectory")?;
         }
 
-        let profile = build_profile(&workspace, &scratch, &cache, &trusted)?;
+        let profile = build_profile(&workspace, &scratch, &cache, &trusted, &[])?;
         Ok(Self {
             workspace,
             scratch,
@@ -183,7 +183,15 @@ impl ProcessSandboxPolicy {
             ));
         }
 
-        let cwd = resolve_cwd(&self.workspace, request.cwd.as_deref())?;
+        let extra_roots = load_authorized_cwd_roots();
+        let cwd = resolve_cwd(&self.workspace, &extra_roots, request.cwd.as_deref())?;
+        let profile = build_profile(
+            &self.workspace,
+            &self.scratch,
+            &self.cache,
+            &self.trusted_toolchain_roots,
+            &extra_roots,
+        )?;
         let mut env = BTreeMap::new();
         env.insert("HOME".into(), self.scratch.display().to_string());
         env.insert(
@@ -204,7 +212,7 @@ impl ProcessSandboxPolicy {
 
         let args = vec![
             "-p".into(),
-            self.profile.clone(),
+            profile,
             "/bin/sh".into(),
             "-c".into(),
             request.command,
@@ -751,7 +759,34 @@ fn reject_root_overlap(left: &Path, right: &Path, label: &str) -> Result<(), Str
     Ok(())
 }
 
-fn resolve_cwd(workspace: &Path, raw: Option<&str>) -> Result<PathBuf, String> {
+fn load_authorized_cwd_roots() -> Vec<PathBuf> {
+    let Ok(path) = std::env::var("PROCESS_RUNTIME_AUTHORIZED_ROOTS_FILE") else {
+        return Vec::new();
+    };
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut roots = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Ok(canonical) = PathBuf::from(line).canonicalize() else {
+            continue;
+        };
+        if canonical.is_dir() && !roots.contains(&canonical) {
+            roots.push(canonical);
+        }
+    }
+    roots
+}
+
+fn path_is_under(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
+}
+
+fn resolve_cwd(workspace: &Path, extra: &[PathBuf], raw: Option<&str>) -> Result<PathBuf, String> {
     use std::path::Component;
 
     let relative = match raw {
@@ -762,11 +797,20 @@ fn resolve_cwd(workspace: &Path, raw: Option<&str>) -> Result<PathBuf, String> {
         Some(value) => {
             let path = PathBuf::from(value);
             if path.is_absolute() {
-                path.strip_prefix(workspace)
-                    .map_err(|_| {
-                        "cwd must resolve inside the Process Runtime workspace".to_string()
-                    })?
-                    .to_path_buf()
+                let canonical = path.canonicalize().map_err(|error| {
+                    format!("cwd inspect failed: {error}")
+                })?;
+                if path_is_under(&canonical, workspace)
+                    || extra.iter().any(|root| path_is_under(&canonical, root))
+                {
+                    if !canonical.is_dir() {
+                        return Err("cwd must be a directory".into());
+                    }
+                    return Ok(canonical);
+                }
+                return Err(
+                    "cwd must resolve inside the workspace or an authorized directory".into(),
+                );
             } else {
                 path
             }
@@ -811,6 +855,7 @@ fn build_profile(
     scratch: &Path,
     cache: &Path,
     trusted: &[PathBuf],
+    extra: &[PathBuf],
 ) -> Result<String, String> {
     let workspace = seatbelt_escape(workspace)?;
     let scratch = seatbelt_escape(scratch)?;
@@ -821,6 +866,13 @@ fn build_profile(
         let root = seatbelt_escape(root)?;
         toolchains.push_str(&format!(
             "(allow file-read-metadata (subpath \"{root}\"))\n(allow file-read-data (subpath \"{root}\"))\n"
+        ));
+    }
+
+    for root in extra {
+        let root = seatbelt_escape(root)?;
+        toolchains.push_str(&format!(
+            "(allow file-read-metadata (subpath \"{root}\"))\n(allow file-read-data (subpath \"{root}\"))\n(allow file-write* (subpath \"{root}\"))\n"
         ));
     }
 

@@ -460,6 +460,7 @@ def production_component_env(
         "PROCESS_RUNTIME_WORKSPACE": str(manifest["workspace"]),
         "PROCESS_RUNTIME_WORKSPACE_ID": CONNECTOR_ID,
         "PROCESS_RUNTIME_STATE_DIR": str(layout["process_runtime_state_dir"]),
+        "PROCESS_RUNTIME_AUTHORIZED_ROOTS_FILE": "/Users/echoman/.local-agent-bridge/authorized-file-roots",
     }
     bridge["LAB_PROCESS_BACKEND_URL"] = process_backend_url
     bridge["LAB_PROCESS_BACKEND_KEY_FILE"] = str(layout["process_runtime_backend_key"])

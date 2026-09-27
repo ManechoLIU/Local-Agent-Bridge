@@ -1205,6 +1205,19 @@ async fn handle_mcp(
         }
     }
 
+    if method == "tools/call" && matches!(tool_name, "run_command" | "start_command") {
+        let arguments = parsed
+            .get("params")
+            .and_then(|value| value.get("arguments"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        extra_files::ensure_authorized_from_arguments(
+            tool_name,
+            &arguments,
+            state.inner.extra_file_production,
+        );
+    }
+
     if method == "tools/list"
         && (state.inner.host_backend.is_some()
             || state.inner.computer_backend.is_some()
