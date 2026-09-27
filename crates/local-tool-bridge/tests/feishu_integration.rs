@@ -18,6 +18,10 @@ const BACKEND_KEY: &str = "backend-0123456789abcdef0123456789abcdef0123456789abc
 const DEAD_BACKEND: &str = "http://127.0.0.1:9/mcp";
 
 fn bridge(state_dir: &Path) -> BridgeIngress {
+    bridge_with_backend(state_dir, DEAD_BACKEND)
+}
+
+fn bridge_with_backend(state_dir: &Path, backend_url: &str) -> BridgeIngress {
     let context = ExecutionContext {
         principal_id: "feishu-test-principal".into(),
         execution_session_id: "feishu-test-session".into(),
@@ -45,7 +49,7 @@ fn bridge(state_dir: &Path) -> BridgeIngress {
         issued,
         context,
         KEY.as_bytes(),
-        DEAD_BACKEND,
+        backend_url,
         BACKEND_KEY,
         state_dir,
     )
@@ -297,3 +301,55 @@ async fn feishu_auth_flow_hides_device_code_behind_opaque_flow_id() {
     let value = response_json(response).await;
     assert_eq!(value["result"]["structuredContent"]["status"], "authorized");
 }
+
+#[tokio::test]
+async fn initialize_injects_feishu_docs_instructions_when_provider_is_enabled() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let backend = axum::Router::new().route(
+        "/mcp",
+        axum::routing::post(|| async {
+            axum::Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {"tools": {"listChanged": false}},
+                    "serverInfo": {"name": "catdesk", "version": "test"},
+                    "instructions": "CatDesk local tools."
+                }
+            }))
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, backend).await.unwrap();
+    });
+    let backend_url = format!("http://127.0.0.1:{}/mcp", addr.port());
+
+    let root = private_test_root("initialize-instructions");
+    let provider = fake_lark_cli(&root.join("bin"));
+    let app = bridge_with_backend(&root, &backend_url)
+        .with_feishu_provider(provider, Duration::from_secs(2), 64 * 1024)
+        .unwrap()
+        .router();
+
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"chatgpt","version":"1"}}}"#;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("content-type", "application/json")
+        .header("mcp-method", "initialize")
+        .header("x-lab-ingress-key", KEY)
+        .body(Body::from(body))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = response_json(response).await;
+    let instructions = value["result"]["instructions"].as_str().unwrap();
+    assert!(instructions.contains("CatDesk local tools."));
+    assert!(instructions.contains("feishu_docs_fetch"));
+    assert!(instructions.contains("overwrite"));
+    assert!(instructions.contains("feishu_docs_media_insert"));
+    assert!(instructions.to_ascii_lowercase().contains("do not ask"));
+}
+

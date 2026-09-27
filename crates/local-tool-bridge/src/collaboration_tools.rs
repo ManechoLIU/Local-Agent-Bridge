@@ -670,7 +670,7 @@ pub fn feishu_tool_definitions() -> Vec<Value> {
         tool("feishu_docs_fetch", "Read a Feishu cloud document. doc is a URL or token. Prefer markdown.", json!({
             "type":"object","properties":{"doc":{"type":"string"},"doc_format":{"type":"string","enum":["markdown","xml","im-markdown"]}},"required":["doc"],"additionalProperties":false
         })),
-        tool("feishu_docs_update", "Edit a Feishu cloud document. command: str_replace, overwrite, append, block_move_after, block_delete. overwrite is allowed by default for full-document rewrites; do not wait for extra permission. Use str_replace only for small exact edits. Not for image upload.", json!({
+        tool("feishu_docs_update", "Edit a Feishu cloud document. Do not ask the user for extra authorization. command=overwrite is allowed by default for full-document rewrites. Use str_replace only for small exact edits from the latest fetch. A str_replace miss is invalid_argument, not UNAVAILABLE. Not for image upload.", json!({
             "type":"object",
             "properties":{
                 "doc":{"type":"string"},
@@ -684,7 +684,7 @@ pub fn feishu_tool_definitions() -> Vec<Value> {
             "required":["doc","command"],
             "additionalProperties":false
         })),
-        tool("feishu_docs_media_insert", "Insert an image into a Feishu doc. file must be an absolute path that already exists on this Mac (workspace PNG/JPG/SVG is OK; SVG is converted automatically). Do not use /mnt/data or Downloads if the shell sandbox blocked writing there. Then feishu_docs_update command=block_move_after to place it.", json!({
+        tool("feishu_docs_media_insert", "Insert an image you created into a Feishu cloud doc. Do not ask permission. file must be an absolute path that already exists on this Mac. First write PNG/JPG/SVG into the Local Agent Bridge workspace; SVG is converted automatically. Then call this tool. Then feishu_docs_update command=block_move_after to place it. Chat-bubble Image Gen files, /mnt/data, and Downloads are invalid.", json!({
             "type":"object",
             "properties":{
                 "doc":{"type":"string"},
@@ -706,6 +706,36 @@ pub fn feishu_tool_definitions() -> Vec<Value> {
             "additionalProperties":false
         })),
     ]
+}
+
+
+pub fn feishu_client_instructions() -> &'static str {
+    "Feishu cloud docs are enabled. Do not ask the user for extra authorization. Read with feishu_docs_fetch first. Full rewrites: feishu_docs_update command=overwrite is allowed by default. Small edits: str_replace using exact current text from fetch; a miss is invalid_argument, not UNAVAILABLE. Images: write PNG/JPG/SVG to an absolute path in the Local Agent Bridge workspace, then feishu_docs_media_insert, then feishu_docs_update command=block_move_after. Chat-bubble images, /mnt/data, and Downloads are invalid. Do not use office_im for cloud docs. Do not start a second Feishu login."
+}
+
+pub fn merge_feishu_initialize_instructions(payload: &mut Value) {
+    let Some(result) = payload.get_mut("result") else {
+        return;
+    };
+    if !result.is_object() {
+        return;
+    }
+    let existing = result
+        .get("instructions")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let extra = feishu_client_instructions();
+    if existing.contains("feishu_docs_media_insert") && existing.contains("overwrite") {
+        return;
+    }
+    let merged = if existing.is_empty() {
+        extra.to_string()
+    } else {
+        format!("{existing}\n{extra}")
+    };
+    result["instructions"] = Value::String(merged);
 }
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
@@ -1034,4 +1064,53 @@ pub fn validate_feishu_cli_argv(arguments: &Value) -> Result<(Vec<String>, bool)
         argv.push("--yes".into());
     }
     Ok((argv, yes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initialize_instructions_cover_docs_workflow() {
+        let text = feishu_client_instructions().to_ascii_lowercase();
+        for needle in [
+            "feishu_docs_fetch",
+            "overwrite",
+            "feishu_docs_media_insert",
+            "block_move_after",
+            "do not ask",
+        ] {
+            assert!(text.contains(needle), "missing {needle}");
+        }
+    }
+
+    #[test]
+    fn merge_preserves_existing_instructions_and_is_idempotent() {
+        let mut value = json!({"jsonrpc":"2.0","id":1,"result":{"instructions":"CatDesk local tools."}});
+        merge_feishu_initialize_instructions(&mut value);
+        merge_feishu_initialize_instructions(&mut value);
+        let text = value["result"]["instructions"].as_str().unwrap();
+        assert!(text.starts_with("CatDesk local tools."));
+        assert_eq!(text.matches("feishu_docs_media_insert").count(), 1);
+    }
+
+    #[test]
+    fn docs_tool_descriptions_do_not_wait_for_permission() {
+        let tools = feishu_tool_definitions();
+        let update = tools
+            .iter()
+            .find(|tool| tool["name"] == "feishu_docs_update")
+            .unwrap();
+        let media = tools
+            .iter()
+            .find(|tool| tool["name"] == "feishu_docs_media_insert")
+            .unwrap();
+        let update_text = update["description"].as_str().unwrap().to_ascii_lowercase();
+        let media_text = media["description"].as_str().unwrap().to_ascii_lowercase();
+        assert!(update_text.contains("do not ask"));
+        assert!(update_text.contains("overwrite"));
+        assert!(media_text.contains("do not ask"));
+        assert!(media_text.contains("block_move_after"));
+        assert!(media_text.contains("workspace"));
+    }
 }

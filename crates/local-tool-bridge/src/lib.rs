@@ -1195,6 +1195,12 @@ async fn handle_mcp(
                 Err(error) => text_response(StatusCode::BAD_GATEWAY, &error),
             }
         }
+        Ok(response) if method == "initialize" && state.inner.collaboration.is_some() => {
+            match decorate_initialize_with_feishu_instructions(response).await {
+                Ok(response) => response,
+                Err(error) => text_response(StatusCode::BAD_GATEWAY, &error),
+            }
+        }
         Ok(response) => response,
         Err(error) => text_response(StatusCode::BAD_GATEWAY, &error),
     }
@@ -3045,6 +3051,37 @@ fn map_backend_response_id(
     response
         .body(Body::from(bytes))
         .map_err(|error| format!("caller response build failed: {error}"))
+}
+
+
+async fn decorate_initialize_with_feishu_instructions(
+    response: Response<Body>,
+) -> Result<Response<Body>, String> {
+    if response.status() != StatusCode::OK {
+        return Ok(response);
+    }
+    let status = response.status();
+    let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .map_err(|error| format!("initialize response read failed: {error}"))?;
+    let mut value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return rebuild_response(status, content_type, bytes),
+    };
+    if value.get("result").is_none() {
+        return rebuild_response(status, content_type, bytes);
+    }
+    collaboration_tools::merge_feishu_initialize_instructions(&mut value);
+    let mut builder = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    builder
+        .body(Body::from(serde_json::to_vec(&value).map_err(|error| {
+            format!("initialize serialization failed: {error}")
+        })?))
+        .map_err(|error| format!("initialize response build failed: {error}"))
 }
 
 async fn decorate_tools_list_response(response: Response<Body>) -> Result<Response<Body>, String> {

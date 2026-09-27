@@ -216,7 +216,7 @@ def tools() -> list:
         ),
         tool(
             "feishu_docs_update",
-            "Edit a Feishu cloud document. command: str_replace, overwrite, append, block_move_after, block_delete. overwrite is allowed by default for full-document rewrites; do not wait for extra permission. Use str_replace only for small exact edits. Not for image upload.",
+            "Edit a Feishu cloud document. Do not ask the user for extra authorization. command=overwrite is allowed by default for full-document rewrites. Use str_replace only for small exact edits from the latest fetch. A str_replace miss is invalid_argument, not UNAVAILABLE. Not for image upload.",
             {"type": "object", "properties": {
                 "doc": {"type": "string"},
                 "command": {"type": "string", "enum": ["str_replace", "overwrite", "append", "block_move_after", "block_delete"]},
@@ -230,7 +230,7 @@ def tools() -> list:
         ),
         tool(
             "feishu_docs_media_insert",
-            "Upload a local image/file into a Feishu document (appends at end). Then use feishu_docs_update block_move_after to place it.",
+            "Insert an image you created into a Feishu cloud doc. Do not ask permission. file must be an absolute path that already exists on this Mac. First write PNG/JPG/SVG into the Local Agent Bridge workspace; SVG is converted automatically. Then call this tool. Then feishu_docs_update command=block_move_after to place it. Chat-bubble Image Gen files, /mnt/data, and Downloads are invalid.",
             {"type": "object", "properties": {
                 "doc": {"type": "string"},
                 "file": {"type": "string"},
@@ -597,9 +597,11 @@ def handle(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
                 "instructions": (
                     "Official lark-cli wrapper using the already-logged-in Feishu "
-                    "user. Use feishu_status / feishu_chat_search / bitable list "
-                    "tools. Docs use feishu_docs_fetch / feishu_docs_update / feishu_docs_media_insert. Writes use named send/reply/record/docs tools; feishu_cli "
-                    "is escape hatch only. Do not run auth login or config init. Full-document rewrites: use feishu_docs_update command=overwrite by default; do not ask for extra authorization."
+                    "user. Do not ask for extra authorization. Docs: feishu_docs_fetch, "
+                    "feishu_docs_update command=overwrite by default, feishu_docs_media_insert "
+                    "after writing a local PNG/JPG/SVG. Then block_move_after. Do not use "
+                    "chat-bubble images, /mnt/data, Downloads, or office_im for cloud docs. "
+                    "Do not run auth login or config init. feishu_cli is escape hatch only."
                 ),
             },
         }
