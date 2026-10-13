@@ -1,7 +1,10 @@
-const GENERATION_PATHS = new Set([
+const GENERATION_ROOTS = Object.freeze([
   "/backend-api/f/conversation",
   "/backend-api/conversation"
 ]);
+const START_ACTIONS = new Set(["", "prepare", "resume"]);
+const NON_CLEARING_FINISH_ACTIONS = new Set(["", "prepare", "resume", "init"]);
+const STOP_CONVERSATION_PATH = "/backend-api/stop_conversation";
 const CONVERSATION_RE = /^[0-9a-f-]{20,80}$/i;
 const SESSION_RECORD_KEY = "lab_current_entry_registry_v1";
 const SESSION_RECORD_VERSION = 1;
@@ -18,6 +21,35 @@ function pathFromUrl(value) {
   } catch {
     return null;
   }
+}
+
+function generationAction(pathname) {
+  if (!pathname) return null;
+  for (const root of GENERATION_ROOTS) {
+    if (pathname === root) return "";
+    const prefix = root + "/";
+    if (!pathname.startsWith(prefix)) continue;
+    const action = pathname.slice(prefix.length);
+    if (action && !action.includes("/")) return action;
+  }
+  return null;
+}
+
+function isGenerationStartPath(pathname) {
+  const action = generationAction(pathname);
+  return action != null && START_ACTIONS.has(action);
+}
+
+function isNonClearingFinish(details) {
+  const action = generationAction(pathFromUrl(details && details.url));
+  return action != null && NON_CLEARING_FINISH_ACTIONS.has(action);
+}
+
+function isStopConversation(details) {
+  if (pathFromUrl(details && details.url) !== STOP_CONVERSATION_PATH) return false;
+  const method = details && details.method;
+  if (method == null || method === "") return true;
+  return String(method).toUpperCase() === "POST";
 }
 
 function validTabId(value) {
@@ -146,7 +178,7 @@ function storedRecord(value, now, futureSkewMs) {
 
 export function isChatGptGenerationRequest(details) {
   if (!details || String(details.method || "").toUpperCase() !== "POST") return false;
-  if (!GENERATION_PATHS.has(pathFromUrl(details.url))) return false;
+  if (!isGenerationStartPath(pathFromUrl(details.url))) return false;
   if (validTabId(details.tabId) != null) return true;
   return isServiceWorkerTabId(details.tabId) && hasChatGptInitiator(details);
 }
@@ -316,9 +348,25 @@ export function createCurrentEntryRegistry({
     },
 
     async observeFinish(details) {
+      if (isNonClearingFinish(details)) return false;
       const requestId = String(details?.requestId || "").trim();
-      if (!requestId) return false;
+      const stop = isStopConversation(details);
+      if (!stop && !requestId) return false;
       return await serialize(async function () {
+        if (stop) {
+          const tabId = validTabId(details && details.tabId);
+          let removed = false;
+          if (tabId != null) {
+            for (const [id, record] of active) {
+              if (record.tab_id !== tabId) continue;
+              active.delete(id);
+              removed = true;
+            }
+          }
+          if (requestId && active.delete(requestId)) removed = true;
+          if (removed) await persist();
+          return removed;
+        }
         const removed = active.delete(requestId);
         if (removed) await persist();
         return removed;

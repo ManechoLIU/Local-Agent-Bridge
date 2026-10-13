@@ -46,12 +46,18 @@ test("registry recognizes only ChatGPT generation requests", () => {
   assert.equal(isChatGptGenerationRequest(req("r3", 7, "https://chatgpt.com/backend-api/conversations", "GET")), false);
   assert.equal(isChatGptGenerationRequest(req("r4", -1)), false);
   assert.equal(isChatGptGenerationRequest(req("r5", 7, "https://example.com/backend-api/f/conversation")), false);
-  assert.equal(isChatGptGenerationRequest(req("r6", 7, "https://chatgpt.com/backend-api/f/conversation/prepare")), false);
+  assert.equal(isChatGptGenerationRequest(req("r6", 7, "https://chatgpt.com/backend-api/f/conversation/prepare")), true);
+  assert.equal(isChatGptGenerationRequest(req("r6b", 7, "https://chatgpt.com/backend-api/conversation/prepare")), true);
+  assert.equal(isChatGptGenerationRequest(req("r6c", 7, "https://chatgpt.com/backend-api/f/conversation/resume")), true);
+  assert.equal(isChatGptGenerationRequest(req("r6d", 7, "https://chatgpt.com/backend-api/conversation/resume")), true);
+  assert.equal(isChatGptGenerationRequest(req("r6e", 7, "https://chatgpt.com/backend-api/f/conversation/prepare", "GET")), false);
+  assert.equal(isChatGptGenerationRequest(req("r6f", 7, "https://chatgpt.com/backend-api/conversations", "POST")), false);
   assert.equal(isChatGptGenerationRequest(req("r7", 7, "https://chatgpt.com/backend-api/conversation/init")), false);
+  assert.equal(isChatGptGenerationRequest(req("r7b", 7, "https://chatgpt.com/backend-api/f/conversation/init")), false);
   assert.equal(isChatGptGenerationRequest({
     ...req("r8", -1, "https://chatgpt.com/backend-api/f/conversation/prepare"),
     initiator: "https://chatgpt.com"
-  }), false);
+  }), true);
   assert.equal(isChatGptGenerationRequest({
     ...req("r9", -1),
     initiator: "https://chatgpt.com"
@@ -64,6 +70,36 @@ test("registry recognizes only ChatGPT generation requests", () => {
     ...req("r11", -1),
     originUrl: "https://chatgpt.com"
   }), true);
+});
+
+test("generation POST completion keeps the active entry until stop_conversation", async () => {
+  const registry = createRegistry();
+  const generation = req("r1", 9);
+  assert.equal(await registry.observeStart(generation), true);
+
+  assert.equal(await registry.observeFinish(generation), false);
+  assert.equal(await registry.observeFinish(req("r1", 9, "https://chatgpt.com/backend-api/f/conversation/prepare")), false);
+  assert.equal(await registry.observeFinish(req("r1", 9, "https://chatgpt.com/backend-api/conversation/resume")), false);
+  assert.equal(await registry.observeFinish(req("r1", 9, "https://chatgpt.com/backend-api/conversation/init")), false);
+  assert.equal((await registry.resolveCurrent()).tab_id, 9);
+
+  assert.equal(await registry.observeFinish(req("stop-1", 9, "https://chatgpt.com/backend-api/stop_conversation")), true);
+  assert.equal(await registry.resolveCurrent(), null);
+});
+
+test("prepare and resume POSTs stay active after their own HTTP completion", async () => {
+  for (const url of [
+    "https://chatgpt.com/backend-api/f/conversation/prepare",
+    "https://chatgpt.com/backend-api/conversation/prepare",
+    "https://chatgpt.com/backend-api/f/conversation/resume",
+    "https://chatgpt.com/backend-api/conversation/resume"
+  ]) {
+    const registry = createRegistry();
+    const start = req("prep-1", 4, url);
+    assert.equal(await registry.observeStart(start), true);
+    assert.equal(await registry.observeFinish(start), false);
+    assert.equal((await registry.resolveCurrent()).tab_id, 4);
+  }
 });
 
 test("unique active generation resolves exact tab and opaque generation anchor", async () => {
