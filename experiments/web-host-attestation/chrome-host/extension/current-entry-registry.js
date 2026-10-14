@@ -7,11 +7,12 @@ const NON_CLEARING_FINISH_ACTIONS = new Set(["", "prepare", "resume", "init"]);
 const STOP_CONVERSATION_PATH = "/backend-api/stop_conversation";
 const CONVERSATION_RE = /^[0-9a-f-]{20,80}$/i;
 const SESSION_RECORD_KEY = "lab_current_entry_registry_v1";
-const SESSION_RECORD_VERSION = 1;
+const SESSION_RECORD_VERSION = 2;
 const MAX_REQUEST_ID_LENGTH = 256;
 const MAX_ACTIVE_RECORDS = 64;
 const STORED_RECORD_KEYS = new Set(["request_id", "tab_id", "started_at_ms"]);
-const STORED_SNAPSHOT_KEYS = new Set(["version", "active"]);
+const STORED_SNAPSHOT_KEYS_V1 = new Set(["version", "active"]);
+const STORED_SNAPSHOT_KEYS = new Set(["version", "active", "pending_stops"]);
 
 function pathFromUrl(value) {
   try {
@@ -156,24 +157,33 @@ function hasOnlyKeys(value, allowedKeys) {
 }
 
 function storedRecord(value, now, futureSkewMs) {
-  if (!hasOnlyKeys(value, STORED_SNAPSHOT_KEYS)) return null;
-  if (value.version !== SESSION_RECORD_VERSION || !Array.isArray(value.active)) return null;
-  if (value.active.length > MAX_ACTIVE_RECORDS) return null;
-  const active = new Map();
-  for (const record of value.active) {
-    if (!hasOnlyKeys(record, STORED_RECORD_KEYS)) return null;
-    const requestId = typeof record?.request_id === "string" ? record.request_id.trim() : "";
-    const tabId = typeof record?.tab_id === "number" ? validTabId(record.tab_id) : null;
-    const startedAtMs = positiveSafeInteger(record?.started_at_ms);
-    if (!requestId || requestId.length > MAX_REQUEST_ID_LENGTH || tabId == null || startedAtMs == null || active.has(requestId)) return null;
-    if (startedAtMs - now > futureSkewMs) return null;
-    active.set(requestId, Object.freeze({
-      request_id: requestId,
-      tab_id: tabId,
-      started_at_ms: startedAtMs
-    }));
+  const legacy = value?.version === 1 && hasOnlyKeys(value, STORED_SNAPSHOT_KEYS_V1);
+  const current = value?.version === SESSION_RECORD_VERSION && hasOnlyKeys(value, STORED_SNAPSHOT_KEYS);
+  if (!legacy && !current) return null;
+  if (!Array.isArray(value.active) || (current && !Array.isArray(value.pending_stops))) return null;
+  const restored = {};
+  for (const [name, records] of [
+    ["active", value.active],
+    ["pending_stops", current ? value.pending_stops : []]
+  ]) {
+    if (records.length > MAX_ACTIVE_RECORDS) return null;
+    const entries = new Map();
+    for (const record of records) {
+      if (!hasOnlyKeys(record, STORED_RECORD_KEYS)) return null;
+      const requestId = typeof record?.request_id === "string" ? record.request_id.trim() : "";
+      const tabId = typeof record?.tab_id === "number" ? validTabId(record.tab_id) : null;
+      const startedAtMs = positiveSafeInteger(record?.started_at_ms);
+      if (!requestId || requestId.length > MAX_REQUEST_ID_LENGTH || tabId == null || startedAtMs == null || entries.has(requestId)) return null;
+      if (startedAtMs - now > futureSkewMs) return null;
+      entries.set(requestId, Object.freeze({
+        request_id: requestId,
+        tab_id: tabId,
+        started_at_ms: startedAtMs
+      }));
+    }
+    restored[name] = entries;
   }
-  return active;
+  return restored;
 }
 
 export function isChatGptGenerationRequest(details) {
@@ -200,6 +210,7 @@ export function createCurrentEntryRegistry({
     throw new Error("current-entry future skew must be a non-negative safe integer");
   }
   const active = new Map();
+  const pendingStops = new Map();
   let initialized = false;
   let failure = null;
   let queue = Promise.resolve();
@@ -223,7 +234,9 @@ export function createCurrentEntryRegistry({
         const restored = storedRecord(entries[SESSION_RECORD_KEY], now, futureSkewMs);
         if (!restored) throw new Error("invalid current-entry session record");
         active.clear();
-        for (const [requestId, record] of restored) active.set(requestId, record);
+        pendingStops.clear();
+        for (const [requestId, record] of restored.active) active.set(requestId, record);
+        for (const [requestId, record] of restored.pending_stops) pendingStops.set(requestId, record);
       }
       initialized = true;
     } catch (cause) {
@@ -237,7 +250,8 @@ export function createCurrentEntryRegistry({
       await sessionStore.set({
         [SESSION_RECORD_KEY]: {
           version: SESSION_RECORD_VERSION,
-          active: Array.from(active.values(), (record) => ({ ...record }))
+          active: Array.from(active.values(), (record) => ({ ...record })),
+          pending_stops: Array.from(pendingStops.values(), (record) => ({ ...record }))
         }
       });
     } catch (cause) {
@@ -279,10 +293,12 @@ export function createCurrentEntryRegistry({
 
   function prune(now) {
     let pruned = false;
-    for (const [requestId, record] of active) {
-      if (now - record.started_at_ms >= maxAgeMs) {
-        active.delete(requestId);
-        pruned = true;
+    for (const records of [active, pendingStops]) {
+      for (const [requestId, record] of records) {
+        if (now - record.started_at_ms >= maxAgeMs) {
+          records.delete(requestId);
+          pruned = true;
+        }
       }
     }
     return pruned;
@@ -298,6 +314,9 @@ export function createCurrentEntryRegistry({
         }
       }
       if (prune(now)) await persist();
+      if (pendingStops.size > 0) {
+        throw new Error("HOST_CURRENT_ENTRY_UNAVAILABLE: stop request is in flight");
+      }
       const byTab = new Map();
       for (const record of active.values()) {
         if (!byTab.has(record.tab_id)) byTab.set(record.tab_id, []);
@@ -315,6 +334,52 @@ export function createCurrentEntryRegistry({
   }
 
   return Object.freeze({
+    async observeStopStart(details) {
+      if (!isStopConversation(details)) return false;
+      const requestId = String(details?.requestId || "").trim();
+      if (!requestId) return false;
+      return await serialize(async function () {
+        if (requestId.length > MAX_REQUEST_ID_LENGTH) {
+          failure = new Error("HOST_CURRENT_ENTRY_UNAVAILABLE: request id exceeds maximum length");
+          throw failure;
+        }
+        let tabId;
+        try {
+          tabId = await resolveObservedTabId(details);
+        } catch (error) {
+          if (!isServiceWorkerTabId(details?.tabId)) throw error;
+          tabId = null;
+        }
+        if (tabId == null) {
+          if (!isServiceWorkerTabId(details?.tabId)) return false;
+          // An unattributed stop could end any active generation. Persist an
+          // empty registry so a worker restart cannot revive stale identity.
+          const invalidated = active.size > 0 || pendingStops.size > 0;
+          active.clear();
+          pendingStops.clear();
+          if (invalidated) await persist();
+          return invalidated;
+        }
+        const existing = pendingStops.get(requestId);
+        if (existing) {
+          if (existing.tab_id === tabId) return true;
+          failure = new Error("HOST_CURRENT_ENTRY_UNAVAILABLE: stop request id was observed in another tab");
+          throw failure;
+        }
+        if (pendingStops.size >= MAX_ACTIVE_RECORDS) {
+          failure = new Error("HOST_CURRENT_ENTRY_UNAVAILABLE: pending stop record count exceeds maximum");
+          throw failure;
+        }
+        pendingStops.set(requestId, Object.freeze({
+          request_id: requestId,
+          tab_id: tabId,
+          started_at_ms: currentTime()
+        }));
+        await persist();
+        return true;
+      });
+    },
+
     async observeStart(details) {
       if (!isChatGptGenerationRequest(details)) return false;
       const requestId = String(details.requestId || "").trim();
@@ -354,7 +419,13 @@ export function createCurrentEntryRegistry({
       if (!stop && !requestId) return false;
       return await serialize(async function () {
         if (stop) {
-          const tabId = validTabId(details && details.tabId);
+          const pending = pendingStops.get(requestId);
+          const observedTabId = validTabId(details?.tabId);
+          if (pending && observedTabId != null && pending.tab_id !== observedTabId) {
+            failure = new Error("HOST_CURRENT_ENTRY_UNAVAILABLE: stop request tab changed before completion");
+            throw failure;
+          }
+          const tabId = pending?.tab_id ?? await resolveObservedTabId(details);
           let removed = false;
           if (tabId != null) {
             for (const [id, record] of active) {
@@ -364,7 +435,8 @@ export function createCurrentEntryRegistry({
             }
           }
           if (requestId && active.delete(requestId)) removed = true;
-          if (removed) await persist();
+          const pendingRemoved = pendingStops.delete(requestId);
+          if (removed || pendingRemoved) await persist();
           return removed;
         }
         const removed = active.delete(requestId);

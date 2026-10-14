@@ -235,8 +235,9 @@ test("background completion and error events erase session entries before a work
       await flushAsyncWork();
       assert.deepEqual(sessionValues, {
         lab_current_entry_registry_v1: {
-          version: 1,
-          active: []
+          version: 2,
+          active: [],
+          pending_stops: []
         }
       });
 
@@ -282,6 +283,88 @@ test("background observes a service worker generation from Referer headers", asy
   assert.equal(reply.ok, true);
   assert.equal(reply.result.current_entry_context.conversation_id, CONVERSATION);
   assert.equal(reply.result.current_entry_context.browser_target_id, "browser-target-7");
+});
+
+test("background clears service worker stop on completion or error without request headers", async function (t) {
+  for (const eventName of ["completed", "errored"]) {
+    await t.test("on" + eventName + " clears the bound generation after worker restart", async function (t) {
+      const sessionValues = {};
+      const first = chromeFixture({ sessionValues });
+      await loadBackground(t, first);
+      const referer = [{ name: "Referer", value: "https://chatgpt.com/c/" + CONVERSATION }];
+      first.listeners.sendHeaders.emit({
+        requestId: "generation-sw-2",
+        tabId: -1,
+        method: "POST",
+        url: "https://chatgpt.com/backend-api/f/conversation",
+        initiator: "https://chatgpt.com",
+        requestHeaders: referer
+      });
+      first.listeners.sendHeaders.emit({
+        requestId: "stop-sw-2",
+        tabId: -1,
+        method: "POST",
+        url: "https://chatgpt.com/backend-api/stop_conversation",
+        initiator: "https://chatgpt.com",
+        requestHeaders: referer
+      });
+      await flushAsyncWork();
+
+      const restarted = chromeFixture({ sessionValues });
+      await loadBackground(t, restarted);
+      restarted.listeners[eventName].emit({
+        requestId: "stop-sw-2",
+        tabId: -1,
+        method: "POST",
+        url: "https://chatgpt.com/backend-api/stop_conversation",
+        initiator: "https://chatgpt.com"
+      });
+      await flushAsyncWork();
+      restarted.listeners.message.emit({ request_id: "discover-stopped", op: "discover_current_entry" });
+      const reply = await replyFor(restarted.port, "discover-stopped");
+      assert.equal(reply?.ok, false);
+      assert.match(reply.error, /HOST_CURRENT_ENTRY_UNAVAILABLE: no active ChatGPT generation/);
+    });
+  }
+});
+
+test("background invalidates an unattributed service worker stop before headerless completion", async function (t) {
+  const sessionValues = {};
+  const fixture = chromeFixture({ sessionValues });
+  await loadBackground(t, fixture);
+  fixture.listeners.sendHeaders.emit({
+    requestId: "generation-sw-unattributed",
+    tabId: -1,
+    method: "POST",
+    url: "https://chatgpt.com/backend-api/f/conversation",
+    initiator: "https://chatgpt.com",
+    requestHeaders: [{ name: "Referer", value: "https://chatgpt.com/c/" + CONVERSATION }]
+  });
+  await flushAsyncWork();
+  fixture.listeners.sendHeaders.emit({
+    requestId: "stop-sw-unattributed",
+    tabId: -1,
+    method: "POST",
+    url: "https://chatgpt.com/backend-api/stop_conversation",
+    initiator: "https://chatgpt.com",
+    requestHeaders: []
+  });
+  await flushAsyncWork();
+
+  const restarted = chromeFixture({ sessionValues });
+  await loadBackground(t, restarted);
+  restarted.listeners.completed.emit({
+    requestId: "stop-sw-unattributed",
+    tabId: -1,
+    method: "POST",
+    url: "https://chatgpt.com/backend-api/stop_conversation",
+    initiator: "https://chatgpt.com"
+  });
+  await flushAsyncWork();
+  restarted.listeners.message.emit({ request_id: "discover-unattributed-stop", op: "discover_current_entry" });
+  const reply = await replyFor(restarted.port, "discover-unattributed-stop");
+  assert.equal(reply?.ok, false);
+  assert.match(reply.error, /HOST_CURRENT_ENTRY_UNAVAILABLE: no active ChatGPT generation/);
 });
 
 test("background reports rejected current-entry mutations without an unhandled rejection", async function (t) {

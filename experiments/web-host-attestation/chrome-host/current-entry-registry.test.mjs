@@ -460,6 +460,88 @@ test("service worker generation can observeStart before the streaming request fi
   assert.equal(await registry.resolveCurrent(), null);
 });
 
+test("service worker stop_conversation clears the generation bound by referer", async () => {
+  const registry = createRegistry({
+    listChatGptPages: async () => [chatgptPage(11)]
+  });
+  assert.equal(await registry.observeStart(swGeneration()), true);
+  assert.equal((await registry.resolveCurrent())?.tab_id, 11);
+
+  assert.equal(await registry.observeFinish(swGeneration({
+    requestId: "stop-sw-1",
+    url: "https://chatgpt.com/backend-api/stop_conversation"
+  })), true);
+  assert.equal(await registry.resolveCurrent(), null);
+});
+
+test("service worker stop completion clears after worker restart without request headers", async () => {
+  const store = createSessionStore();
+  const pages = async () => [chatgptPage(11)];
+  const registry = createCurrentEntryRegistry({ sessionStore: store, listChatGptPages: pages });
+  assert.equal(await registry.observeStart(swGeneration()), true);
+  assert.equal(await registry.observeStopStart(swGeneration({
+    requestId: "stop-sw-2",
+    url: "https://chatgpt.com/backend-api/stop_conversation"
+  })), true);
+
+  const restarted = createCurrentEntryRegistry({ sessionStore: store, listChatGptPages: pages });
+  assert.equal(await restarted.observeFinish({
+    requestId: "stop-sw-2",
+    tabId: -1,
+    method: "POST",
+    url: "https://chatgpt.com/backend-api/stop_conversation",
+    initiator: "https://chatgpt.com"
+  }), true);
+  assert.equal(await restarted.resolveCurrent(), null);
+});
+
+test("unattributed service worker stop invalidates the current entry across restart", async () => {
+  const store = createSessionStore();
+  const registry = createCurrentEntryRegistry({ sessionStore: store, listChatGptPages: async () => [chatgptPage(11)] });
+  assert.equal(await registry.observeStart(swGeneration()), true);
+  assert.equal(await registry.observeStopStart(swGeneration({
+    requestId: "stop-without-referer",
+    url: "https://chatgpt.com/backend-api/stop_conversation",
+    requestHeaders: []
+  })), true);
+  const restarted = createCurrentEntryRegistry({ sessionStore: store, listChatGptPages: async () => [chatgptPage(11)] });
+  assert.equal(await restarted.observeFinish({
+    requestId: "stop-without-referer",
+    tabId: -1,
+    method: "POST",
+    url: "https://chatgpt.com/backend-api/stop_conversation",
+    initiator: "https://chatgpt.com"
+  }), false);
+  assert.equal(await restarted.resolveCurrent(), null);
+});
+
+test("a pending stop suspends current-entry resolution", async () => {
+  const registry = createRegistry({ listChatGptPages: async () => [chatgptPage(11)] });
+  assert.equal(await registry.observeStart(swGeneration()), true);
+  assert.equal(await registry.observeStopStart(swGeneration({
+    requestId: "stop-pending",
+    url: "https://chatgpt.com/backend-api/stop_conversation"
+  })), true);
+  await assert.rejects(registry.resolveCurrent(), /HOST_CURRENT_ENTRY_UNAVAILABLE/);
+});
+
+test("service worker stop error clears an uncertain active generation", async () => {
+  const registry = createRegistry({ listChatGptPages: async () => [chatgptPage(11)] });
+  assert.equal(await registry.observeStart(swGeneration()), true);
+  assert.equal(await registry.observeStopStart(swGeneration({
+    requestId: "stop-sw-3",
+    url: "https://chatgpt.com/backend-api/stop_conversation"
+  })), true);
+  assert.equal(await registry.observeFinish({
+    requestId: "stop-sw-3",
+    tabId: -1,
+    method: "POST",
+    url: "https://chatgpt.com/backend-api/stop_conversation",
+    initiator: "https://chatgpt.com"
+  }), true);
+  assert.equal(await registry.resolveCurrent(), null);
+});
+
 test("service worker generation without referer does not guess a tab", async () => {
   const registry = createRegistry({
     listChatGptPages: async () => [chatgptPage(11), chatgptPage(12, OTHER_CONVERSATION)]

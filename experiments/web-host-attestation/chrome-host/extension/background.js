@@ -60,6 +60,7 @@ chrome.webRequest.onBeforeRequest.addListener(function (details) {
 }, currentEntryRequestFilter);
 chrome.webRequest.onBeforeSendHeaders.addListener(function (details) {
   observeCurrentEntryMutation("observeStart", details);
+  observeCurrentEntryMutation("observeStopStart", details);
 }, currentEntryRequestFilter, ["requestHeaders", "extraHeaders"]);
 chrome.webRequest.onCompleted.addListener(function (details) {
   observeCurrentEntryMutation("observeFinish", details);
