@@ -33,6 +33,10 @@ Before delegation, inspect the execution and delegation capabilities actually av
 
 backend default provider=grok-build model=grok-4.6 auth_mode=oauth
 
+For independently delegable work, prefer Grok 4.6 through the existing AAR OAuth route when authorized and healthy, to conserve Codex tokens. Codex retains coordination, necessary local execution, and final acceptance. Show the actual AAR start and terminal status cards. The user requires visible external-agent dispatch, running and return cards; Web Goal display is not a user requirement. The user explicitly disabled forced Web Goal display for LAB; preserve that preference and its audit while continuing with the existing ledger and Controller. A blocked health gate or an ambiguous attempt must be reported accurately; never bypass it, silently switch authentication routes, or retry possible side effects.
+
+For LAB Grok caller contracts, explicitly set `AD_EXTERNAL_STREAM_RECORD_MAX_BYTES=1048576` before execution and record that bounded I/O setting with the Assignment budget. The official maximum stays 2 MiB and over-limit records still fail closed. Read large install manifests and gate reports through bounded selected-field summaries; a normal CLI file result may repeat the same source four times. The real 393063-byte record reproduction and bound checks are in `tmp/web-controller-repair-20261023/grok-real-stream-record-boundary-regression.json`. Keep declared and effective total budgets equal and choose them per task; do not silently impose a five-minute caller cap. Preserve NDJSON stdout/stderr with `scripts/grok_delivery_boundary.py` instead of parsing the whole stream as one JSON value. Implementation work must request a canonical delivery receipt; exit zero alone is insufficient. Validate returned artifacts before acceptance.
+
 This project does **not** inherit the old SelfAlone restriction that a Web Controller may use only Web-hosted models.
 
 The current project Controller may select any genuinely available executor according to task fit, including:
@@ -139,21 +143,18 @@ Agents must not infer that `smaller command = allowed` or `larger command = bloc
 
 ## 2. Current Controller identity
 
-Unique logical Controller: `a697051d-402b-4062-a883-a29ba8b395e9`. Not two Controllers.
+Unique logical Controller: `a697051d-402b-4062-a883-a29ba8b395e9`. The machine registry is authoritative; never create a second Controller to repair or resume this project.
 
-**On duty now (desktop):**
+**Current owner, verified 2026-10-24:**
 
-- host `desktop_codex`
-- session `01a0b48e-76a7-7a60-9448-a4ba1deabdf2`
-- desktop target generation **1**
-- execution ownership generation **12**, `provenance = desktop_entry`
-- identity projection: `VERIFIED` / `CURRENT_EXECUTION_TARGET` / `controller_actions_allowed=true`
+- host `web`;
+- session `6ab93a76-4e6c-83e9-95ae-71d28091ef08`;
+- Web target generation **14**, execution ownership generation **18**;
+- current installed AAR revision `92c1353ca1e634ec0e63815c5f86304a8daaac00` (user-authorized local maintenance; exact revision subsequently published to GitHub); same-Web14/18 exact ACK and official Live-E2E accepted at 2026-10-24 13:00:29 CST. Preserve this acceptance and the original f4 accepted evidence.
 
-**Web lineage (not on duty):** session `6aacbb08-5204-83ec-8a8e-ddcfdb6f8edb`, generation 11, `identity_proof=host_attested_origin`. Kept as attested lineage. LAB-GOV-02 accept-live-e2e still requires that Web host path; do not treat missing E2E stamp as missing binding.
+Desktop Codex session `01a16273-7fed-7f92-8abc-ab0737b4f3da` continues the user-authorized Mac execution and integration work. It is an executor, not a second Controller and not an implicit ownership transfer. Fresh-read registry generations before protected operations. Older desktop/Web target identities are audit history only; opening or continuing a desktop chat must not reclaim ownership.
 
-Historical bootstrap Web IDs (`6a9e41a2-…`, `6a9e4158-…`, `6a9e4037-…` and `manual_user_authorized` aliases) are audit only.
-
-**Enforcement (not prose):** `replace-desktop-session` claims ownership in the same lock when this window is appointed current. `bind-desktop-session` does not take duty. Codex `~/.codex/hooks.json` already runs `lifecycle_hook.py` from the Adaptive Agent Runtime skill. Markdown in this file is the contract; the hook/registry is the gate.
+**Enforcement:** use existing canonical Host attestation, registry/ownership fences and AAR gates. Do not fabricate identity receipts, replay old wakes, or replace the current entry to satisfy prose. Current evidence and remaining work are in the task ledger and dated handoff document.
 
 ## 3. Remaining identity gate (LAB-GOV-02)
 

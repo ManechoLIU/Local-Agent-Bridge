@@ -489,6 +489,13 @@ impl CapabilityAuthority {
         self.issued_capability(capability_id)
     }
 
+    /// Read-only compatibility fence for request IDs persisted by older ingress versions.
+    pub fn has_used_request_id(&self, capability_id: &str, request_id: &str) -> bool {
+        self.records
+            .get(capability_id)
+            .is_some_and(|record| record.used_request_ids.contains(request_id))
+    }
+
     pub fn revoke(&mut self, capability_id: &str) -> bool {
         match self.records.get_mut(capability_id) {
             Some(record) => {

@@ -475,7 +475,10 @@ where
                 Ok(result) => json!({"request_id":request_id,"ok":true,"result":result}),
                 Err(error) => json!({"request_id":request_id,"ok":false,"error":error}),
             };
-            writeln!(stream, "{}", response).unwrap();
+            if let Err(error) = writeln!(stream, "{}", response) {
+                // An oversized fixture is deliberately rejected before its full frame is read.
+                assert!(response.to_string().len() > 64 * 1024 && error.kind() == std::io::ErrorKind::BrokenPipe);
+            }
         }
     })
 }
@@ -676,6 +679,19 @@ fn runtime_handler(
                 "bridge_call_id":request["bridge_call_id"],
                 "host_tool_execution_id":request["host_tool_execution_id"]
             })),
+            "execute" => {
+                let normalized: Value = serde_json::from_str(
+                    request["tool_intent"]["normalized_request_utf8"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                let arguments = &normalized["arguments"];
+                let raw = json!({"jsonrpc":"2.0","id":request["bridge_call_id"],"result":{"content":[{"type":"text","text":"done"}],"structuredContent":{"toolName":"run_command","command":arguments["command"],"cwd":arguments["cwd"],"stdout":"control-event: allowed","stderr":"","success":true,"exitCode":0,"elapsedMs":1,"timedOut":false},"isError":false}}).to_string();
+                Ok(
+                    json!({"protocol":"runtime_host_tool_hook_v1","op":"execute","bridge_call_id":request["bridge_call_id"],"host_tool_execution_id":request["host_tool_execution_id"],"backend_http_status":200,"backend_response":{"schema_version":1,"provenance":"runtime_host_backend_response_v1","response_body_utf8":raw}}),
+                )
+            }
             "terminal" if reject_terminal => Ok(json!({
                 "protocol":"runtime_host_tool_hook_v1","state":"REJECTED",
                 "bridge_call_id":request["bridge_call_id"],
@@ -690,7 +706,6 @@ fn runtime_handler(
         }
     }
 }
-
 fn call(body: String) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -1970,9 +1985,14 @@ async fn disabled_receipt_chain_preserves_legacy_run_command_body_and_reserved_f
     assert_eq!(captured.len(), 1);
     assert_eq!(captured[0].1.as_ref(), raw.as_bytes());
     assert_eq!(captured[0].0["mcp-session-id"], "caller-controlled-session");
+    let typed_rpc_identity = json!(["caller-controlled-proof-id", "rpc", "legacy"]);
+    let expected_proof_id = format!(
+        "rpc-v2:{:x}",
+        Sha256::digest(typed_rpc_identity.to_string().as_bytes())
+    );
     assert_eq!(
-        captured[0].0["x-lab-request-id"],
-        "caller-controlled-proof-id"
+        captured[0].0["x-lab-request-id"].to_str().unwrap(),
+        expected_proof_id
     );
 }
 
@@ -2008,4 +2028,449 @@ async fn stalled_private_server_has_one_bounded_overall_deadline() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(backend_capture.0.lock().await.len(), 0);
     stalled.join().unwrap();
+}
+
+// Explicit Host protection stays provider-neutral: command authorization belongs
+// to the Runtime hook, while unmarked calls retain the Process Runtime route.
+#[tokio::test]
+async fn process_backend_explicit_host_challenge_uses_runtime_execute_after_pre() {
+    let root = tempfile::tempdir().unwrap();
+    let host_path = root.path().join("host.sock");
+    let runtime_path = root.path().join("runtime.sock");
+    let host_log = Arc::new(StdMutex::new(Vec::new()));
+    let runtime_log = Arc::new(StdMutex::new(Vec::new()));
+    let _host = spawn_ndjson_server(host_path.clone(), 3, host_handler(host_log.clone()));
+    let _runtime = spawn_ndjson_server(
+        runtime_path.clone(),
+        3,
+        runtime_handler(runtime_log.clone(), false, false),
+    );
+    while !host_path.exists() || !runtime_path.exists() {
+        tokio::task::yield_now().await;
+    }
+    let native_capture = BackendCapture::default();
+    let process_capture = BackendCapture::default();
+    let native_url = backend_server(native_capture.clone(), false).await;
+    let process_url = backend_server(process_capture.clone(), false).await;
+    let app = bridge(&native_url, root.path(), &host_path, Some(&runtime_path))
+        .with_process_backend(&process_url, BACKEND_KEY)
+        .unwrap()
+        .router();
+    let command = "/usr/bin/python3 /runtime/control_event_guard.py /tmp/snapshot.json --ledger /repo/TASK_LEDGER.md --repo /repo --controller-session controller-test";
+    let challenge = app
+        .clone()
+        .oneshot(call(retry_body("protected-opt-in", command, json!({}))))
+        .await
+        .unwrap();
+    assert_eq!(challenge.status(), StatusCode::OK);
+    let challenge = response_json(challenge).await;
+    assert_eq!(
+        challenge["error"]["data"]["code"],
+        "HOST_INVOCATION_CAPABILITY_REQUIRED"
+    );
+    assert_eq!(native_capture.0.lock().await.len(), 0);
+    assert_eq!(process_capture.0.lock().await.len(), 0);
+    assert!(runtime_log.lock().unwrap().is_empty());
+    let capability = challenge["error"]["data"]["host_invocation_capability"].clone();
+    let completed = app
+        .clone()
+        .oneshot(call(retry_body(
+            "protected-retry",
+            command,
+            capability.clone(),
+        )))
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), StatusCode::OK);
+    let completed = response_json(completed).await;
+    assert_eq!(completed["result"]["isError"], false);
+    assert_eq!(native_capture.0.lock().await.len(), 0);
+    assert_eq!(process_capture.0.lock().await.len(), 0);
+    assert_eq!(
+        host_log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|value| value["op"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "tool_receipt_issue",
+            "tool_receipt_consume",
+            "tool_receipt_terminal"
+        ]
+    );
+    assert_eq!(
+        runtime_log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|value| value["op"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["pre", "execute", "terminal"]
+    );
+    let execution = runtime_log.lock().unwrap()[1].clone();
+    assert_eq!(
+        execution["tool_intent"],
+        runtime_log.lock().unwrap()[0]["tool_intent"]
+    );
+    assert_eq!(
+        host_log.lock().unwrap()[2]["backend_route"],
+        "/runtime-host-tool-hook/execute"
+    );
+    let journal = ToolReceiptJournal::load(root.path().join("tool-receipt-journal.json")).unwrap();
+    assert_eq!(
+        journal.state(execution["bridge_call_id"].as_str().unwrap()),
+        Some(ToolReceiptState::Terminal)
+    );
+
+    // A completed capability remains consumed; the Runtime executor is never retried.
+    assert_eq!(
+        app.clone()
+            .oneshot(call(retry_body("protected-replay", command, capability)))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(runtime_log.lock().unwrap().len(), 3);
+
+    // A filename in an ordinary command is not a native routing hint.
+    let ordinary = app
+        .oneshot(call(challenge_body(
+            "ordinary-process",
+            "printf '%s' /runtime/control_event_guard.py",
+        )))
+        .await
+        .unwrap();
+    assert_eq!(ordinary.status(), StatusCode::OK);
+    assert_eq!(native_capture.0.lock().await.len(), 0);
+    assert_eq!(process_capture.0.lock().await.len(), 1);
+    assert_eq!(host_log.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn process_backend_explicit_host_request_cannot_bypass_runtime_pre_rejection() {
+    for command in [
+        "printf unapproved",
+        "/usr/bin/python3 /runtime/control_event_guard.py /tmp/snapshot.json --ledger /repo/TASK_LEDGER.md --repo /repo --controller-session controller-test; touch /tmp/forbidden",
+        "echo '/runtime/control_event_guard.py'",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let host_path = root.path().join("host.sock");
+        let runtime_path = root.path().join("runtime.sock");
+        let host_log = Arc::new(StdMutex::new(Vec::new()));
+        let runtime_log = Arc::new(StdMutex::new(Vec::new()));
+        let _host = spawn_ndjson_server(host_path.clone(), 2, host_handler(host_log.clone()));
+        let _runtime = spawn_ndjson_server(
+            runtime_path.clone(),
+            1,
+            runtime_handler(runtime_log.clone(), true, false),
+        );
+        while !host_path.exists() || !runtime_path.exists() {
+            tokio::task::yield_now().await;
+        }
+        let native_capture = BackendCapture::default();
+        let process_capture = BackendCapture::default();
+        let native_url = backend_server(native_capture.clone(), false).await;
+        let process_url = backend_server(process_capture.clone(), false).await;
+        let app = bridge(&native_url, root.path(), &host_path, Some(&runtime_path))
+            .with_process_backend(&process_url, BACKEND_KEY)
+            .unwrap()
+            .router();
+        let first = response_json(
+            app.clone()
+                .oneshot(call(retry_body("opt-in-reject", command, json!({}))))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            first["error"]["data"]["code"],
+            "HOST_INVOCATION_CAPABILITY_REQUIRED"
+        );
+        let rejected = app
+            .oneshot(call(retry_body(
+                "retry-reject",
+                command,
+                first["error"]["data"]["host_invocation_capability"].clone(),
+            )))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+        assert_eq!(runtime_log.lock().unwrap().len(), 1);
+        assert_eq!(runtime_log.lock().unwrap()[0]["op"], "pre");
+        assert!(native_capture.0.lock().await.is_empty());
+        assert!(process_capture.0.lock().await.is_empty());
+        assert_eq!(host_log.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn process_backend_explicit_host_request_fails_closed_without_runtime_hook_or_chain() {
+    for with_host_chain in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let native_capture = BackendCapture::default();
+        let process_capture = BackendCapture::default();
+        let native_url = backend_server(native_capture.clone(), false).await;
+        let process_url = backend_server(process_capture.clone(), false).await;
+        let host_path = root.path().join("unused-host.sock");
+        let state = if with_host_chain {
+            bridge(&native_url, root.path(), &host_path, None)
+        } else {
+            legacy_bridge(&native_url, root.path())
+        };
+        let app = state
+            .with_process_backend(&process_url, BACKEND_KEY)
+            .unwrap()
+            .router();
+        let denied = app
+            .oneshot(call(retry_body(
+                "opt-in-no-runtime",
+                "printf forbidden",
+                json!({}),
+            )))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(native_capture.0.lock().await.is_empty());
+        assert!(process_capture.0.lock().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn process_backend_explicit_host_request_rejects_invalid_marker_and_caller_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let native_capture = BackendCapture::default();
+    let process_capture = BackendCapture::default();
+    let native_url = backend_server(native_capture.clone(), false).await;
+    let process_url = backend_server(process_capture.clone(), false).await;
+    let app = bridge(
+        &native_url,
+        root.path(),
+        &root.path().join("unused-host.sock"),
+        Some(&root.path().join("unused-runtime.sock")),
+    )
+    .with_process_backend(&process_url, BACKEND_KEY)
+    .unwrap()
+    .router();
+    for marker in [Value::Null, json!(true), json!("caller-token"), json!([])] {
+        let rejected = app
+            .clone()
+            .oneshot(call(retry_body("invalid-marker", "printf blocked", marker)))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    }
+    let mut claimed: Value =
+        serde_json::from_str(&retry_body("caller-identity", "printf blocked", json!({}))).unwrap();
+    claimed["params"]["arguments"]["conversation_id"] = json!("caller-claimed-conversation");
+    let rejected = app.oneshot(call(claimed.to_string())).await.unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert!(native_capture.0.lock().await.is_empty());
+    assert!(process_capture.0.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn process_backend_runtime_execute_bad_responses_are_unknown_without_fallback_or_retry() {
+    for fault in [
+        "rejected",
+        "protocol",
+        "op",
+        "call_id",
+        "execution_id",
+        "extra",
+        "status",
+        "schema",
+        "provenance",
+        "empty",
+        "invalid_json",
+        "wrong_rpc_id",
+        "oversized",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let host_path = root.path().join("host.sock");
+        let runtime_path = root.path().join("runtime.sock");
+        let host_log = Arc::new(StdMutex::new(Vec::new()));
+        let runtime_log = Arc::new(StdMutex::new(Vec::new()));
+        let host = spawn_ndjson_server(host_path.clone(), 2, host_handler(host_log.clone()));
+        let base_handler = runtime_handler(runtime_log.clone(), false, false);
+        let journal_path = root.path().join("tool-receipt-journal.json");
+        let runtime = spawn_ndjson_server(runtime_path.clone(), 2, move |request| {
+            let execute = request["op"] == "execute";
+            if execute {
+                assert_eq!(
+                    ToolReceiptJournal::load(&journal_path)
+                        .unwrap()
+                        .state(request["bridge_call_id"].as_str().unwrap()),
+                    Some(ToolReceiptState::DispatchIntent)
+                );
+            }
+            let mut result = base_handler(request)?;
+            if execute {
+                match fault {
+                    "rejected" => return Err("executor refused".into()),
+                    "protocol" => result["protocol"] = json!("foreign"),
+                    "op" => result["op"] = json!("pre"),
+                    "call_id" => result["bridge_call_id"] = json!("bc_foreign"),
+                    "execution_id" => result["host_tool_execution_id"] = json!("hte_foreign"),
+                    "extra" => result["untrusted"] = json!(true),
+                    "status" => result["backend_http_status"] = json!(500),
+                    "schema" => result["backend_response"]["schema_version"] = json!(2),
+                    "provenance" => result["backend_response"]["provenance"] = json!("foreign"),
+                    "empty" => result["backend_response"]["response_body_utf8"] = json!(""),
+                    "invalid_json" => {
+                        result["backend_response"]["response_body_utf8"] = json!("not JSON")
+                    }
+                    "wrong_rpc_id" => {
+                        result["backend_response"]["response_body_utf8"] =
+                            json!(r#"{"jsonrpc":"2.0","id":"bc_foreign","result":{}}"#)
+                    }
+                    "oversized" => {
+                        result["backend_response"]["response_body_utf8"] = json!("x".repeat(65_537))
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            Ok(result)
+        });
+        while !host_path.exists() || !runtime_path.exists() {
+            tokio::task::yield_now().await;
+        }
+        let native_capture = BackendCapture::default();
+        let process_capture = BackendCapture::default();
+        let native_url = backend_server(native_capture.clone(), false).await;
+        let process_url = backend_server(process_capture.clone(), false).await;
+        let app = bridge(&native_url, root.path(), &host_path, Some(&runtime_path))
+            .with_process_backend(&process_url, BACKEND_KEY)
+            .unwrap()
+            .router();
+        let command = "approved-exact-command";
+        let challenge = response_json(
+            app.clone()
+                .oneshot(call(retry_body("issue", command, json!({}))))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let capability = challenge["error"]["data"]["host_invocation_capability"].clone();
+        let call_id = capability["bridge_call_id"].as_str().unwrap().to_owned();
+        let retry = retry_body("execute", command, capability);
+        let response = app.clone().oneshot(call(retry.clone())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{fault}");
+        assert!(
+            response_text(response)
+                .await
+                .contains("RESULT_UNKNOWN_AFTER_DISPATCH"),
+            "{fault}"
+        );
+        assert_eq!(
+            ToolReceiptJournal::load(root.path().join("tool-receipt-journal.json"))
+                .unwrap()
+                .state(&call_id),
+            Some(ToolReceiptState::ResultUnknownAfterDispatch),
+            "{fault}"
+        );
+        assert_eq!(
+            app.oneshot(call(retry)).await.unwrap().status(),
+            StatusCode::CONFLICT,
+            "{fault}"
+        );
+        assert!(native_capture.0.lock().await.is_empty(), "{fault}");
+        assert!(process_capture.0.lock().await.is_empty(), "{fault}");
+        assert_eq!(host_log.lock().unwrap().len(), 2, "{fault}");
+        assert_eq!(runtime_log.lock().unwrap().len(), 2, "{fault}");
+        host.join().unwrap();
+        runtime.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn process_backend_runtime_execute_transport_loss_and_timeout_are_unknown_once() {
+    for stall in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let host_path = root.path().join("host.sock");
+        let runtime_path = root.path().join("runtime.sock");
+        let host_log = Arc::new(StdMutex::new(Vec::new()));
+        let runtime_log = Arc::new(StdMutex::new(Vec::new()));
+        let host = spawn_ndjson_server(host_path.clone(), 2, host_handler(host_log.clone()));
+        let server_path = runtime_path.clone();
+        let base_handler = runtime_handler(runtime_log.clone(), false, false);
+        let runtime = thread::spawn(move || {
+            let listener = UnixListener::bind(&server_path).unwrap();
+            std::fs::set_permissions(&server_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            for execute in [false, true] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(line.trim_end()).unwrap();
+                let request_id = request["request_id"].clone();
+                let result = base_handler(request).unwrap();
+                if execute {
+                    if stall {
+                        thread::sleep(Duration::from_millis(5_200));
+                    }
+                    // The command may have run, but the response is lost.
+                    break;
+                }
+                writeln!(
+                    stream,
+                    "{}",
+                    json!({"request_id":request_id,"ok":true,"result":result})
+                )
+                .unwrap();
+            }
+        });
+        while !host_path.exists() || !runtime_path.exists() {
+            tokio::task::yield_now().await;
+        }
+        let native_capture = BackendCapture::default();
+        let process_capture = BackendCapture::default();
+        let native_url = backend_server(native_capture.clone(), false).await;
+        let process_url = backend_server(process_capture.clone(), false).await;
+        let app = bridge(&native_url, root.path(), &host_path, Some(&runtime_path))
+            .with_process_backend(&process_url, BACKEND_KEY)
+            .unwrap()
+            .router();
+        let challenge = response_json(
+            app.clone()
+                .oneshot(call(retry_body("issue", "approved", json!({}))))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let capability = challenge["error"]["data"]["host_invocation_capability"].clone();
+        let call_id = capability["bridge_call_id"].as_str().unwrap().to_owned();
+        let retry = retry_body("execute", "approved", capability);
+        let response = tokio::time::timeout(
+            Duration::from_millis(5_700),
+            app.clone().oneshot(call(retry.clone())),
+        )
+        .await
+        .expect("execute deadline must be bounded")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            response_text(response)
+                .await
+                .contains("RESULT_UNKNOWN_AFTER_DISPATCH")
+        );
+        assert_eq!(
+            ToolReceiptJournal::load(root.path().join("tool-receipt-journal.json"))
+                .unwrap()
+                .state(&call_id),
+            Some(ToolReceiptState::ResultUnknownAfterDispatch)
+        );
+        assert_eq!(
+            app.oneshot(call(retry)).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        assert!(native_capture.0.lock().await.is_empty());
+        assert!(process_capture.0.lock().await.is_empty());
+        assert_eq!(host_log.lock().unwrap().len(), 2);
+        assert_eq!(runtime_log.lock().unwrap().len(), 2);
+        host.join().unwrap();
+        runtime.join().unwrap();
+    }
 }

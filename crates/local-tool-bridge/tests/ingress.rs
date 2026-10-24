@@ -504,10 +504,7 @@ async fn discovery_capability_tool_call_request_id_header_remains_replay_protect
     assert_eq!(first.status(), StatusCode::OK);
     let (headers, forwarded_body) = capture.0.lock().await.clone().unwrap();
     assert_eq!(forwarded_body, Bytes::from(body.to_string()));
-    assert_eq!(
-        headers.get("x-lab-request-id").unwrap(),
-        "provider-catdesk-instruction-123"
-    );
+    assert!(headers.get("x-lab-request-id").unwrap().to_str().unwrap().starts_with("rpc-v2:"));
     *capture.0.lock().await = None;
 
     let second = app.oneshot(request()).await.unwrap();
@@ -527,10 +524,7 @@ async fn non_reconnectable_notification_request_id_header_remains_replay_protect
     assert_eq!(first.status(), StatusCode::OK);
     let (headers, forwarded_body) = capture.0.lock().await.clone().unwrap();
     assert_eq!(forwarded_body, Bytes::from(body.to_string()));
-    assert_eq!(
-        headers.get("x-lab-request-id").unwrap(),
-        "provider-notification-123"
-    );
+    assert!(headers.get("x-lab-request-id").unwrap().to_str().unwrap().starts_with("rpc-v2:"));
     *capture.0.lock().await = None;
 
     let second = app.oneshot(request()).await.unwrap();
@@ -589,6 +583,145 @@ async fn trusted_uds_ingress_persists_request_id_replay_before_backend() {
     .router();
     let after_restart = restarted_app.oneshot(request()).await.unwrap();
     assert_eq!(after_restart.status(), StatusCode::FORBIDDEN);
+    assert!(capture.0.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn distinct_rpc_calls_in_one_provider_request_group_do_not_collide() {
+    let capture = Capture::default();
+    let backend_url = backend_server(capture.clone()).await;
+    let state_dir = tempfile::tempdir().unwrap();
+    let app = trusted_bridge(&backend_url, state_dir.path(), vec![Capability::FileRead]).router();
+    let request = |id: &str, arguments: serde_json::Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("x-request-id", "shared-provider-group")
+            .body(Body::from(
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": {"name": "read", "arguments": arguments}
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+    for id in ["rpc-a", "rpc-b"] {
+        let response = app
+            .clone()
+            .oneshot(request(id, serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "distinct RPC {id} must reach backend"
+        );
+    }
+    *capture.0.lock().await = None;
+    // Changing arguments cannot turn an already-used RPC identity into a fresh call.
+    let replay = app
+        .oneshot(request("rpc-a", serde_json::json!({"path": "changed"})))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+    assert!(capture.0.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn legacy_bare_provider_replay_key_stays_rejected_after_upgrade() {
+    let capture = Capture::default();
+    let backend_url = backend_server(capture.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    drop(trusted_bridge(
+        &backend_url,
+        dir.path(),
+        vec![Capability::FileRead],
+    ));
+    let path = dir.path().join("authority-state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    state["records"]["cap-uds-1"]["used_request_ids"] =
+        serde_json::json!(["legacy-provider-group"]);
+    std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+    let authority = CapabilityAuthority::load_or_create_private(dir.path()).unwrap();
+    let grant = authority.lease("cap-uds-1").unwrap().grant.clone();
+    let issued = authority.issued_capability("cap-uds-1").unwrap();
+    let app = BridgeIngress::new_trusted_unix_socket(
+        authority,
+        issued,
+        ExecutionContext {
+            principal_id: grant.principal_id,
+            execution_session_id: grant.execution_session_id,
+            capability_id: grant.capability_id,
+            workspace_id: grant.workspace_id,
+        },
+        &backend_url,
+        BACKEND_KEY,
+        local_tool_bridge::ToolPolicy::catdesk_default(),
+        dir.path(),
+    )
+    .unwrap()
+    .router();
+    let request = Request::builder().method("POST").uri("/mcp")
+        .header("content-type", "application/json").header("x-request-id", "legacy-provider-group")
+        .body(Body::from(r#"{"jsonrpc":"2.0","id":"new-rpc","method":"tools/call","params":{"name":"read","arguments":{}}}"#)).unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(capture.0.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn provider_group_rpc_ids_keep_json_types_distinct() {
+    let capture = Capture::default();
+    let backend_url = backend_server(capture).await;
+    let dir = tempfile::tempdir().unwrap();
+    let app = trusted_bridge(&backend_url, dir.path(), vec![Capability::FileRead]).router();
+    for id in [serde_json::json!(1), serde_json::json!("1")] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("x-request-id", "typed-group")
+            .body(Body::from(
+                serde_json::json!({"jsonrpc":"2.0", "id":id, "method":"tools/call",
+                "params":{"name":"read","arguments":{}}})
+                .to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+}
+
+#[tokio::test]
+async fn null_rpc_id_and_missing_notification_id_have_separate_replay_fences() {
+    let capture = Capture::default();
+    let backend_url = backend_server(capture.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let app = trusted_bridge(&backend_url, dir.path(), vec![Capability::FileRead]).router();
+    let request = |id: Option<serde_json::Value>, args: serde_json::Value| {
+        let mut body = serde_json::json!({"jsonrpc":"2.0", "method":"tools/call",
+            "params":{"name":"read","arguments":args}});
+        if let Some(id) = id { body["id"] = id; }
+        Request::builder().method("POST").uri("/mcp")
+            .header("content-type", "application/json").header("x-request-id", "null-group")
+            .body(Body::from(body.to_string())).unwrap()
+    };
+    let first = app.clone().oneshot(request(Some(serde_json::Value::Null), serde_json::json!({}))).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    *capture.0.lock().await = None;
+    let changed = app.clone().oneshot(request(Some(serde_json::Value::Null), serde_json::json!({"changed":true}))).await.unwrap();
+    assert_eq!(changed.status(), StatusCode::FORBIDDEN);
+    assert!(capture.0.lock().await.is_none());
+    let missing = app.clone().oneshot(request(None, serde_json::json!({}))).await.unwrap();
+    assert_eq!(missing.status(), StatusCode::OK);
+    *capture.0.lock().await = None;
+    let replay = app.oneshot(request(None, serde_json::json!({}))).await.unwrap();
+    assert_eq!(replay.status(), StatusCode::FORBIDDEN);
     assert!(capture.0.lock().await.is_none());
 }
 

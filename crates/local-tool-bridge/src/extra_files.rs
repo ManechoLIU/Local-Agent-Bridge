@@ -35,8 +35,8 @@ pub fn parse_extra_file_roots(raw: Option<&str>, production: bool) -> Result<Vec
             push_unique(&mut roots, validate_extra_file_root(Path::new(part), production)?);
         }
     }
-    if roots.len() > 16 {
-        return Err("authorized file roots are limited to 16 directories".into());
+    if roots.len() > 64 {
+        return Err("authorized file roots are limited to 64 directories".into());
     }
     Ok(roots)
 }
@@ -290,8 +290,8 @@ fn authorize_root(path: String, production: bool) -> Result<Value, String> {
     let mut roots = load_authorized_roots_from(&file, production).unwrap_or_default();
     let already = roots.iter().any(|existing| existing == &root);
     if !already {
-        if roots.len() >= 16 {
-            return Err("authorized file roots are limited to 16 directories".into());
+        if roots.len() >= 64 {
+            return Err("authorized file roots are limited to 64 directories".into());
         }
         roots.push(root.clone());
         write_authorized_roots_file(&file, &roots)?;

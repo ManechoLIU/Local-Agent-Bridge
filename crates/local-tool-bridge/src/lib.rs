@@ -1031,7 +1031,30 @@ async fn handle_mcp(
         .and_then(|value| value.get("name"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let protected = if state.inner.process_backend.is_none()
+    // An explicit capability object opts into Host protection even when a
+    // Process Runtime is configured. Command authorization remains with the
+    // Runtime hook; neither a command string nor this marker grants execution.
+    let explicit_host_protection = tool_name == "run_command"
+        && parsed
+            .get("params")
+            .and_then(|value| value.get("arguments"))
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|arguments| arguments.contains_key("host_invocation_capability"));
+    if state.inner.process_backend.is_some()
+        && explicit_host_protection
+        && state
+            .inner
+            .tool_receipts
+            .as_ref()
+            .and_then(|chain| chain.runtime_socket.as_ref())
+            .is_none()
+    {
+        return text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "explicit Host protection requires the Host receipt chain and Runtime pre hook",
+        );
+    }
+    let protected = if (state.inner.process_backend.is_none() || explicit_host_protection)
         && state.inner.tool_receipts.is_some()
         && (tool_name == "run_command" || header_text(&headers, "mcp-name") == Some("run_command"))
     {
@@ -1072,12 +1095,18 @@ async fn handle_mcp(
             // methods. Proof IDs are authority replay keys, so keep them unique.
             Uuid::new_v4().to_string()
         } else {
-            // Non-discovery paths only treat a non-empty x-request-id as the
-            // authority replay key. ChatGPT/tunnel reuses JSON-RPC id 0 without
-            // that header, so body id must not be an authority key.
+            // The provider header identifies a group of RPC calls, not one call.
+            // Keep RPC ID types distinct and reject a reused ID even if its
+            // arguments change. Notifications without an ID use their body hash.
             header_text(&headers, "x-request-id")
                 .filter(|value| !value.is_empty())
-                .map(str::to_string)
+                .map(|provider_id| {
+                    let identity = match parsed.get("id") {
+                        Some(id) => serde_json::json!([provider_id, "rpc", id]),
+                        None => serde_json::json!([provider_id, "notification", format!("{:x}", Sha256::digest(&body))]),
+                    };
+                    format!("rpc-v2:{:x}", Sha256::digest(identity.to_string().as_bytes()))
+                })
                 .unwrap_or_else(|| Uuid::new_v4().to_string())
         };
     let nonce = Uuid::new_v4().to_string();
@@ -1117,6 +1146,15 @@ async fn handle_mcp(
                 }
             }
         }
+        // Old records only contain the bare provider ID. We cannot infer which
+        // RPC consumed it, so preserve that rejection across upgrades.
+        if protected.is_none() && !is_reconnectable_discovery_method(method, &capability) {
+            if let Some(provider_id) = header_text(&headers, "x-request-id").filter(|id| !id.is_empty()) {
+                if authority.has_used_request_id(&state.inner.context.capability_id, provider_id) {
+                    return text_response(StatusCode::FORBIDDEN, "request id replay detected");
+                }
+            }
+        }
         let issued =
             match authority.issued_capability_at(&state.inner.context.capability_id, now_ms) {
                 Ok(issued) => issued,
@@ -1153,12 +1191,17 @@ async fn handle_mcp(
     };
 
     if let (Some(protected), Some(chain)) = (protected, state.inner.tool_receipts.as_ref()) {
-        if state.inner.process_backend.is_none() {
-            return match handle_protected_run_command(&state, &headers, protected, body, chain).await {
-                Ok(response) => response,
-                Err(error) => text_response(error.status, &error.message),
-            };
-        }
+        // With Process Runtime configured, only explicit Host opt-in reaches
+        // this branch; its execution must stay on the approved Runtime channel.
+        let runtime_execute = state.inner.process_backend.is_some();
+        return match handle_protected_run_command(
+            &state, &headers, protected, body, chain, runtime_execute,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => text_response(error.status, &error.message),
+        };
     }
 
     if method == "tools/call" && collaboration_tools::is_feishu_admin_tool(tool_name) {
@@ -1634,6 +1677,65 @@ fn runtime_backend_response(bytes: &[u8]) -> Result<serde_json::Value, String> {
     }))
 }
 
+fn parse_runtime_execute_response(
+    value: &serde_json::Value,
+    call_id: &str,
+    execution_id: &str,
+) -> Result<BufferedBackendResponse, String> {
+    let object = value
+        .as_object()
+        .ok_or("Runtime execute result must be an object")?;
+    const FIELDS: &[&str] = &[
+        "protocol",
+        "op",
+        "bridge_call_id",
+        "host_tool_execution_id",
+        "backend_http_status",
+        "backend_response",
+    ];
+    if object.len() != FIELDS.len() || object.keys().any(|key| !FIELDS.contains(&key.as_str())) {
+        return Err("Runtime execute result schema is not exact".into());
+    }
+    validate_runtime_result(value, "op", "execute", call_id, execution_id)?;
+    if value
+        .get("backend_http_status")
+        .and_then(serde_json::Value::as_u64)
+        != Some(200)
+    {
+        return Err("Runtime execute backend HTTP status is invalid".into());
+    }
+    let envelope = value
+        .get("backend_response")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("Runtime execute backend response is missing")?;
+    if envelope.len() != 3
+        || envelope.keys().any(|key| {
+            !["schema_version", "provenance", "response_body_utf8"].contains(&key.as_str())
+        })
+        || envelope
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+        || envelope
+            .get("provenance")
+            .and_then(serde_json::Value::as_str)
+            != Some(RUNTIME_BACKEND_RESPONSE_PROVENANCE)
+    {
+        return Err("Runtime execute backend response schema is invalid".into());
+    }
+    let raw = envelope
+        .get("response_body_utf8")
+        .and_then(serde_json::Value::as_str)
+        .filter(|raw| !raw.is_empty() && raw.len() <= MAX_PROTECTED_RESPONSE_BYTES)
+        .ok_or("Runtime execute backend response bytes are missing or oversized")?;
+    validate_backend_response(raw.as_bytes(), call_id)?;
+    Ok(BufferedBackendResponse {
+        status: StatusCode::OK,
+        content_type: Some("application/json".into()),
+        bytes: Bytes::copy_from_slice(raw.as_bytes()),
+    })
+}
+
 fn parse_protected_run_command(body: &[u8]) -> Result<ProtectedRunCommand, String> {
     if body.len() > MAX_PROTECTED_REQUEST_BYTES {
         return Err("protected run_command request exceeds 64 KiB".into());
@@ -1681,6 +1783,8 @@ fn parse_protected_run_command(body: &[u8]) -> Result<ProtectedRunCommand, Strin
         .ok_or_else(|| "protected run_command arguments must be an object".to_string())?;
     let capability = match arguments.get("host_invocation_capability") {
         None => None,
+        // An empty object requests a fresh machine-issued Host challenge.
+        Some(value) if value.as_object().is_some_and(|object| object.is_empty()) => None,
         Some(value) if value.is_object() => Some(value.clone()),
         Some(_) => return Err("host_invocation_capability must be a non-null object".into()),
     };
@@ -1755,6 +1859,7 @@ async fn handle_protected_run_command(
     protected: ProtectedRunCommand,
     raw_body: Bytes,
     chain: &ToolReceiptChain,
+    runtime_execute: bool,
 ) -> Result<Response<Body>, FlowError> {
     let mut journal = chain.journal.lock().await;
     if protected.capability.is_none() {
@@ -1966,40 +2071,65 @@ async fn handle_protected_run_command(
         })
         .map_err(|error| FlowError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX);
-    let issued = state
-        .inner
-        .authority
-        .lock()
+    let execution_result = if runtime_execute {
+        match chain.runtime_socket.as_ref() {
+            Some(socket) => call_private_ndjson(
+                socket,
+                serde_json::json!({
+                    "op":"execute", "protocol":RUNTIME_HOOK_PROTOCOL,
+                    "bridge_call_id":record.bridge_call_id,
+                    "host_tool_execution_id":host_tool_execution_id,
+                    "pre_receipt":pre_receipt.clone(),
+                    "tool_intent":tool_intent.clone(),
+                }),
+            )
+            .await
+            .and_then(|value| {
+                parse_runtime_execute_response(
+                    &value,
+                    &record.bridge_call_id,
+                    &host_tool_execution_id,
+                )
+            }),
+            None => Err("approved Runtime executor is unavailable".into()),
+        }
+    } else {
+        // Preserve only the existing no-Process legacy receipt route.
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let issued = state
+            .inner
+            .authority
+            .lock()
+            .await
+            .issued_capability_at(&state.inner.context.capability_id, now_ms)
+            .map_err(|error| FlowError::new(StatusCode::FORBIDDEN, error))?;
+        let proof = sign_request_for_execution(
+            &issued,
+            &state.inner.context,
+            &host_tool_execution_id,
+            &Uuid::new_v4().to_string(),
+            &Uuid::new_v4().to_string(),
+            "tools/call",
+            "run_command",
+            &record.frozen_forwarded,
+        )
+        .map_err(|error| FlowError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        send_to_backend_buffered(
+            state,
+            &state.inner.default_backend,
+            incoming,
+            &proof.to_headers(),
+            Bytes::from(record.frozen_forwarded.clone()),
+            protected.backend_deadline(),
+        )
         .await
-        .issued_capability_at(&state.inner.context.capability_id, now_ms)
-        .map_err(|error| FlowError::new(StatusCode::FORBIDDEN, error))?;
-    let proof = sign_request_for_execution(
-        &issued,
-        &state.inner.context,
-        &host_tool_execution_id,
-        &Uuid::new_v4().to_string(),
-        &Uuid::new_v4().to_string(),
-        "tools/call",
-        "run_command",
-        &record.frozen_forwarded,
-    )
-    .map_err(|error| FlowError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    let backend = match send_to_backend_buffered(
-        state,
-        backend_for_run_command(state),
-        incoming,
-        &proof.to_headers(),
-        Bytes::from(record.frozen_forwarded.clone()),
-        protected.backend_deadline(),
-    )
-    .await
-    {
+    };
+    let backend = match execution_result {
         Ok(value) => value,
         Err(error) => {
             mark_result_unknown(&mut journal, &capability_id, None, None);
@@ -2069,7 +2199,11 @@ async fn handle_protected_run_command(
             format!("RESULT_UNKNOWN_AFTER_DISPATCH: {error}"),
         ));
     }
-    let backend_route = backend_for_run_command(state).url.path().to_string();
+    let backend_route = if runtime_execute {
+        "/runtime-host-tool-hook/execute".to_string()
+    } else {
+        state.inner.default_backend.url.path().to_string()
+    };
     let terminal_classification = if backend.status.is_success() {
         "SUCCESS"
     } else {

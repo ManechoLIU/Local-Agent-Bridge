@@ -14,6 +14,20 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
     return normalizedText(raw);
   }
 
+  function findComposer() {
+    const candidates = new Set([
+      document.querySelector('#prompt-textarea[contenteditable="true"]'),
+      ...document.querySelectorAll('form[data-chatgpt-composer] [data-composer-markdown][contenteditable="true"][role="textbox"]')
+    ].filter(Boolean));
+    const visible = Array.from(candidates).filter(function (node) {
+      if (typeof node.getBoundingClientRect !== "function") return true;
+      const rect = node.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    });
+    // Multiple editors are ambiguous; never select or overwrite an arbitrary draft.
+    return visible.length === 1 ? visible[0] : null;
+  }
+
   function conversationFromCurrentLocation() {
     const url = new URL(globalThis.location.href);
     if (url.protocol !== "https:" || url.hostname !== "chatgpt.com") {
@@ -63,18 +77,31 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
   }
 
   function currentUserMessageCount() {
-    return document.querySelectorAll('[data-message-author-role="user"]').length;
+    return visibleUserMessageNodes().length;
   }
 
   function visibleUserMessageNodes() {
-    return Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+    const nodes = Array.from(new Set([
+      ...document.querySelectorAll('[data-message-author-role="user"]'),
+      ...document.querySelectorAll('[data-user-message-bubble="true"]')
+    ]));
+    // Prefer the inner bubble if both generations of markup wrap one message.
+    return nodes.filter(function (node) {
+      return !nodes.some(function (other) {
+        return other !== node && typeof node.contains === "function" && node.contains(other);
+      });
+    });
   }
 
   function normalizedUserMessageText(node) {
     if (!node) return "";
-    const raw = typeof node.innerText === "string"
-      ? node.innerText
-      : String(node.textContent || "");
+    // Read the message body separately from UI controls. A trailing word such
+    // as "展开" may be real user content and must never be deleted by text rules.
+    const body = typeof node.querySelector === "function"
+      ? node.querySelector("[data-search-result-target]") || node : node;
+    const raw = typeof body.innerText === "string"
+      ? body.innerText
+      : String(body.textContent || "");
     return normalizedText(raw);
   }
 
@@ -93,6 +120,11 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
   function responseIsActive() {
     const stop = document.querySelector('button[data-testid="stop-button"]');
     if (stop) return true;
+    const composerStop = Array.from(document.querySelectorAll('form[data-chatgpt-composer] button')).some(function (node) {
+      const label = String(node.getAttribute && node.getAttribute("aria-label") || "").trim().toLowerCase();
+      return label === "停止" || label === "stop";
+    });
+    if (composerStop) return true;
     const labelled = Array.from(document.querySelectorAll("button,[role=button]")).find(function (node) {
       const label = String(node.getAttribute && node.getAttribute("aria-label") || "")
         .trim()
@@ -213,7 +245,7 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
       };
     }
 
-    const composer = document.querySelector('#prompt-textarea[contenteditable="true"]');
+    const composer = findComposer();
     if (!composer) {
       return {
         prepared: false,
@@ -239,6 +271,24 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
         baseline_user_message_count: currentUserMessageCount(),
         initial_send_control: null
       };
+    }
+    if (ownsPreparedPayload) {
+      const expected = payload.trim();
+      const alreadySubmitted = visibleUserMessageNodes().some(function (node) {
+        return normalizedUserMessageText(node) === expected;
+      });
+      if (alreadySubmitted) {
+        return {
+          prepared: false,
+          ready_to_dispatch: false,
+          dispatch_attempted: false,
+          submit_confirmed: false,
+          retryable: false,
+          status: "payload_already_submitted",
+          baseline_user_message_count: currentUserMessageCount(),
+          initial_send_control: null
+        };
+      }
     }
     if (responseIsActive()) {
       return {
@@ -301,7 +351,7 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
         send_control: null
       };
     }
-    const composer = document.querySelector('#prompt-textarea[contenteditable="true"]');
+    const composer = findComposer();
     if (!composer) {
       return {
         resolved: false,
@@ -360,7 +410,7 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
         routeMatches = false;
       }
       if (routeMatches) {
-        const composer = document.querySelector('#prompt-textarea[contenteditable="true"]');
+        const composer = findComposer();
         const composerEmpty = normalizedComposerText(composer) === "";
         const messageExists = await exactNewPayloadMessageExists();
         if (messageExists) {
@@ -377,7 +427,7 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
       await new Promise(function (resolve) { setTimeout(resolve, 25); });
     }
 
-    const composer = document.querySelector('#prompt-textarea[contenteditable="true"]');
+    const composer = findComposer();
     return {
       dispatch_attempted: true,
       submit_confirmed: false,
@@ -403,7 +453,7 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
     } catch {
       return { safe_to_clear: false, status: "wrong_conversation", composer_empty: false };
     }
-    const composer = document.querySelector('#prompt-textarea[contenteditable="true"]');
+    const composer = findComposer();
     if (!composer) {
       return { safe_to_clear: false, status: "composer_unavailable", composer_empty: false };
     }
@@ -427,7 +477,7 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
     } catch {
       return { composer_empty: false, status: "wrong_conversation" };
     }
-    const composer = document.querySelector('#prompt-textarea[contenteditable="true"]');
+    const composer = findComposer();
     return {
       composer_empty: normalizedComposerText(composer) === "",
       status: composer ? "observed" : "composer_unavailable"
@@ -487,7 +537,7 @@ export async function pageSubmitOperationFunction(operationValue, inputValue) {
     }
 
     const exactUserMessage = await exactPayloadMessageExists();
-    const composer = document.querySelector('#prompt-textarea[contenteditable="true"]');
+    const composer = findComposer();
     if (!composer) {
       return {
         status: "composer_unavailable",

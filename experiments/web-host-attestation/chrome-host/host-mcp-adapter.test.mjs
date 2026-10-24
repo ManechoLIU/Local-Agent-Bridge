@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -122,6 +122,34 @@ test('Host MCP loads the production fence from a private manifest and exact runt
   );
 });
 
+test('Host MCP reads owner-only immutable production manifest without chmod mutation', t => {
+  const root = mkdtempSync(join(tmpdir(), 'lab-host-immutable-release-'));
+  t.after(() => rmSync(root, {recursive:true, force:true}));
+  const manifestPath = join(root, 'release.json');
+  writeFileSync(manifestPath, JSON.stringify({
+    ...FENCE,
+    fail_closed:true,
+    tunnel:{profile_name:FENCE.tunnel_profile_name},
+    host:{contract_version:FENCE.contract_version, release_revision:FENCE.release_revision,
+      endpoint_generation:FENCE.endpoint_generation}
+  }));
+  chmodSync(manifestPath, 0o400);
+  const env = {
+    LAB_PRODUCTION_RELEASE_MANIFEST_FILE:manifestPath,
+    LAB_PRODUCTION_CONNECTOR_ID:FENCE.connector_id,
+    LAB_PRODUCTION_CONTRACT_VERSION:FENCE.contract_version,
+    LAB_PRODUCTION_RELEASE_REVISION:FENCE.release_revision,
+    LAB_PRODUCTION_ENDPOINT_GENERATION:String(FENCE.endpoint_generation),
+    LAB_PRODUCTION_WORKSPACE:FENCE.workspace,
+    LAB_PRODUCTION_TUNNEL_PROFILE_NAME:FENCE.tunnel_profile_name
+  };
+  assert.deepEqual(productionReleaseFenceFromEnvironment(env), FENCE);
+  assert.equal(statSync(manifestPath).mode & 0o777, 0o400,
+    'private immutable production manifest must never be chmod-ed on read');
+  chmodSync(manifestPath, 0o644);
+  assert.throws(() => productionReleaseFenceFromEnvironment(env), /permissions must be 0600 or stricter/);
+});
+
 test('Host MCP process rejects an invalid production manifest before reading backend keys or state', t => {
   const root = mkdtempSync(join(tmpdir(), 'lab-host-production-startup-order-'));
   t.after(() => rmSync(root, {recursive: true, force: true}));
@@ -215,6 +243,38 @@ test('Host MCP rejects caller conversation identity before Host execution', asyn
   assert.equal(response.status, 400);
   assert.equal(called, false);
   assert.match(JSON.parse(response.body).error.message, /conversation_id|additional/i);
+});
+
+test('Host MCP preserves trusted current-entry failure as fenced tool error rather than opaque 503', async () => {
+  const handler = createHostMcpHandler(handlerOptions({
+    execute: async () => { throw new Error('HOST_CURRENT_ENTRY_UNAVAILABLE: trusted Host invocation context unavailable'); }
+  }));
+  const response = await handler(request({
+    jsonrpc:'2.0', id:'host-unavailable', method:'tools/call',
+    params:{name:'discover_current_entry', arguments:{target_generation:8, ownership_generation:8}}
+  }));
+  assert.equal(response.status, 200);
+  const payload = JSON.parse(response.body);
+  assert.equal(payload.result.isError, true);
+  assert.equal(payload.result.structuredContent.error_code, 'HOST_CURRENT_ENTRY_UNAVAILABLE');
+  assert.match(payload.result.structuredContent.message, /trusted Host invocation context unavailable/);
+  assert.equal('current_entry' in payload.result.structuredContent, false);
+  assert.deepEqual(payload.result._meta?.['local-agent-bridge/production-fence'], FENCE);
+});
+
+test('Host MCP rejects untrusted verifier results without producing identity evidence', async () => {
+  const handler = createHostMcpHandler(handlerOptions({
+    execute: async () => ({ok:true, operation:'discover_current_entry', current_entry:{conversation_id:'forged'}})
+  }));
+  const response = await handler(request({
+    jsonrpc:'2.0', id:'untrusted', method:'tools/call',
+    params:{name:'discover_current_entry', arguments:{target_generation:8, ownership_generation:8}}
+  }));
+  assert.equal(response.status, 200);
+  const payload = JSON.parse(response.body);
+  assert.equal(payload.result.isError, true);
+  assert.equal(payload.result.structuredContent.error_code, 'HOST_ATTESTATION_FAILED');
+  assert.equal('current_entry' in payload.result.structuredContent, false);
 });
 
 test('Host MCP rejects wrong backend key', async () => {

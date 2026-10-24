@@ -21,6 +21,13 @@ use uuid::Uuid;
 const PRODUCTION_BRIDGE_SOCKET: &str = "/tmp/local-agent-bridge-production/bridge.sock";
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Reject unknown arguments before reading any deployment configuration.
+    let mut arguments = env::args_os().skip(1);
+    let check_config = match (arguments.next(), arguments.next()) {
+        (None, None) => false,
+        (Some(argument), None) if argument == "--check-config" => true,
+        _ => return Err("unsupported command-line arguments".into()),
+    };
     let socket_path = required_env("LAB_BRIDGE_SOCKET")?;
     let backend_url = required_env("LAB_BRIDGE_BACKEND_URL")?;
     let host_backend_url = env::var("LAB_HOST_BACKEND_URL").ok();
@@ -139,6 +146,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX);
+    if check_config {
+        if env_flag("LAB_BRIDGE_ROTATE_MASTER_KEY") {
+            return Err("--check-config cannot rotate authority keys".into());
+        }
+        if !state_dir.join("authority-state.json").is_file() {
+            return Err("--check-config requires an existing capability authority".into());
+        }
+    }
     let mut authority = CapabilityAuthority::load_or_create_private(&state_dir)?;
     if env_flag("LAB_BRIDGE_ROTATE_MASTER_KEY") {
         let expected = required_env("LAB_BRIDGE_EXPECTED_KEY_GENERATION")?
@@ -167,10 +182,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into());
             }
         }
+    } else if check_config {
+        return Err("--check-config requires an existing capability lease".into());
     } else {
         authority.issue(grant, now_ms, ttl_ms, 1)?
     };
-    authority.save_private(&state_dir)?;
+    if !check_config {
+        authority.save_private(&state_dir)?;
+    }
 
     // UDS ownership/permissions are the local ingress authentication boundary.
     // Capability replay state is persisted before any backend side effect.
@@ -310,6 +329,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let extra_file_roots = extra_file_roots_from_env(production_mode)?;
     ingress = ingress.with_extra_file_roots(extra_file_roots)?;
     ingress = ingress.with_extra_file_production(production_mode)?;
+    if check_config {
+        println!("{}", serde_json::json!({
+            "check_config": true,
+            "production_mode": production_mode,
+            "listening": false,
+        }));
+        return Ok(());
+    }
     let app = ingress.router();
 
     let socket = PathBuf::from(&socket_path);

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
-import { chmodSync, lstatSync, readFileSync } from 'node:fs';
+import { lstatSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -195,7 +195,23 @@ export function createHostMcpHandler(options) {
         }
       });
     } catch (error) {
-      return json(503, {jsonrpc: '2.0', id, error: {code: -32002, message: String(error?.message || error)}});
+      // A Host identity failure is a tool-level error, not a transport outage.
+      // Preserve the production fence so ingress can return the reason instead
+      // of collapsing it into an opaque downstream 5xx. Never include a
+      // current_entry in a failure receipt: Controller recovery stays closed.
+      const message = String(error?.message || error);
+      const error_code = /^HOST_CURRENT_ENTRY_UNAVAILABLE(?::|$)/.test(message)
+        ? 'HOST_CURRENT_ENTRY_UNAVAILABLE' : 'HOST_ATTESTATION_FAILED';
+      const structuredContent = {error_code, message};
+      return json(200, {
+        jsonrpc: '2.0', id,
+        result: {
+          content: [{type: 'text', text: JSON.stringify(structuredContent)}],
+          structuredContent,
+          isError: true,
+          _meta: {'local-agent-bridge/production-fence': productionFence}
+        }
+      });
     }
   };
 }
@@ -205,7 +221,9 @@ function readPrivateText(path, minimumBytes) {
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`private file must be regular and non-symlink: ${path}`);
   if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) throw new Error(`private file owner mismatch: ${path}`);
   if ((stat.mode & 0o077) !== 0) throw new Error(`private file permissions must be 0600 or stricter: ${path}`);
-  chmodSync(path, 0o600);
+  // Immutable production releases can be owner-readable but chmod-denied.
+  // The lstat already enforces a safe private mode; do not mutate the file
+  // just to read it. On some hardened installations chmod throws EPERM.
   const value = readFileSync(path);
   if (value.length < minimumBytes) throw new Error(`private file is too short: ${path}`);
   return value;
