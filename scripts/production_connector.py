@@ -215,6 +215,45 @@ RUNTIME_EXTENSION_EXECUTION_RELATIVE_PATHS = (
     "trusted-input.js",
     "submit-transaction-queue.js",
 )
+RUNTIME_EXTENSION_COMPONENT_SCHEMA = "runtime_host_extension_component_patch_v1"
+RUNTIME_EXTENSION_COMPONENT_ALLOWLIST = ("submit-page.js",)
+RUNTIME_EXTENSION_REGISTRY_OVERLAY_INCOMPLETE_SCHEMA = (
+    "runtime_host_extension_component_registry_overlay_v1"
+)
+RUNTIME_EXTENSION_REGISTRY_OVERLAY_SCHEMA = (
+    "runtime_host_extension_component_background_registry_overlay_v1"
+)
+RUNTIME_EXTENSION_REGISTRY_OVERLAY_COMPONENT = (
+    "chrome-extension-background-registry-overlay"
+)
+RUNTIME_EXTENSION_REGISTRY_OVERLAY_RELATIVE = "current-entry-registry.js"
+RUNTIME_EXTENSION_REGISTRY_OVERLAY_BACKGROUND_RELATIVE = "background.js"
+RUNTIME_EXTENSION_REGISTRY_OVERLAY_ALLOWLIST = (
+    "background.js",
+    "current-entry-registry.js",
+    "submit-page.js",
+)
+RUNTIME_EXTENSION_REGISTRY_OVERLAY_PRIOR_CHANGED = (
+    "background.js",
+    "current-entry-registry.js",
+)
+RUNTIME_EXTENSION_REGISTRY_OVERLAY_GIT_COMMIT = (
+    "219fe5051c63fcb73a71437b866879406e3e2315"
+)
+RUNTIME_EXTENSION_REGISTRY_OVERLAY_GIT_PATHS = {
+    "background.js": (
+        "experiments/web-host-attestation/chrome-host/extension/background.js"
+    ),
+    "current-entry-registry.js": (
+        "experiments/web-host-attestation/chrome-host/extension/current-entry-registry.js"
+    ),
+}
+RUNTIME_EXTENSION_REGISTRY_OVERLAY_GIT_PATH = RUNTIME_EXTENSION_REGISTRY_OVERLAY_GIT_PATHS[
+    "current-entry-registry.js"
+]
+RUNTIME_EXTENSION_REGISTRY_OVERLAY_BACKGROUND_GIT_PATH = (
+    RUNTIME_EXTENSION_REGISTRY_OVERLAY_GIT_PATHS["background.js"]
+)
 
 
 def canonical_workspace() -> Path:
@@ -395,6 +434,7 @@ def production_layout(
     }
 
 
+
 def production_component_env(
     manifest: dict[str, Any],
     layout: dict[str, Path],
@@ -500,6 +540,7 @@ def production_component_env(
         bridge["LAB_FEISHU_TIMEOUT_MS"] = "30000"
         bridge["LAB_FEISHU_OUTPUT_LIMIT"] = str(1024 * 1024)
     return {"host": host, "bridge": bridge, "process_runtime": process_runtime, "computer_runtime": computer_runtime}
+
 
 
 def production_tunnel_profile(
@@ -741,6 +782,8 @@ def install_release_bundle(
         _private_dir(layout["tunnel_dir"])
         published_profile_changed = True
         _write_json_private(published_profile, profile)
+        validate_installed_release(layout, require_sealed=False)
+        _seal_release_tree(release_dir)
         validate_installed_release(layout)
     except Exception as error:
         cleanup_errors: list[str] = []
@@ -831,7 +874,40 @@ def _normalize_production_catdesk_config(path: Path) -> None:
     _write_text_private(path, normalized, 0o600)
 
 
-def validate_installed_release(layout: dict[str, Path]) -> dict[str, Any]:
+def _seal_release_tree(release_dir: Path) -> None:
+    """Seal release directories so runtime cannot leave unlisted artifacts behind.
+
+    Runtime state lives outside this tree.  Existing private release files stay
+    owner-readable/writable because generation-34 runtime readers normalize
+    those files to mode 0600 at startup.  Removing write bits from every
+    directory still prevents backup or repair files from being created inside
+    the immutable release and poisoning reboot recovery.  Artifact hashes catch
+    any in-place file modification.
+    """
+    root = Path(release_dir)
+    entries = [root, *root.rglob("*")]
+    if any(item.is_symlink() for item in entries):
+        raise RuntimeError("production release cannot be sealed with symlinks")
+    directories = [item for item in entries if item.is_dir()]
+    original_modes = {
+        item: stat.S_IMODE(item.stat().st_mode)
+        for item in directories
+    }
+    try:
+        for item in reversed(directories):
+            item.chmod(original_modes[item] & ~0o222)
+    except Exception:
+        for item in directories:
+            try:
+                item.chmod(original_modes[item])
+            except OSError:
+                pass
+        raise
+
+
+def validate_installed_release(
+    layout: dict[str, Path], *, require_sealed: bool = True
+) -> dict[str, Any]:
     manifest_path = layout["release_manifest"]
     _validate_private_source(manifest_path, "production release manifest")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -842,6 +918,16 @@ def validate_installed_release(layout: dict[str, Path]) -> dict[str, Any]:
     _validate_runtime_dependencies(manifest)
     _validate_release_local_node(layout, manifest)
     release_dir = layout["release_dir"]
+    if require_sealed:
+        writable_directories = []
+        for item in (release_dir, *release_dir.rglob("*")):
+            if item.is_dir() and stat.S_IMODE(item.stat().st_mode) & 0o222:
+                writable_directories.append(str(item.relative_to(release_dir)) or ".")
+        if writable_directories:
+            raise RuntimeError(
+                "production release directories are writable: "
+                + ", ".join(sorted(writable_directories))
+            )
     expected_files = {str(relative) for relative in artifacts}
     if "release.json" in expected_files:
         raise RuntimeError("production release manifest must not hash itself as an artifact")
@@ -900,9 +986,24 @@ def _install_native_messaging_manifests_unlocked(
     home_dir: Path = Path.home(),
     native_user_data_dirs: Iterable[Path] = (),
     browser_executables: Iterable[Path] = (),
+    extension_component_manifest: Path | None = None,
+    rollback_extension_component_manifest: Path | None = None,
 ) -> dict[str, Path]:
     _validate_manifest_contract(manifest)
-    _validate_immutable_native_wrapper(layout, manifest)
+    if (
+        extension_component_manifest is not None
+        and rollback_extension_component_manifest is not None
+    ):
+        raise RuntimeError("extension component apply and rollback are mutually exclusive")
+    component_operation = (
+        extension_component_manifest is not None
+        or rollback_extension_component_manifest is not None
+    )
+    _validate_immutable_native_wrapper(
+        layout,
+        manifest,
+        allow_legacy_component_source=component_operation,
+    )
     wrapper = layout["native_host_wrapper"]
     info = wrapper.lstat()
     if wrapper.is_symlink() or not wrapper.is_file() or info.st_uid != os.geteuid():
@@ -923,12 +1024,37 @@ def _install_native_messaging_manifests_unlocked(
         "allowed_origins": [f"chrome-extension://{HOST_EXTENSION_ID}/"],
     }
     paths = _native_messaging_paths(home_dir, native_user_data_dirs=native_user_data_dirs)
+    if rollback_extension_component_manifest is not None:
+        binding_raw = _read_private_bytes_if_present(
+            layout["host_extension_binding"], "Runtime Host extension binding"
+        )
+        if binding_raw is None:
+            raise RuntimeError("Runtime Host extension binding is missing for rollback")
+        try:
+            current_binding = json.loads(binding_raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RuntimeError("Runtime Host extension binding is invalid for rollback") from error
+        current_extension_dir = current_binding.get("extension_dir")
+        if not isinstance(current_extension_dir, str) or not Path(current_extension_dir).is_absolute():
+            raise RuntimeError("Runtime Host extension rollback source is invalid")
+        expected_component = _validate_runtime_extension_component_patch(
+            layout,
+            manifest,
+            extension_dir=Path(current_extension_dir),
+            component_manifest=rollback_extension_component_manifest,
+        )
+        if current_binding.get("component_patch") != expected_component:
+            raise RuntimeError("Runtime Host extension rollback provenance mismatch")
+        extension_component_manifest = (
+            _runtime_extension_component_rollback_restore_manifest(expected_component)
+        )
     extension_binding = _build_runtime_extension_binding(
         layout,
         manifest,
         home_dir=home_dir,
         native_user_data_dirs=native_user_data_dirs,
         browser_executables=browser_executables,
+        extension_component_manifest=extension_component_manifest,
     )
     config_path = _runtime_verifier_config_path(home_dir)
     with _runtime_verifier_config_lock(home_dir):
@@ -953,10 +1079,16 @@ def _install_native_messaging_manifests_unlocked(
                 installed[browser] = path
             _write_json_private(layout["host_extension_binding"], extension_binding)
             _register_runtime_host_verifier_locked(
-                layout, manifest, home_dir=home_dir
+                layout,
+                manifest,
+                home_dir=home_dir,
+                allow_legacy_component_source=component_operation,
             )
             _validate_runtime_host_verifier_registration(
-                layout, manifest, home_dir=home_dir
+                layout,
+                manifest,
+                home_dir=home_dir,
+                allow_legacy_component_source=component_operation,
             )
         except Exception as error:
             rollback_errors: list[str] = []
@@ -998,6 +1130,63 @@ def _managed_native_user_data_dirs(
     return tuple(result)
 
 
+def _bound_host_native_user_data_dirs(
+    home_dir: Path, native_user_data_dirs: Iterable[Path]
+) -> tuple[Path, ...]:
+    """Select bound Host profiles while fencing missing or unstable explicit ones.
+
+    Resolve each candidate once, carrying its explicit/default classification
+    with it. Explicit candidates run first so a stale default cannot hide an
+    explicit missing profile. Canonical file/owner/extension checks still apply.
+    """
+    explicit = [Path(path).expanduser() for path in native_user_data_dirs]
+    defaults = [
+        Path(home_dir).expanduser() / ".chatgpt-web-mcp" / name
+        for name in DEFAULT_NATIVE_USER_DATA_DIR_NAMES
+    ]
+    candidates = [(path, True) for path in explicit] + [
+        (path, False) for path in defaults
+    ]
+    observed: set[Path] = set()
+    result: list[Path] = []
+    for candidate, is_explicit in candidates:
+        if not candidate.is_absolute():
+            raise RuntimeError("custom Chrome user-data-dir must be absolute")
+        if candidate.is_symlink():
+            raise RuntimeError("managed Chrome user-data-dir may not be a symlink")
+        resolved = candidate.resolve()
+        if resolved in observed:
+            continue
+        observed.add(resolved)
+        preferences = resolved / "Default" / "Secure Preferences"
+        raw = _read_private_bytes_if_present(
+            preferences, "Chrome Secure Preferences for Runtime Host extension"
+        )
+        if raw is None:
+            if is_explicit:
+                raise RuntimeError("explicit Chrome profile has no installed Host extension")
+            continue
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RuntimeError("Chrome Secure Preferences is not valid UTF-8 JSON") from error
+        if not isinstance(value, dict):
+            raise RuntimeError("Chrome Secure Preferences is not valid JSON object")
+        extensions = value.get("extensions", {})
+        settings = extensions.get("settings", {}) if isinstance(extensions, dict) else None
+        if not isinstance(settings, dict):
+            raise RuntimeError("Chrome Secure Preferences settings are invalid")
+        if HOST_EXTENSION_ID not in settings:
+            if is_explicit:
+                raise RuntimeError("explicit Chrome profile has no installed Host extension")
+            continue
+        _configured_extension_source(resolved)
+        result.append(resolved)
+    if not result:
+        raise RuntimeError("no configured Chrome Host extension profile is available")
+    return tuple(result)
+
+
 def _configured_extension_source(user_data_dir: Path) -> tuple[Path, Path]:
     preferences = user_data_dir / "Default" / "Secure Preferences"
     raw = _read_private_bytes_if_present(
@@ -1032,6 +1221,519 @@ def _configured_extension_source(user_data_dir: Path) -> tuple[Path, Path]:
     return preferences, resolved
 
 
+def _runtime_extension_tree_hashes(
+    root: Path, *, label: str, require_immutable: bool = False
+) -> dict[str, str]:
+    root = Path(root)
+    _validate_owned_tree_source(root, label)
+    hashes: dict[str, str] = {}
+    for item in (root, *sorted(root.rglob("*"))):
+        mode = stat.S_IMODE(item.lstat().st_mode)
+        if mode & 0o022:
+            raise RuntimeError(f"{label} is writable by group or other: {item}")
+        if require_immutable and mode & 0o222:
+            raise RuntimeError(f"{label} is not sealed: {item}")
+        if item.is_file():
+            relative = item.relative_to(root).as_posix()
+            hashes[relative] = _sha256_file(item)
+    if not hashes or "manifest.json" not in hashes or "submit-page.js" not in hashes:
+        raise RuntimeError(f"{label} is incomplete")
+    return hashes
+
+
+def _validate_runtime_extension_component_patch(
+    layout: dict[str, Path],
+    manifest: dict[str, Any],
+    *,
+    extension_dir: Path,
+    component_manifest: Path,
+) -> dict[str, Any]:
+    """Validate a sealed extension tree derived from one immutable release.
+
+    Only submit-page.js may differ. The returned record is safe to embed in the
+    existing v1 runtime binding; the Native Host continues to enforce its
+    ordinary bundle pins while Python preserves the full-tree provenance.
+    """
+    _validate_manifest_contract(manifest)
+    component_manifest = Path(component_manifest)
+    raw = _read_private_bytes_if_present(
+        component_manifest, "Runtime Host extension component manifest"
+    )
+    if raw is None:
+        raise RuntimeError("Runtime Host extension component manifest is missing")
+    try:
+        record = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            "Runtime Host extension component manifest is not valid UTF-8 JSON"
+        ) from error
+    extension_dir = Path(extension_dir).resolve(strict=True)
+    release_extension_dir = (
+        layout["host_dir"] / "chrome-host" / "extension"
+    ).resolve(strict=True)
+    release_manifest = layout["release_manifest"].resolve(strict=True)
+    expected_patch_root = component_manifest.parent.resolve(strict=True)
+    expected_extension_dir = expected_patch_root / "extension"
+    if extension_dir != expected_extension_dir:
+        raise RuntimeError("Runtime Host extension component directory mismatch")
+    if component_manifest.name != "component-manifest.json":
+        raise RuntimeError("Runtime Host extension component manifest name mismatch")
+    if {item.name for item in expected_patch_root.iterdir()} != {
+        "extension",
+        "component-manifest.json",
+    }:
+        raise RuntimeError("Runtime Host extension component has unlisted root artifacts")
+    for item in (expected_patch_root, component_manifest):
+        if stat.S_IMODE(item.lstat().st_mode) & 0o222:
+            raise RuntimeError("Runtime Host extension component provenance is not sealed")
+    if (
+        isinstance(record, dict)
+        and record.get("schema_version")
+        == RUNTIME_EXTENSION_REGISTRY_OVERLAY_INCOMPLETE_SCHEMA
+    ):
+        raise RuntimeError(
+            "incomplete registry overlay without background.js is rejected"
+        )
+    if (
+        isinstance(record, dict)
+        and record.get("schema_version") == RUNTIME_EXTENSION_REGISTRY_OVERLAY_SCHEMA
+    ):
+        return _validate_runtime_extension_component_registry_overlay(
+            layout,
+            manifest,
+            extension_dir=extension_dir,
+            component_manifest=component_manifest,
+            record=record,
+            raw=raw,
+            expected_patch_root=expected_patch_root,
+            release_manifest=release_manifest,
+        )
+    expected_keys = {
+        "schema_version",
+        "component",
+        "created_at_unix_ms",
+        "patch_dir",
+        "extension_dir",
+        "source_release_dir",
+        "source_release_manifest",
+        "source_release_manifest_sha256",
+        "source_release_revision",
+        "source_endpoint_generation",
+        "allowed_relative_paths",
+        "changed_relative_paths",
+        "source_hashes",
+        "artifact_hashes",
+    }
+    if not isinstance(record, dict) or set(record) != expected_keys:
+        raise RuntimeError("Runtime Host extension component manifest structure mismatch")
+    if (
+        record.get("schema_version") != RUNTIME_EXTENSION_COMPONENT_SCHEMA
+        or record.get("component") != "chrome-extension-submit-page"
+        or not isinstance(record.get("created_at_unix_ms"), int)
+        or isinstance(record.get("created_at_unix_ms"), bool)
+        or record["created_at_unix_ms"] < 1
+        or record.get("patch_dir") != str(expected_patch_root)
+        or record.get("extension_dir") != str(extension_dir)
+        or record.get("source_release_dir") != str(layout["release_dir"].resolve(strict=True))
+        or record.get("source_release_manifest") != str(release_manifest)
+        or record.get("source_release_revision") != manifest.get("release_revision")
+        or record.get("source_endpoint_generation") != manifest.get("endpoint_generation")
+        or record.get("allowed_relative_paths")
+        != list(RUNTIME_EXTENSION_COMPONENT_ALLOWLIST)
+        or record.get("changed_relative_paths")
+        != list(RUNTIME_EXTENSION_COMPONENT_ALLOWLIST)
+    ):
+        raise RuntimeError("Runtime Host extension component provenance mismatch")
+    release_manifest_digest = _sha256_file(release_manifest)
+    if record.get("source_release_manifest_sha256") != release_manifest_digest:
+        raise RuntimeError("Runtime Host extension source manifest hash mismatch")
+    source_hashes = _runtime_extension_tree_hashes(
+        release_extension_dir, label="production release extension"
+    )
+    artifact_hashes = _runtime_extension_tree_hashes(
+        extension_dir,
+        label="Runtime Host extension component",
+        require_immutable=True,
+    )
+    release_artifacts = manifest.get("artifacts_sha256")
+    if not isinstance(release_artifacts, dict):
+        raise RuntimeError("production release manifest has no extension artifact hashes")
+    prefix = "host/chrome-host/extension/"
+    pinned_source_hashes = {
+        relative.removeprefix(prefix): digest
+        for relative, digest in release_artifacts.items()
+        if isinstance(relative, str) and relative.startswith(prefix)
+    }
+    if source_hashes != pinned_source_hashes or record.get("source_hashes") != source_hashes:
+        raise RuntimeError("Runtime Host extension source tree hash mismatch")
+    if record.get("artifact_hashes") != artifact_hashes:
+        raise RuntimeError("Runtime Host extension component tree hash mismatch")
+    if set(source_hashes) != set(artifact_hashes):
+        raise RuntimeError("Runtime Host extension component file set mismatch")
+    changed = sorted(
+        relative
+        for relative in source_hashes
+        if source_hashes[relative] != artifact_hashes[relative]
+    )
+    if changed != list(RUNTIME_EXTENSION_COMPONENT_ALLOWLIST):
+        raise RuntimeError("Runtime Host extension component allowlist mismatch")
+    return {
+        "manifest_path": str(component_manifest.resolve(strict=True)),
+        "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        "source_release_manifest": str(release_manifest),
+        "source_release_manifest_sha256": release_manifest_digest,
+        "allowed_relative_paths": list(RUNTIME_EXTENSION_COMPONENT_ALLOWLIST),
+        "source_hashes": source_hashes,
+        "artifact_hashes": artifact_hashes,
+    }
+
+
+def _require_sha256_digest(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise RuntimeError(f"{label} must be an explicit SHA-256 digest")
+    return value
+
+
+def _git_object_id(value: Any, label: str) -> str:
+    if not isinstance(value, str):
+        raise RuntimeError(f"{label} must be a full 40-character Git object id")
+    text = value.strip().lower()
+    if len(text) != 40 or any(character not in "0123456789abcdef" for character in text):
+        raise RuntimeError(f"{label} must be a full 40-character Git object id")
+    return text
+
+
+def _git_offline_run(
+    repository: Path, *args: str, binary: bool = False
+) -> bytes | str:
+    env = os.environ.copy()
+    for key in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_NO_REPLACE_OBJECTS",
+    ):
+        env.pop(key, None)
+    env.update(
+        {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_ASKPASS": os.devnull,
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+        }
+    )
+    completed = subprocess.run(
+        ["git", "-c", "core.hooksPath=/dev/null", "-C", str(repository), *args],
+        capture_output=True,
+        check=False,
+        env=env,
+        text=not binary,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("registry overlay git object is unavailable")
+    return completed.stdout
+
+
+def _validate_registry_overlay_git_provenance(
+    *,
+    repository: Any,
+    commit: Any,
+    blob_oid: Any,
+    expected_sha256: Any,
+    current_bytes: bytes,
+    relative: Any = RUNTIME_EXTENSION_REGISTRY_OVERLAY_RELATIVE,
+) -> dict[str, str]:
+    if relative not in RUNTIME_EXTENSION_REGISTRY_OVERLAY_GIT_PATHS:
+        raise RuntimeError("registry overlay git path is not allowlisted")
+    git_path = RUNTIME_EXTENSION_REGISTRY_OVERLAY_GIT_PATHS[relative]
+    if not isinstance(current_bytes, (bytes, bytearray)):
+        raise RuntimeError("registry overlay current file is invalid")
+    current_payload = bytes(current_bytes)
+    digest = hashlib.sha256(current_payload).hexdigest()
+    expected = _require_sha256_digest(
+        expected_sha256, f"registry overlay {relative} SHA-256"
+    )
+    if digest != expected:
+        raise RuntimeError(f"explicit candidate {relative} hash mismatch")
+    if not isinstance(repository, (str, Path)):
+        raise RuntimeError("registry overlay git repository path is invalid")
+    repo = Path(repository).expanduser()
+    if not repo.is_absolute():
+        raise RuntimeError("registry overlay git repository path is invalid")
+    try:
+        repo = repo.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise RuntimeError("registry overlay git repository is missing") from error
+    if repo.is_symlink() or not repo.is_dir() or not (repo / ".git").exists():
+        raise RuntimeError("registry overlay git repository is unsafe")
+    pinned_commit = _git_object_id(
+        RUNTIME_EXTENSION_REGISTRY_OVERLAY_GIT_COMMIT,
+        "pinned registry overlay git commit",
+    )
+    observed_commit = _git_object_id(commit, "registry overlay git commit")
+    if observed_commit != pinned_commit:
+        raise RuntimeError("registry overlay git commit mismatch")
+    verified_commit = str(
+        _git_offline_run(repo, "rev-parse", "--verify", f"{pinned_commit}^{{commit}}")
+    ).strip()
+    if verified_commit != pinned_commit:
+        raise RuntimeError("registry overlay git commit is unavailable")
+    spec = f"{pinned_commit}:{git_path}"
+    observed_blob = str(_git_offline_run(repo, "rev-parse", "--verify", spec)).strip()
+    expected_blob = _git_object_id(blob_oid, "registry overlay git blob")
+    if observed_blob != expected_blob:
+        raise RuntimeError("registry overlay git blob mismatch")
+    commit_bytes = _git_offline_run(repo, "show", spec, binary=True)
+    blob_bytes = _git_offline_run(repo, "show", expected_blob, binary=True)
+    if (
+        not isinstance(commit_bytes, (bytes, bytearray))
+        or not isinstance(blob_bytes, (bytes, bytearray))
+        or bytes(commit_bytes) != current_payload
+        or bytes(blob_bytes) != current_payload
+    ):
+        raise RuntimeError("registry overlay git object does not match the current file")
+    return {
+        "repository": str(repo),
+        "commit": pinned_commit,
+        "blob_oid": expected_blob,
+        "sha256": digest,
+        "relative": relative,
+        "git_path": git_path,
+    }
+
+
+def _runtime_extension_component_rollback_restore_manifest(
+    provenance: dict[str, Any],
+) -> Path | None:
+    if provenance.get("schema_version") != RUNTIME_EXTENSION_REGISTRY_OVERLAY_SCHEMA:
+        return None
+    prior = provenance.get("prior_component_manifest")
+    if not isinstance(prior, str) or not Path(prior).is_absolute():
+        raise RuntimeError("registry overlay prior component manifest path is invalid")
+    return Path(prior)
+
+
+def _validate_runtime_extension_component_registry_overlay(
+    layout: dict[str, Path],
+    manifest: dict[str, Any],
+    *,
+    extension_dir: Path,
+    component_manifest: Path,
+    record: dict[str, Any],
+    raw: bytes,
+    expected_patch_root: Path,
+    release_manifest: Path,
+) -> dict[str, Any]:
+    expected_keys = {
+        "schema_version",
+        "component",
+        "created_at_unix_ms",
+        "patch_dir",
+        "extension_dir",
+        "source_release_dir",
+        "source_release_manifest",
+        "source_release_manifest_sha256",
+        "source_release_revision",
+        "source_endpoint_generation",
+        "allowed_relative_paths",
+        "changed_relative_paths",
+        "source_hashes",
+        "artifact_hashes",
+        "prior_component_manifest",
+        "prior_component_manifest_sha256",
+        "preserved_submit_page_sha256",
+        "candidate_git_repository",
+        "candidate_git_commit",
+        "candidate_git_blob_oid",
+        "candidate_registry_sha256",
+        "candidate_background_git_blob_oid",
+        "candidate_background_sha256",
+    }
+    if set(record) != expected_keys:
+        raise RuntimeError("Runtime Host extension component manifest structure mismatch")
+    if (
+        record.get("component") != RUNTIME_EXTENSION_REGISTRY_OVERLAY_COMPONENT
+        or not isinstance(record.get("created_at_unix_ms"), int)
+        or isinstance(record.get("created_at_unix_ms"), bool)
+        or record["created_at_unix_ms"] < 1
+        or record.get("patch_dir") != str(expected_patch_root)
+        or record.get("extension_dir") != str(extension_dir)
+        or record.get("source_release_dir") != str(layout["release_dir"].resolve(strict=True))
+        or record.get("source_release_manifest") != str(release_manifest)
+        or record.get("source_release_revision") != manifest.get("release_revision")
+        or record.get("source_endpoint_generation") != manifest.get("endpoint_generation")
+        or record.get("allowed_relative_paths")
+        != list(RUNTIME_EXTENSION_REGISTRY_OVERLAY_ALLOWLIST)
+        or record.get("changed_relative_paths")
+        != list(RUNTIME_EXTENSION_REGISTRY_OVERLAY_ALLOWLIST)
+    ):
+        raise RuntimeError("Runtime Host extension component provenance mismatch")
+    prior_manifest_raw = record.get("prior_component_manifest")
+    if (
+        not isinstance(prior_manifest_raw, str)
+        or not Path(prior_manifest_raw).is_absolute()
+    ):
+        raise RuntimeError("registry overlay prior component manifest path is invalid")
+    prior_manifest = Path(prior_manifest_raw).resolve(strict=True)
+    if prior_manifest == component_manifest.resolve(strict=True):
+        raise RuntimeError("registry overlay prior component must be a distinct sealed package")
+    if prior_manifest.name != "component-manifest.json":
+        raise RuntimeError("registry overlay prior component manifest name mismatch")
+    prior_digest = _require_sha256_digest(
+        record.get("prior_component_manifest_sha256"),
+        "registry overlay prior component manifest SHA-256",
+    )
+    prior_raw = _read_private_bytes_if_present(
+        prior_manifest, "prior Runtime Host extension component manifest"
+    )
+    if prior_raw is None:
+        raise RuntimeError("registry overlay prior component manifest is missing")
+    if hashlib.sha256(prior_raw).hexdigest() != prior_digest:
+        raise RuntimeError("registry overlay prior component hash mismatch")
+    prior_provenance = _validate_runtime_extension_component_patch(
+        layout,
+        manifest,
+        extension_dir=prior_manifest.parent / "extension",
+        component_manifest=prior_manifest,
+    )
+    if (
+        prior_provenance.get("schema_version") == RUNTIME_EXTENSION_REGISTRY_OVERLAY_SCHEMA
+        or prior_provenance.get("allowed_relative_paths")
+        != list(RUNTIME_EXTENSION_COMPONENT_ALLOWLIST)
+        or prior_provenance.get("manifest_sha256") != prior_digest
+    ):
+        raise RuntimeError("registry overlay prior component must be the verified v1 submit-page component")
+    preserved_submit = _require_sha256_digest(
+        record.get("preserved_submit_page_sha256"),
+        "registry overlay preserved submit-page.js SHA-256",
+    )
+    prior_submit = prior_provenance["artifact_hashes"].get("submit-page.js")
+    if prior_submit != preserved_submit:
+        raise RuntimeError("registry overlay preserved submit-page.js hash mismatch")
+    release_manifest_digest = _sha256_file(release_manifest)
+    if record.get("source_release_manifest_sha256") != release_manifest_digest:
+        raise RuntimeError("Runtime Host extension source manifest hash mismatch")
+    source_hashes = _runtime_extension_tree_hashes(
+        (layout["host_dir"] / "chrome-host" / "extension").resolve(strict=True),
+        label="production release extension",
+    )
+    artifact_hashes = _runtime_extension_tree_hashes(
+        extension_dir,
+        label="Runtime Host extension component",
+        require_immutable=True,
+    )
+    release_artifacts = manifest.get("artifacts_sha256")
+    if not isinstance(release_artifacts, dict):
+        raise RuntimeError("production release manifest has no extension artifact hashes")
+    prefix = "host/chrome-host/extension/"
+    pinned_source_hashes = {
+        relative.removeprefix(prefix): digest
+        for relative, digest in release_artifacts.items()
+        if isinstance(relative, str) and relative.startswith(prefix)
+    }
+    if source_hashes != pinned_source_hashes or record.get("source_hashes") != source_hashes:
+        raise RuntimeError("Runtime Host extension source tree hash mismatch")
+    if artifact_hashes.get("submit-page.js") != preserved_submit:
+        raise RuntimeError(
+            "registry overlay must preserve the verified submit-page.js component"
+        )
+    if artifact_hashes.get("submit-page.js") == source_hashes.get("submit-page.js"):
+        raise RuntimeError(
+            "registry overlay must not revert submit-page.js to the original release"
+        )
+    if record.get("artifact_hashes") != artifact_hashes:
+        raise RuntimeError("Runtime Host extension component tree hash mismatch")
+    if set(source_hashes) != set(artifact_hashes):
+        raise RuntimeError("Runtime Host extension component file set mismatch")
+    if set(prior_provenance["artifact_hashes"]) != set(artifact_hashes):
+        raise RuntimeError("Runtime Host extension component file set mismatch")
+    changed = sorted(
+        relative
+        for relative in source_hashes
+        if source_hashes[relative] != artifact_hashes[relative]
+    )
+    if changed != list(RUNTIME_EXTENSION_REGISTRY_OVERLAY_ALLOWLIST):
+        raise RuntimeError("Runtime Host extension component allowlist mismatch")
+    changed_from_prior = sorted(
+        relative
+        for relative in prior_provenance["artifact_hashes"]
+        if prior_provenance["artifact_hashes"][relative] != artifact_hashes[relative]
+    )
+    if changed_from_prior != list(RUNTIME_EXTENSION_REGISTRY_OVERLAY_PRIOR_CHANGED):
+        raise RuntimeError("Runtime Host extension component allowlist mismatch")
+    overlay_files = (
+        (
+            RUNTIME_EXTENSION_REGISTRY_OVERLAY_RELATIVE,
+            "candidate_git_blob_oid",
+            "candidate_registry_sha256",
+        ),
+        (
+            RUNTIME_EXTENSION_REGISTRY_OVERLAY_BACKGROUND_RELATIVE,
+            "candidate_background_git_blob_oid",
+            "candidate_background_sha256",
+        ),
+    )
+    git_provenances: dict[str, dict[str, str]] = {}
+    for relative, blob_key, sha_key in overlay_files:
+        path = extension_dir / relative
+        try:
+            payload = path.read_bytes()
+        except OSError as error:
+            raise RuntimeError(f"registry overlay {relative} is missing") from error
+        git_provenance = _validate_registry_overlay_git_provenance(
+            repository=record.get("candidate_git_repository"),
+            commit=record.get("candidate_git_commit"),
+            blob_oid=record.get(blob_key),
+            expected_sha256=record.get(sha_key),
+            current_bytes=payload,
+            relative=relative,
+        )
+        if (
+            artifact_hashes.get(relative) != git_provenance["sha256"]
+            or record.get("candidate_git_repository") != git_provenance["repository"]
+            or record.get("candidate_git_commit") != git_provenance["commit"]
+            or record.get(blob_key) != git_provenance["blob_oid"]
+            or record.get(sha_key) != git_provenance["sha256"]
+        ):
+            raise RuntimeError("registry overlay candidate provenance mismatch")
+        git_provenances[relative] = git_provenance
+    registry_git = git_provenances[RUNTIME_EXTENSION_REGISTRY_OVERLAY_RELATIVE]
+    background_git = git_provenances[RUNTIME_EXTENSION_REGISTRY_OVERLAY_BACKGROUND_RELATIVE]
+    if (
+        background_git["repository"] != registry_git["repository"]
+        or background_git["commit"] != registry_git["commit"]
+    ):
+        raise RuntimeError("registry overlay candidate provenance mismatch")
+    return {
+        "manifest_path": str(component_manifest.resolve(strict=True)),
+        "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        "source_release_manifest": str(release_manifest),
+        "source_release_manifest_sha256": release_manifest_digest,
+        "allowed_relative_paths": list(RUNTIME_EXTENSION_REGISTRY_OVERLAY_ALLOWLIST),
+        "source_hashes": source_hashes,
+        "artifact_hashes": artifact_hashes,
+        "schema_version": RUNTIME_EXTENSION_REGISTRY_OVERLAY_SCHEMA,
+        "component": RUNTIME_EXTENSION_REGISTRY_OVERLAY_COMPONENT,
+        "prior_component_manifest": str(prior_manifest),
+        "prior_component_manifest_sha256": prior_digest,
+        "preserved_submit_page_sha256": preserved_submit,
+        "candidate_git_repository": registry_git["repository"],
+        "candidate_git_commit": registry_git["commit"],
+        "candidate_git_blob_oid": registry_git["blob_oid"],
+        "candidate_registry_sha256": registry_git["sha256"],
+        "candidate_background_git_blob_oid": background_git["blob_oid"],
+        "candidate_background_sha256": background_git["sha256"],
+    }
+
+
 def _build_runtime_extension_binding(
     layout: dict[str, Path],
     manifest: dict[str, Any],
@@ -1039,8 +1741,9 @@ def _build_runtime_extension_binding(
     home_dir: Path,
     native_user_data_dirs: Iterable[Path],
     browser_executables: Iterable[Path],
+    extension_component_manifest: Path | None = None,
 ) -> dict[str, Any]:
-    profiles = _managed_native_user_data_dirs(home_dir, native_user_data_dirs)
+    profiles = _bound_host_native_user_data_dirs(home_dir, native_user_data_dirs)
     configured = [_configured_extension_source(profile) for profile in profiles]
     for user_data_dir, (bound_preference, _) in zip(profiles, configured, strict=True):
         try:
@@ -1106,6 +1809,14 @@ def _build_runtime_extension_binding(
     if not executable_pins or len(executable_pins) > 8:
         raise RuntimeError("at least one trusted Chrome executable pin is required")
     release_extension_dir = layout["host_dir"] / "chrome-host" / "extension"
+    component_provenance = None
+    if extension_component_manifest is not None:
+        component_provenance = _validate_runtime_extension_component_patch(
+            layout,
+            manifest,
+            extension_dir=extension_dir,
+            component_manifest=extension_component_manifest,
+        )
     bundle_sha256: dict[str, str] = {}
     for relative in RUNTIME_EXTENSION_EXECUTION_RELATIVE_PATHS:
         actual = extension_dir / relative
@@ -1126,12 +1837,12 @@ def _build_runtime_extension_binding(
             ):
                 raise RuntimeError(f"{label} is unsafe: {relative}")
         actual_digest = _sha256_file(actual)
-        if actual_digest != _sha256_file(release):
+        if component_provenance is None and actual_digest != _sha256_file(release):
             raise RuntimeError(
                 f"loaded Chrome extension does not match production release: {relative}"
             )
         bundle_sha256[str(actual)] = actual_digest
-    return {
+    binding = {
         "schema_version": "runtime_host_extension_binding_v1",
         "extension_id": HOST_EXTENSION_ID,
         "release_revision": manifest["release_revision"],
@@ -1141,11 +1852,21 @@ def _build_runtime_extension_binding(
         "browser_executables": executable_pins,
         "bundle_sha256": bundle_sha256,
     }
+    if component_provenance is not None:
+        binding["component_patch"] = component_provenance
+    return binding
 
 
-def _validate_runtime_extension_binding(
+def _read_authenticated_runtime_extension_binding(
     layout: dict[str, Path], installed: dict[str, Any]
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], bytes]:
+    """Authenticate the private binding and its immutable component provenance.
+
+    Chrome may already have switched to a newly staged unpacked path, so this
+    proof does not require current preferences to still name the bound
+    extension_dir. Host identity, release pins, executable pins, bundle CAS,
+    and component-tree provenance stay mandatory.
+    """
     path = layout["host_extension_binding"]
     raw = _read_private_bytes_if_present(path, "Runtime Host extension binding")
     if raw is None:
@@ -1180,12 +1901,27 @@ def _validate_runtime_extension_binding(
     ):
         raise RuntimeError("Runtime Host extension binding structure mismatch")
     extension_dir = Path(extension_dir_raw).resolve(strict=True)
+    component_provenance = value.get("component_patch")
+    if component_provenance is not None:
+        if not isinstance(component_provenance, dict):
+            raise RuntimeError("Runtime Host extension component provenance is invalid")
+        component_manifest_raw = component_provenance.get("manifest_path")
+        if (
+            not isinstance(component_manifest_raw, str)
+            or not Path(component_manifest_raw).is_absolute()
+        ):
+            raise RuntimeError("Runtime Host extension component manifest path is invalid")
+        expected_component_provenance = _validate_runtime_extension_component_patch(
+            layout,
+            installed,
+            extension_dir=extension_dir,
+            component_manifest=Path(component_manifest_raw),
+        )
+        if component_provenance != expected_component_provenance:
+            raise RuntimeError("Runtime Host extension component provenance drifted")
     for preference_raw in preferences:
         if not isinstance(preference_raw, str) or not Path(preference_raw).is_absolute():
             raise RuntimeError("Runtime Host extension preference path is invalid")
-        _, configured_dir = _configured_extension_source(Path(preference_raw).parents[1])
-        if configured_dir != extension_dir:
-            raise RuntimeError("Runtime Host extension profile binding drifted")
     observed_browser_paths: set[Path] = set()
     for record in browser_executables:
         if not isinstance(record, dict) or set(record) != {"path", "sha256"}:
@@ -1230,9 +1966,24 @@ def _validate_runtime_extension_binding(
         if (
             not isinstance(expected, str)
             or _sha256_file(actual) != expected
-            or _sha256_file(release_extension_dir / relative) != expected
+            or (
+                component_provenance is None
+                and _sha256_file(release_extension_dir / relative) != expected
+            )
         ):
             raise RuntimeError(f"Runtime Host extension bundle hash mismatch: {relative}")
+    return value, raw
+
+
+def _validate_runtime_extension_binding(
+    layout: dict[str, Path], installed: dict[str, Any]
+) -> dict[str, Any]:
+    value, _raw = _read_authenticated_runtime_extension_binding(layout, installed)
+    extension_dir = Path(str(value["extension_dir"])).resolve(strict=True)
+    for preference_raw in value["preference_paths"]:
+        _, configured_dir = _configured_extension_source(Path(preference_raw).parents[1])
+        if configured_dir != extension_dir:
+            raise RuntimeError("Runtime Host extension profile binding drifted")
     return value
 
 
@@ -1425,9 +2176,17 @@ def _register_runtime_host_verifier(
 
 
 def _register_runtime_host_verifier_locked(
-    layout: dict[str, Path], manifest: dict[str, Any], *, home_dir: Path
+    layout: dict[str, Path],
+    manifest: dict[str, Any],
+    *,
+    home_dir: Path,
+    allow_legacy_component_source: bool = False,
 ) -> Path:
-    installed = _validate_immutable_native_wrapper(layout, manifest)
+    installed = _validate_immutable_native_wrapper(
+        layout,
+        manifest,
+        allow_legacy_component_source=allow_legacy_component_source,
+    )
     record = _runtime_verifier_record(layout, installed)
     config_path = _runtime_verifier_config_path(home_dir)
     value, original = _read_runtime_verifier_config(config_path)
@@ -1445,9 +2204,17 @@ def _register_runtime_host_verifier_locked(
 
 
 def _validate_runtime_host_verifier_registration(
-    layout: dict[str, Path], manifest: dict[str, Any], *, home_dir: Path
+    layout: dict[str, Path],
+    manifest: dict[str, Any],
+    *,
+    home_dir: Path,
+    allow_legacy_component_source: bool = False,
 ) -> Path:
-    installed = _validate_immutable_native_wrapper(layout, manifest)
+    installed = _validate_immutable_native_wrapper(
+        layout,
+        manifest,
+        allow_legacy_component_source=allow_legacy_component_source,
+    )
     expected = _runtime_verifier_record(layout, installed)
     config_path = _runtime_verifier_config_path(home_dir)
     value, _ = _read_runtime_verifier_config(config_path)
@@ -1496,10 +2263,38 @@ def _native_messaging_paths(
     return paths
 
 
-def _validate_immutable_native_wrapper(
+def _validate_legacy_component_source_release(
     layout: dict[str, Path], manifest: dict[str, Any]
 ) -> dict[str, Any]:
-    installed = validate_installed_release(layout)
+    installed = validate_installed_release(layout, require_sealed=False)
+    writable = []
+    for item in (layout["release_dir"], *layout["release_dir"].rglob("*")):
+        if item.is_dir() and stat.S_IMODE(item.stat().st_mode) & 0o222:
+            writable.append(item.relative_to(layout["release_dir"]).as_posix() or ".")
+    if writable != ["secrets"]:
+        raise RuntimeError(
+            "legacy extension component source has unexpected writable directories: "
+            + ", ".join(sorted(writable))
+        )
+    if (
+        installed.get("release_revision") != manifest.get("release_revision")
+        or installed.get("endpoint_generation") != manifest.get("endpoint_generation")
+    ):
+        raise RuntimeError("legacy extension component source identity mismatch")
+    return installed
+
+
+def _validate_immutable_native_wrapper(
+    layout: dict[str, Path],
+    manifest: dict[str, Any],
+    *,
+    allow_legacy_component_source: bool = False,
+) -> dict[str, Any]:
+    installed = (
+        _validate_legacy_component_source_release(layout, manifest)
+        if allow_legacy_component_source
+        else validate_installed_release(layout)
+    )
     if (
         installed.get("release_revision") != manifest.get("release_revision")
         or installed.get("endpoint_generation") != manifest.get("endpoint_generation")
@@ -3412,6 +4207,8 @@ def reconcile_dead_recorded_tunnel_pid_to_live_exclusive(
         )
 
 
+
+
 def _reconcile_dead_recorded_tunnel_pid_to_live_exclusive_unlocked(
     manifest: dict[str, Any],
     layout: dict[str, Path],
@@ -4978,6 +5775,7 @@ def production_status(manifest: dict[str, Any], layout: dict[str, Path]) -> dict
     }
 
 
+
 _ACTIVE_PRODUCTION_TUNNEL_STATE_KEYS = (
     "tunnel_pid",
     "tunnel_id",
@@ -5446,6 +6244,7 @@ def _start_local_runtime_unlocked(
             "process_runtime_process_identity": process_runtime_identity,
             "computer_runtime_process_identity": computer_runtime_identity,
             "bridge_process_identity": bridge_identity,
+            "bridge_socket_identity": _bridge_socket_identity(layout["bridge_socket"]),
             "bridge_execution_session_id": session_id,
             "bridge_capability_id": capability_id,
             "bridge_capability_ttl_ms": manifest["bridge"]["capability_ttl_ms"],
@@ -5521,6 +6320,7 @@ def _start_local_runtime_unlocked(
         raise
 
 
+
 def smoke_tools(layout: dict[str, Path]) -> list[str]:
     status, response = _call_mcp(layout, "tools/list", {})
     if status != 200 or "error" in response:
@@ -5531,6 +6331,8 @@ def smoke_tools(layout: dict[str, Path]) -> list[str]:
     )
     validate_tool_surface(names)
     return names
+
+
 
 
 def verify_caller_conversation_id_rejected(layout: dict[str, Path]) -> None:
@@ -6521,11 +7323,48 @@ def _bridge_env_with_live_host_receipt(
     return gated
 
 
+def _bridge_socket_identity(path: Path) -> dict[str, Any]:
+    try:
+        info = path.lstat()
+    except FileNotFoundError as error:
+        raise RuntimeError("production Bridge socket is missing") from error
+    if path.is_symlink() or not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid():
+        raise RuntimeError("production Bridge socket is unsafe")
+    if stat.S_IMODE(info.st_mode) != 0o600:
+        raise RuntimeError("production Bridge socket permissions are unsafe")
+    return {
+        "path": str(path),
+        "uid": info.st_uid,
+        "mode": stat.S_IMODE(info.st_mode),
+        "device": info.st_dev,
+        "inode": info.st_ino,
+    }
+
+
+def _bridge_socket_is_live(path: Path, identity: object) -> bool:
+    if not isinstance(identity, dict):
+        return False
+    try:
+        observed = _bridge_socket_identity(path)
+        if observed != identity:
+            return False
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.5)
+            probe.connect(str(path))
+        return True
+    except (OSError, RuntimeError):
+        return False
+
+
 def _wait_for_bridge(process: subprocess.Popen[Any], layout: dict[str, Path]) -> list[str]:
     for _ in range(100):
         if process.poll() is not None:
             raise RuntimeError("production Bridge exited during startup")
-        if layout["bridge_socket"].exists():
+        try:
+            identity = _bridge_socket_identity(layout["bridge_socket"])
+        except RuntimeError:
+            identity = None
+        if identity is not None and _bridge_socket_is_live(layout["bridge_socket"], identity):
             try:
                 return smoke_tools(layout)
             except Exception:
@@ -6825,6 +7664,8 @@ def install_native_messaging_manifests(
     home_dir: Path = Path.home(),
     native_user_data_dirs: Iterable[Path] = (),
     browser_executables: Iterable[Path] = (),
+    extension_component_manifest: Path | None = None,
+    rollback_extension_component_manifest: Path | None = None,
 ) -> dict[str, Path]:
     with _production_install_lock(layout["runtime_root"]):
         return _install_native_messaging_manifests_unlocked(
@@ -6833,6 +7674,8 @@ def install_native_messaging_manifests(
             home_dir=home_dir,
             native_user_data_dirs=native_user_data_dirs,
             browser_executables=browser_executables,
+            extension_component_manifest=extension_component_manifest,
+            rollback_extension_component_manifest=rollback_extension_component_manifest,
         )
 
 
@@ -7463,6 +8306,12 @@ def _endpoint_generation(value: int) -> int:
     return value
 
 
+
+
+
+
+
+
 def release_manifest(
     workspace: Path | None = None,
     *,
@@ -7732,6 +8581,9 @@ def _rollback_request_manifest(release_revision: str, endpoint_generation: int) 
     }
 
 
+
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Local Agent Bridge production connector contract")
     parser.add_argument(
@@ -7860,6 +8712,7 @@ def main(argv: list[str] | None = None) -> int:
             and result.get("tunnel_ready") is True
         ) else 2
     return 0
+
 
 
 if __name__ == "__main__":

@@ -1015,7 +1015,7 @@ class ProductionConnectorContractTests(unittest.TestCase):
                         pc._bridge_capability_lease_status(
                             layout, state, now_ms=now_ms
                         )
-    def test_install_release_bundle_is_private_immutable_and_hash_verified(self):
+    def test_install_release_bundle_seals_directories_but_keeps_runtime_private_files_readable(self):
         manifest = self._manifest()
         source_node = dict(manifest["runtime_dependencies"]["node"])
         with tempfile.TemporaryDirectory(dir="/tmp") as raw_root:
@@ -1045,6 +1045,18 @@ class ProductionConnectorContractTests(unittest.TestCase):
             self.assertTrue(os.access(layout["process_runtime_binary"], os.X_OK))
             self.assertEqual(stat.S_IMODE(layout["process_runtime_binary"].stat().st_mode), 0o700)
             self.assertTrue(os.access(layout["native_host_wrapper"], os.X_OK))
+            for item in (layout["release_dir"], *layout["release_dir"].rglob("*")):
+                if not item.is_dir():
+                    continue
+                self.assertEqual(
+                    stat.S_IMODE(item.stat().st_mode) & 0o222,
+                    0,
+                    f"immutable release directory remained writable: {item}",
+                )
+            with self.assertRaises(PermissionError):
+                (layout["release_dir"] / "unlisted-recovery-backup").write_text(
+                    "must not be writable\n", encoding="utf-8"
+                )
             self.assertEqual(
                 pc.tomllib.loads(
                     layout["release_catdesk_config"].read_text(encoding="utf-8")
@@ -1190,7 +1202,11 @@ class ProductionConnectorContractTests(unittest.TestCase):
                 "path": source_node["path"],
                 "sha256": source_node["sha256"],
             }
-            pc._write_json_private(layout["release_manifest"], legacy_manifest)
+            layout["release_manifest"].write_text(
+                json.dumps(legacy_manifest, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
             with self.assertRaisesRegex(RuntimeError, "Node.*immutable release"):
                 pc.validate_installed_release(layout)
             with patch.object(pc, "_spawn_logged") as spawn:
@@ -1198,13 +1214,17 @@ class ProductionConnectorContractTests(unittest.TestCase):
                     pc.start_local_runtime(manifest, layout)
                 spawn.assert_not_called()
             layout["release_manifest"].write_bytes(release_manifest_before_retry)
-            layout["release_manifest"].chmod(0o600)
 
             extra = layout["release_dir"] / "unlisted-evidence.txt"
+            layout["release_dir"].chmod(0o700)
             extra.write_text("not in release manifest", encoding="utf-8")
+            extra.chmod(0o400)
+            layout["release_dir"].chmod(0o500)
             with self.assertRaisesRegex(RuntimeError, "extra|unlisted|artifact"):
                 pc.validate_installed_release(layout)
+            layout["release_dir"].chmod(0o700)
             extra.unlink()
+            layout["release_dir"].chmod(0o500)
 
             layout["bridge_binary"].write_bytes(b"tampered")
             with self.assertRaisesRegex(RuntimeError, "hash|artifact"):
